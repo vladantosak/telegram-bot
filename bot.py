@@ -672,32 +672,31 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if os.path.exists(video_path):
         os.remove(video_path)
 
-   if speech_text and len(speech_text.strip()) > 10 and "Ошибка распознавания" not in speech_text:
-    result = check_status(speech_text)
+      if speech_text and len(speech_text.strip()) > 10 and "Ошибка распознавания" not in speech_text:
+        result = check_status(speech_text)
 
-    # защита от ошибочного определения ФАКТА ДНЯ
-    if result["report_type"] == "факт_дня":
-        fact_words = [
-            "итог за день",
-            "за весь день",
-            "за смену",
-            "вся смена",
-            "подвожу итог",
-            "отчитываюсь за день"
-        ]
+        if result["report_type"] == "факт_дня":
+            fact_words = [
+                "итог за день",
+                "за весь день",
+                "за смену",
+                "вся смена",
+                "подвожу итог",
+                "отчитываюсь за день"
+            ]
 
-        text_lower = speech_text.lower()
+            text_lower = speech_text.lower()
 
-        if not any(word in text_lower for word in fact_words):
-            result["report_type"] = "статус"
+            if not any(word in text_lower for word in fact_words):
+                result["report_type"] = "статус"
 
-else:
-    result = {
-        "report_type": "статус",
-        "is_ok": False,
-        "format_comment": "голосовой отчёт не удалось распознать",
-        "required_action": "сотруднику необходимо отправить видео повторно с понятным голосовым отчётом",
-    }
+    else:
+        result = {
+            "report_type": "статус",
+            "is_ok": False,
+            "format_comment": "голосовой отчёт не удалось распознать",
+            "required_action": "сотруднику необходимо отправить видео повторно с понятным голосовым отчётом",
+        }
 
     full_name = f"{last_name} {first_name}".strip()
     report_date = now.strftime("%Y-%m-%d")
