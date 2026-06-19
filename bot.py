@@ -56,6 +56,8 @@ MAIN_MENU = ReplyKeyboardMarkup(
 CANCEL_KEYBOARD = ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True)
 SCHEDULE_KEYBOARD = ReplyKeyboardMarkup([["A", "B"], ["❌ Отмена"]], resize_keyboard=True)
 YES_NO_KEYBOARD = ReplyKeyboardMarkup([["Да", "Нет"], ["❌ Отмена"]], resize_keyboard=True)
+CANCEL_TEXT = "❌ Отмена"
+DIALOG_TEXT = filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{CANCEL_TEXT}$")
 
 
 def get_db():
@@ -824,14 +826,14 @@ def main():
             CommandHandler("add_worker", add_worker_start),
         ],
         states={
-            ASK_WORKER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_id)],
-            ASK_LASTNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_lastname)],
-            ASK_FIRSTNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_firstname)],
-            ASK_POSITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_position)],
-            ASK_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_group)],
-            ASK_SCHEDULE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_schedule)],
+            ASK_WORKER_ID: [MessageHandler(DIALOG_TEXT, add_worker_id)],
+            ASK_LASTNAME: [MessageHandler(DIALOG_TEXT, add_worker_lastname)],
+            ASK_FIRSTNAME: [MessageHandler(DIALOG_TEXT, add_worker_firstname)],
+            ASK_POSITION: [MessageHandler(DIALOG_TEXT, add_worker_position)],
+            ASK_GROUP: [MessageHandler(DIALOG_TEXT, add_worker_group)],
+            ASK_SCHEDULE: [MessageHandler(DIALOG_TEXT, add_worker_schedule)],
             ASK_NEEDS_DAILY_FACT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_needs_daily_fact)
+                MessageHandler(DIALOG_TEXT, add_worker_needs_daily_fact)
             ],
         },
         fallbacks=[
@@ -846,7 +848,7 @@ def main():
             CommandHandler("remove_worker", remove_worker_start),
         ],
         states={
-            ASK_REMOVE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_worker_finish)],
+            ASK_REMOVE_ID: [MessageHandler(DIALOG_TEXT, remove_worker_finish)],
         },
         fallbacks=[
             MessageHandler(filters.Regex("^❌ Отмена$"), cancel_dialog),
@@ -860,7 +862,7 @@ def main():
             CommandHandler("department", department_start),
         ],
         states={
-            ASK_DEPARTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, department_finish)],
+            ASK_DEPARTMENT: [MessageHandler(DIALOG_TEXT, department_finish)],
         },
         fallbacks=[
             MessageHandler(filters.Regex("^❌ Отмена$"), cancel_dialog),
@@ -874,7 +876,7 @@ def main():
             CommandHandler("set_report_time", set_report_time_start),
         ],
         states={
-            ASK_REPORT_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_report_time_finish)],
+            ASK_REPORT_TIME: [MessageHandler(DIALOG_TEXT, set_report_time_finish)],
         },
         fallbacks=[
             MessageHandler(filters.Regex("^❌ Отмена$"), cancel_dialog),
