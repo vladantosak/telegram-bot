@@ -286,11 +286,11 @@ def normalize_ai_result(data: dict, source_text: str) -> dict:
     else:
         if not issue:
             issue = "есть замечания по отчету"
-        format_comment = f"не ОК: {issue}"
+        format_comment = f"не ОК , {issue}"
         if not required_action or required_action.lower() == "ничего не предпринимать":
-            required_action = f"сотруднику объяснено: {issue}"
-        elif not required_action.lower().startswith("сотруднику объяснено"):
-            required_action = f"сотруднику объяснено: {required_action}"
+            required_action = f"сказал сотруднику что нужно исправить: {issue}"
+        elif not required_action.lower().startswith("сказал сотруднику"):
+            required_action = f"сказал сотруднику что нужно {required_action}"
         if not employee_message:
             employee_message = f"В отчете есть замечание: {issue}. В следующем отчете исправьте это."
 
@@ -362,6 +362,10 @@ CHECK_PROMPT_TEMPLATE = """
 - Если is_ok=false, required_action должен говорить, что нужно сделать руководителю.
 - Если is_ok=false, employee_message должен быть понятным сообщением сотруднику.
   Например: "Вы не указали объем работ. В следующем отчете не забудьте указать, что именно сделано."
+- Формулируй issue коротко в прошедшем времени, например:
+  "не указал объем выполненной работы".
+- Формулируй required_action как уже выполненное действие, например:
+  "сказал сотруднику что нужно в статусе указывать объем выполненной работы".
 
 Верни только JSON без Markdown:
 {{
@@ -862,7 +866,7 @@ async def process_video_report(
 
     text = (
         f"{header}\n"
-        f"Формат отчета: {result['format_comment']} ,\n"
+        f"Формат отчета: {result['format_comment']}\n"
         f"Требуемые действия: {result['required_action']}"
     )
 
