@@ -560,6 +560,7 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
     group_id = context.user_data["group_id"]
     schedule = context.user_data["schedule"]
     needs_daily_fact = raw == "да"
+    pending_auto_user = context.user_data.get("pending_auto_user")
 
     upsert_worker(worker_id, last_name, first_name, position, group_id, schedule, needs_daily_fact)
 
@@ -572,6 +573,41 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
         f"Факт дня: {'да' if needs_daily_fact else 'нет'}",
         reply_markup=MAIN_MENU,
     )
+
+    if pending_auto_user and pending_auto_user.get("telegram_id") == worker_id:
+        employee_chat_id = pending_auto_user.get("chat_id")
+        video_file_id = pending_auto_user.get("video_file_id")
+
+        if employee_chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=employee_chat_id,
+                    text="Вы добавлены в базу. Ваш предыдущий видеоотчет сейчас обрабатывается.",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+            except Exception as e:
+                await update.message.reply_text(f"Сотрудник добавлен, но уведомление ему не отправилось: {e}")
+
+        if video_file_id:
+            worker = get_worker(worker_id)
+            try:
+                await process_video_report(
+                    context=context,
+                    worker=worker,
+                    user_id=worker_id,
+                    video_file_id=video_file_id,
+                    employee_chat_id=employee_chat_id,
+                )
+                await update.message.reply_text(
+                    "Предыдущий видеоотчет сотрудника обработан ИИ и отправлен в группу.",
+                    reply_markup=MAIN_MENU,
+                )
+            except Exception as e:
+                await update.message.reply_text(
+                    f"Сотрудник добавлен, но старое видео не удалось обработать: {e}",
+                    reply_markup=MAIN_MENU,
+                )
+
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -777,46 +813,13 @@ async def summary_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_daily_summary(FakeContext())
 
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    worker = get_worker(user.id)
-
-    if worker is None:
-        user_name = " ".join(part for part in [user.first_name, user.last_name] if part).strip() or "Без имени"
-        username = f"@{user.username}" if user.username else "username не указан"
-        context.application.bot_data["pending_unregistered_user"] = {
-            "telegram_id": user.id,
-            "name": user_name,
-            "username": username,
-            "chat_id": update.effective_chat.id,
-        }
-
-        employee_warning = "Вы не зарегистрированы как сотрудник. Обратитесь к администратору."
-        await update.message.reply_text(
-            employee_warning,
-            reply_markup=ReplyKeyboardRemove(),
-        )
-
-        admin_text = (
-            "Сотруднику показано сообщение, что его нет в базе и нужно обратиться к администратору.\n\n"
-            "Данные пользователя:\n"
-            f"Имя: {user_name}\n"
-            f"Username: {username}\n"
-            f"Telegram ID: {user.id}\n"
-            f"Chat ID: {update.effective_chat.id}\n\n"
-            f"Текст для сотрудника: {employee_warning}\n\n"
-            "Добавьте сотрудника через кнопку:\n"
-            "➕ Добавить сотрудника\n\n"
-            "Telegram ID подставится автоматически."
-        )
-        if ADMIN_ID:
-            try:
-                await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text)
-            except Exception as e:
-                print(f"Не удалось отправить уведомление админу: {e}")
-
-        return
-
+async def process_video_report(
+    context: ContextTypes.DEFAULT_TYPE,
+    worker,
+    user_id: int,
+    video_file_id: str,
+    employee_chat_id: int | None = None,
+):
     now = datetime.now()
     full_name = f"{worker['last_name']} {worker['first_name']}".strip()
     position = worker["position"]
@@ -824,9 +827,9 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
 
     try:
-        video_file = await update.message.video.get_file()
+        video_file = await context.bot.get_file(video_file_id)
         os.makedirs("tmp", exist_ok=True)
-        file_path = os.path.join("tmp", f"{user.id}_{now.strftime('%Y%m%d_%H%M%S')}.mp4")
+        file_path = os.path.join("tmp", f"{user_id}_{now.strftime('%Y%m%d_%H%M%S')}.mp4")
         await video_file.download_to_drive(file_path)
 
         speech_text = transcribe_audio(file_path)
@@ -862,7 +865,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     save_report(
-        telegram_id=user.id,
+        telegram_id=user_id,
         report_date=report_date,
         report_type=report_type,
         slot_time=slot_time,
@@ -873,13 +876,73 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         required_action=result["required_action"],
     )
 
-    try:
-        await context.bot.send_video(chat_id=group_id, video=update.message.video.file_id)
-        await context.bot.send_message(chat_id=group_id, text=text, parse_mode="HTML")
+    await context.bot.send_video(chat_id=group_id, video=video_file_id)
+    await context.bot.send_message(chat_id=group_id, text=text, parse_mode="HTML")
+
+    if employee_chat_id:
         if not result["is_ok"] and result["employee_message"]:
-            await update.message.reply_text(result["employee_message"], reply_markup=ReplyKeyboardRemove())
+            await context.bot.send_message(
+                chat_id=employee_chat_id,
+                text=result["employee_message"],
+                reply_markup=ReplyKeyboardRemove(),
+            )
         else:
-            await update.message.reply_text("Отчет отправлен и сохранен.", reply_markup=ReplyKeyboardRemove())
+            await context.bot.send_message(
+                chat_id=employee_chat_id,
+                text="Отчет отправлен и сохранен.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    worker = get_worker(user.id)
+
+    if worker is None:
+        user_name = " ".join(part for part in [user.first_name, user.last_name] if part).strip() or "Без имени"
+        username = f"@{user.username}" if user.username else "username не указан"
+        context.application.bot_data["pending_unregistered_user"] = {
+            "telegram_id": user.id,
+            "name": user_name,
+            "username": username,
+            "chat_id": update.effective_chat.id,
+            "video_file_id": update.message.video.file_id,
+        }
+
+        employee_warning = "Вы не зарегистрированы как сотрудник. Обратитесь к администратору."
+        await update.message.reply_text(
+            employee_warning,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+        admin_text = (
+            "Сотруднику показано сообщение, что его нет в базе и нужно обратиться к администратору.\n\n"
+            "Данные пользователя:\n"
+            f"Имя: {user_name}\n"
+            f"Username: {username}\n"
+            f"Telegram ID: {user.id}\n"
+            f"Chat ID: {update.effective_chat.id}\n\n"
+            f"Текст для сотрудника: {employee_warning}\n\n"
+            "Добавьте сотрудника через кнопку:\n"
+            "➕ Добавить сотрудника\n\n"
+            "Telegram ID подставится автоматически."
+        )
+        if ADMIN_ID:
+            try:
+                await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text)
+            except Exception as e:
+                print(f"Не удалось отправить уведомление админу: {e}")
+
+        return
+
+    try:
+        await process_video_report(
+            context=context,
+            worker=worker,
+            user_id=user.id,
+            video_file_id=update.message.video.file_id,
+            employee_chat_id=update.effective_chat.id,
+        )
     except Exception as e:
         await update.message.reply_text(f"Ошибка отправки в группу: {e}", reply_markup=ReplyKeyboardRemove())
 
