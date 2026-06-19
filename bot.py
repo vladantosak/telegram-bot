@@ -40,18 +40,67 @@ def get_db():
 
 def init_db():
     conn = get_db()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS workers (
-            telegram_id INTEGER PRIMARY KEY,
-            last_name TEXT NOT NULL,
-            first_name TEXT NOT NULL,
-            position TEXT NOT NULL DEFAULT 'Не указано',
-            group_id INTEGER NOT NULL
+
+    # Миграция: если существует старая таблица workers без нужных колонок —
+    # пересоздаём её с новой структурой. Старые данные в старом формате
+    # были учебными/тестовыми, поэтому просто переносим то, что можем.
+    existing_cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(workers)").fetchall()
+    }
+
+    if existing_cols and "last_name" not in existing_cols:
+        print("Обнаружена старая структура таблицы workers — выполняю миграцию")
+        conn.execute("ALTER TABLE workers RENAME TO workers_old")
+        conn.execute(
+            """
+            CREATE TABLE workers (
+                telegram_id INTEGER PRIMARY KEY,
+                last_name TEXT NOT NULL,
+                first_name TEXT NOT NULL,
+                position TEXT NOT NULL DEFAULT 'Не указано',
+                group_id INTEGER NOT NULL
+            )
+            """
         )
-        """
-    )
-    conn.commit()
+        # Переносим старые записи, если в старой таблице была колонка name
+        if "name" in existing_cols:
+            old_rows = conn.execute("SELECT * FROM workers_old").fetchall()
+            for row in old_rows:
+                parts = (row["name"] or "").split(" ", 1)
+                last_name = parts[0] if parts else "Без фамилии"
+                first_name = parts[1] if len(parts) > 1 else ""
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO workers
+                    (telegram_id, last_name, first_name, position, group_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["telegram_id"],
+                        last_name,
+                        first_name,
+                        row["position"] if "position" in row.keys() else "Не указано",
+                        row["group_id"],
+                    ),
+                )
+        conn.execute("DROP TABLE workers_old")
+        conn.commit()
+        print("Миграция завершена")
+    else:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workers (
+                telegram_id INTEGER PRIMARY KEY,
+                last_name TEXT NOT NULL,
+                first_name TEXT NOT NULL,
+                position TEXT NOT NULL DEFAULT 'Не указано',
+                group_id INTEGER NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
     conn.close()
     print(f"База данных готова: {DB_PATH}")
 
