@@ -37,10 +37,11 @@ SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
     ASK_GROUP,
     ASK_SCHEDULE,
     ASK_NEEDS_DAILY_FACT,
-    ASK_REMOVE_ID,
+    ASK_REMOVE_DEPARTMENT,
+    ASK_REMOVE_WORKER,
     ASK_DEPARTMENT,
     ASK_REPORT_TIME,
-) = range(10)
+) = range(11)
 
 
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -567,17 +568,57 @@ async def remove_worker_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not await require_admin(update):
         return ConversationHandler.END
 
-    await update.message.reply_text("Введите Telegram ID сотрудника для удаления:", reply_markup=CANCEL_KEYBOARD)
-    return ASK_REMOVE_ID
+    rows = get_all_workers()
+    positions = sorted({row["position"] for row in rows})
+    if not positions:
+        await update.message.reply_text("В базе пока нет сотрудников.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+
+    keyboard = [[position] for position in positions]
+    keyboard.append(["❌ Отмена"])
+    await update.message.reply_text(
+        "Выберите отдел, из которого нужно удалить сотрудника:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+    )
+    return ASK_REMOVE_DEPARTMENT
+
+
+async def remove_worker_department(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    position = update.message.text.strip()
+    rows = get_workers_by_position(position)
+    if not rows:
+        await update.message.reply_text(
+            f"В отделе '{position}' сотрудники не найдены. Выберите отдел еще раз.",
+            reply_markup=MAIN_MENU,
+        )
+        return ConversationHandler.END
+
+    context.user_data["remove_position"] = position
+    keyboard = []
+    for row in rows:
+        keyboard.append([f"{row['last_name']} {row['first_name']} - ID {row['telegram_id']}"])
+    keyboard.append(["❌ Отмена"])
+
+    await update.message.reply_text(
+        f"Выберите сотрудника для удаления из отдела '{position}':",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+    )
+    return ASK_REMOVE_WORKER
 
 
 async def remove_worker_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
-    if not raw.lstrip("-").isdigit():
-        await update.message.reply_text("Введите числовой Telegram ID:", reply_markup=CANCEL_KEYBOARD)
-        return ASK_REMOVE_ID
+    marker = "ID "
+    if marker not in raw:
+        await update.message.reply_text("Выберите сотрудника кнопкой из списка.", reply_markup=CANCEL_KEYBOARD)
+        return ASK_REMOVE_WORKER
 
-    target_id = int(raw)
+    target_id_raw = raw.rsplit(marker, 1)[1].strip()
+    if not target_id_raw.lstrip("-").isdigit():
+        await update.message.reply_text("Не удалось прочитать ID. Выберите сотрудника кнопкой из списка.", reply_markup=CANCEL_KEYBOARD)
+        return ASK_REMOVE_WORKER
+
+    target_id = int(target_id_raw)
     worker = get_worker(target_id)
     if worker is None:
         await update.message.reply_text(f"Сотрудник с ID {target_id} не найден.", reply_markup=MAIN_MENU)
@@ -585,6 +626,7 @@ async def remove_worker_finish(update: Update, context: ContextTypes.DEFAULT_TYP
 
     name = f"{worker['last_name']} {worker['first_name']}"
     delete_worker(target_id)
+    context.user_data.pop("remove_position", None)
     await update.message.reply_text(f"Сотрудник удален: {name} (ID {target_id})", reply_markup=MAIN_MENU)
     return ConversationHandler.END
 
@@ -848,7 +890,8 @@ def main():
             CommandHandler("remove_worker", remove_worker_start),
         ],
         states={
-            ASK_REMOVE_ID: [MessageHandler(DIALOG_TEXT, remove_worker_finish)],
+            ASK_REMOVE_DEPARTMENT: [MessageHandler(DIALOG_TEXT, remove_worker_department)],
+            ASK_REMOVE_WORKER: [MessageHandler(DIALOG_TEXT, remove_worker_finish)],
         },
         fallbacks=[
             MessageHandler(filters.Regex("^❌ Отмена$"), cancel_dialog),
