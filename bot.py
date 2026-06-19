@@ -671,8 +671,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if os.path.exists(video_path):
         os.remove(video_path)
-
-      if speech_text and len(speech_text.strip()) > 10 and "Ошибка распознавания" not in speech_text:
+        if speech_text and len(speech_text.strip()) > 10 and "Ошибка распознавания" not in speech_text:
         result = check_status(speech_text)
 
         if result["report_type"] == "факт_дня":
@@ -690,12 +689,12 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not any(word in text_lower for word in fact_words):
                 result["report_type"] = "статус"
 
-    else:
+         else:
         result = {
             "report_type": "статус",
             "is_ok": False,
             "format_comment": "голосовой отчёт не удалось распознать",
-            "required_action": "сотруднику необходимо отправить видео повторно с понятным голосовым отчётом",
+            "required_action": "сотруднику необходимо отправить видео повторно",
         }
 
     full_name = f"{last_name} {first_name}".strip()
