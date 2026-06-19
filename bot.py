@@ -863,6 +863,8 @@ async def process_video_report(
         f"Формат отчета: {result['format_comment']} ,\n"
         f"Требуемые действия: {result['required_action']}"
     )
+    if not result["is_ok"] and result["employee_message"]:
+        text += f"\nЗамечание сотруднику: {result['employee_message']}"
 
     save_report(
         telegram_id=user_id,
