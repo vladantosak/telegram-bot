@@ -287,10 +287,7 @@ def normalize_ai_result(data: dict, source_text: str) -> dict:
         if not issue:
             issue = "есть замечания по отчету"
         format_comment = f"не ОК , {issue}"
-        if not required_action or required_action.lower() == "ничего не предпринимать":
-            required_action = f"сказал сотруднику что нужно исправить: {issue}"
-        elif not required_action.lower().startswith("сказал сотруднику"):
-            required_action = f"сказал сотруднику что нужно {required_action}"
+        required_action = f"сделал замечание сотруднику по поводу того что {issue}"
         if not employee_message:
             employee_message = f"В отчете есть замечание: {issue}. В следующем отчете исправьте это."
 
