@@ -769,12 +769,21 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if worker is None:
         user_name = " ".join(part for part in [user.first_name, user.last_name] if part).strip() or "Без имени"
         username = f"@{user.username}" if user.username else "username не указан"
+
+        employee_warning = "Вы не зарегистрированы как сотрудник. Обратитесь к администратору."
+        await update.message.reply_text(
+            employee_warning,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
         admin_text = (
-            "Незарегистрированный пользователь отправил видеоотчет:\n"
+            "Сотруднику показано сообщение, что его нет в базе и нужно обратиться к администратору.\n\n"
+            "Данные пользователя:\n"
             f"Имя: {user_name}\n"
             f"Username: {username}\n"
             f"Telegram ID: {user.id}\n"
             f"Chat ID: {update.effective_chat.id}\n\n"
+            f"Текст для сотрудника: {employee_warning}\n\n"
             "Добавьте сотрудника через кнопку:\n"
             "➕ Добавить сотрудника"
         )
@@ -784,10 +793,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 print(f"Не удалось отправить уведомление админу: {e}")
 
-        await update.message.reply_text(
-            "Вы не зарегистрированы как сотрудник. Обратитесь к администратору.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
         return
 
     now = datetime.now()
