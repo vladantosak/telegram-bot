@@ -767,6 +767,23 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker = get_worker(user.id)
 
     if worker is None:
+        user_name = " ".join(part for part in [user.first_name, user.last_name] if part).strip() or "Без имени"
+        username = f"@{user.username}" if user.username else "username не указан"
+        admin_text = (
+            "Незарегистрированный пользователь отправил видеоотчет:\n"
+            f"Имя: {user_name}\n"
+            f"Username: {username}\n"
+            f"Telegram ID: {user.id}\n"
+            f"Chat ID: {update.effective_chat.id}\n\n"
+            "Добавьте сотрудника через кнопку:\n"
+            "➕ Добавить сотрудника"
+        )
+        if ADMIN_ID:
+            try:
+                await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text)
+            except Exception as e:
+                print(f"Не удалось отправить уведомление админу: {e}")
+
         await update.message.reply_text(
             "Вы не зарегистрированы как сотрудник. Обратитесь к администратору.",
             reply_markup=ReplyKeyboardRemove(),
