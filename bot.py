@@ -288,7 +288,9 @@ def normalize_ai_result(data: dict, source_text: str) -> dict:
             issue = "есть замечания по отчету"
         format_comment = f"не ОК: {issue}"
         if not required_action or required_action.lower() == "ничего не предпринимать":
-            required_action = "уточнить отчет у сотрудника"
+            required_action = f"сотруднику объяснено: {issue}"
+        elif not required_action.lower().startswith("сотруднику объяснено"):
+            required_action = f"сотруднику объяснено: {required_action}"
         if not employee_message:
             employee_message = f"В отчете есть замечание: {issue}. В следующем отчете исправьте это."
 
@@ -863,8 +865,6 @@ async def process_video_report(
         f"Формат отчета: {result['format_comment']} ,\n"
         f"Требуемые действия: {result['required_action']}"
     )
-    if not result["is_ok"] and result["employee_message"]:
-        text += f"\nЗамечание сотруднику: {result['employee_message']}"
 
     save_report(
         telegram_id=user_id,
