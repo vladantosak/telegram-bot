@@ -463,6 +463,18 @@ async def add_worker_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     context.user_data.clear()
+    pending_user = context.application.bot_data.pop("pending_unregistered_user", None)
+    if pending_user:
+        context.user_data["new_worker_id"] = pending_user["telegram_id"]
+        context.user_data["pending_auto_user"] = pending_user
+        await update.message.reply_text(
+            "Telegram ID заполнен автоматически:\n"
+            f"{pending_user['telegram_id']} ({pending_user['name']}, {pending_user['username']})\n\n"
+            "Введите фамилию:",
+            reply_markup=CANCEL_KEYBOARD,
+        )
+        return ASK_LASTNAME
+
     await update.message.reply_text("Введите Telegram ID сотрудника:", reply_markup=CANCEL_KEYBOARD)
     return ASK_WORKER_ID
 
@@ -704,6 +716,9 @@ async def set_report_time_finish(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def cancel_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending_auto_user = context.user_data.get("pending_auto_user")
+    if pending_auto_user:
+        context.application.bot_data["pending_unregistered_user"] = pending_auto_user
     context.user_data.clear()
     await update.message.reply_text("Действие отменено.", reply_markup=MAIN_MENU)
     return ConversationHandler.END
@@ -769,6 +784,12 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if worker is None:
         user_name = " ".join(part for part in [user.first_name, user.last_name] if part).strip() or "Без имени"
         username = f"@{user.username}" if user.username else "username не указан"
+        context.application.bot_data["pending_unregistered_user"] = {
+            "telegram_id": user.id,
+            "name": user_name,
+            "username": username,
+            "chat_id": update.effective_chat.id,
+        }
 
         employee_warning = "Вы не зарегистрированы как сотрудник. Обратитесь к администратору."
         await update.message.reply_text(
@@ -785,7 +806,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Chat ID: {update.effective_chat.id}\n\n"
             f"Текст для сотрудника: {employee_warning}\n\n"
             "Добавьте сотрудника через кнопку:\n"
-            "➕ Добавить сотрудника"
+            "➕ Добавить сотрудника\n\n"
+            "Telegram ID подставится автоматически."
         )
         if ADMIN_ID:
             try:
