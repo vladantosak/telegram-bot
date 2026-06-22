@@ -171,6 +171,11 @@ def init_db():
         """
     )
 
+    # Очистка тестовых или отмененных данных сотрудника ("Отмена")
+    conn.execute(
+        "DELETE FROM workers WHERE last_name LIKE '%Отмена%' OR first_name LIKE '%Отмена%' OR position LIKE '%Отмена%'"
+    )
+
     conn.commit()
     conn.close()
 
@@ -615,7 +620,10 @@ def generate_daily_summary_text(report_date: str) -> str:
         elif r_dict["report_type"] == "daily_fact":
             reports_by_worker[tid]["daily_fact"].append(r_dict)
 
-    summary_lines = [f"📊 Сводка отчетов за {report_date}\n"]
+    summary_lines = [
+        f"📊 Сводка отчетов за {report_date}",
+        ""
+    ]
     
     workers_by_dept = {}
     for w in workers:
@@ -626,6 +634,7 @@ def generate_daily_summary_text(report_date: str) -> str:
 
     for dept, dept_workers in workers_by_dept.items():
         summary_lines.append(f"🏢 Отдел: {dept}")
+        summary_lines.append("──────────────────────────")
         for w in dept_workers:
             tid = w["telegram_id"]
             name = f"{w['last_name']} {w['first_name']}"
@@ -634,32 +643,53 @@ def generate_daily_summary_text(report_date: str) -> str:
             # 1. Почасовые статусы
             schedule_slots = SCHEDULES.get(w["schedule"], SCHEDULE_A)
             status_segments = []
+            issues_list = []
+            
             for slot in schedule_slots:
                 rep = w_reports["status"].get(slot)
                 if rep:
                     status_icon = "✅" if rep["is_ok"] else "⚠️"
                     late_icon = "⏰" if rep["is_late"] else ""
-                    comment = f" ({rep['format_comment']})" if not rep["is_ok"] else ""
-                    status_segments.append(f"{slot}:{status_icon}{late_icon}{comment}")
+                    status_segments.append(f"{slot} {status_icon}{late_icon}")
+                    if not rep["is_ok"]:
+                        comment = rep["format_comment"] or "Есть замечание"
+                        if comment.startswith("не ОК, "):
+                            comment = comment[len("не ОК, "):]
+                        elif comment.startswith("не ОК: "):
+                            comment = comment[len("не ОК: "):]
+                        issues_list.append(f"• {slot} — {comment}")
                 else:
-                    status_segments.append(f"{slot}:❌")
+                    status_segments.append(f"{slot} ❌")
             
             status_str = " | ".join(status_segments)
-            summary_lines.append(f"  • {name}")
-            summary_lines.append(f"    📢 Статусы: {status_str}")
-
+            
             # 2. Факт дня (daily_fact)
             if w["needs_daily_fact"]:
                 fact_reps = w_reports["daily_fact"]
                 if fact_reps:
                     f_rep = fact_reps[-1]
-                    fact_icon = "✅" if f_rep["is_ok"] else "⚠️"
-                    comment = f" ({f_rep['format_comment']})" if not f_rep["is_ok"] else ""
-                    summary_lines.append(f"    📝 Итог дня (Факт): {fact_icon}{comment}")
+                    if f_rep["is_ok"]:
+                        fact_str = "✅ Сдан"
+                    else:
+                        comment = f_rep["format_comment"] or "Есть замечание"
+                        if comment.startswith("не ОК, "):
+                            comment = comment[len("не ОК, "):]
+                        elif comment.startswith("не ОК: "):
+                            comment = comment[len("не ОК: "):]
+                        fact_str = f"⚠️ Замечание ({comment})"
                 else:
-                    summary_lines.append(f"    📝 Итог дня (Факт): ❌ Не отправлен")
+                    fact_str = "❌ Не отправлен"
             else:
-                summary_lines.append(f"    📝 Итог дня (Факт): Не требуется")
+                fact_str = "⚪ Не требуется"
+
+            summary_lines.append(f"👨‍💻 {name}")
+            summary_lines.append(f"   ⏱ Статусы:  {status_str}")
+            summary_lines.append(f"   📋 Итог дня: {fact_str}")
+            if issues_list:
+                summary_lines.append("   ⚠️ Замечания по статусам:")
+                for issue in issues_list:
+                    summary_lines.append(f"     {issue}")
+            summary_lines.append("")
         summary_lines.append("")
 
     return "\n".join(summary_lines)
@@ -711,7 +741,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"🔧 Оценка отчета изменена вручную администратором @{query.from_user.username or user_id}:\n"
             f"Сотрудник: {worker_name}\n"
             f"Дата отчета: {report['report_date']}\n"
-            f"Слот/Тип: {report['slot_time'] or report['report_type']}\n"
+            f"Статус/Тип: {report['slot_time'] or report['report_type']}\n"
             f"Новый статус: {status_emoji} ({new_comment})"
         )
         
@@ -1250,14 +1280,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
         nearest_slot, is_late = find_nearest_slot(sched_list, now)
 
-        # Решение проблемы 5: Проверка дубликатов для одной даты и слота/типа
-        if check_duplicate_report(user_id, date_str, ai_res["report_type"], nearest_slot):
-            if ai_res["report_type"] == "status":
-                await update.message.reply_text(f"⚠️ Вы уже отправляли отчет по статусу за сегодня (слот {nearest_slot}).")
-            else:
-                await update.message.reply_text("⚠️ Вы уже отправляли итоговый факт дня на сегодня.")
-            return
-
         report_id = save_report(
             telegram_id=user_id,
             report_date=date_str,
@@ -1287,7 +1309,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         notify_text = (
             f"📊 {is_ok_emoji} Новый отчет: {w_name}\n"
-            f"Тип/Слот: {nearest_slot if ai_res['report_type'] == 'status' else 'Факт дня (Итог)'}\n"
+            f"Тип/Статус: {nearest_slot if ai_res['report_type'] == 'status' else 'Факт дня (Итог)'}\n"
             f"Оценка ИИ: {'ОК' if ai_res['is_ok'] else 'НЕ ОК'}\n"
             f"Комментарий ИИ: {ai_res['format_comment']}\n"
             f"Группа: {gname}\n"
