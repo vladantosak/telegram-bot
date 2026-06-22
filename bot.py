@@ -80,7 +80,8 @@ SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
     ASK_ORDER_DEPARTMENT,
     ASK_ORDER_WORKER,
     ASK_ORDER_DIRECTION,
-) = range(21)
+    ASK_EDIT_SORT_ORDER,
+) = range(22)
 
 # Клавиатуры
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -1036,7 +1037,7 @@ async def list_workers_select(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Добавление кнопки Истории еженедельных оценок (проблема 6)
     kbd = ReplyKeyboardMarkup(
         [
-            ["📅 История за неделю"],
+            ["📅 История за неделю", "✏️ Номер в списке"],
             ["✏️ Изменить фамилию", "✏️ Изменить имя"],
             ["✏️ Изменить отдел", "✏️ Изменить график"],
             ["✏️ Изменить группу", "✏️ Факт дня"],
@@ -1063,6 +1064,14 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(history_text, reply_markup=MAIN_MENU)
         context.user_data.clear()
         return ConversationHandler.END
+
+    if action == "✏️ Номер в списке":
+        await update.message.reply_text(
+            f"Введите новый порядковый номер для {worker['last_name']} {worker['first_name']}\n"
+            f"(сейчас он под номером {idx + 1}, всего в отделе {len(rows)} сотрудников):",
+            reply_markup=CANCEL_KEYBOARD
+        )
+        return ASK_EDIT_SORT_ORDER
 
     if action in ("🔼 Вверх в списке", "🔽 Вниз в списке"):
         target_idx = idx - 1 if action == "🔼 Вверх в списке" else idx + 1
@@ -1140,6 +1149,63 @@ async def edit_daily_fact_finish(update: Update, context: ContextTypes.DEFAULT_T
     worker = context.user_data.get("edit_worker")
     update_worker_field(worker["telegram_id"], "needs_daily_fact", 1 if raw == "да" else 0)
     await update.message.reply_text(f"Параметр Факт Дня изменен на: {raw}", reply_markup=MAIN_MENU)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def edit_sort_order_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    if raw == "❌ Отмена":
+        await update.message.reply_text("Изменение отменено.", reply_markup=MAIN_MENU)
+        context.user_data.clear()
+        return ConversationHandler.END
+        
+    if not raw.isdigit():
+        await update.message.reply_text("Пожалуйста, введите положительное целое число для порядкового номера:")
+        return ASK_EDIT_SORT_ORDER
+        
+    target_num = int(raw)
+    worker = context.user_data.get("edit_worker")
+    rows = context.user_data.get("list_rows", [])
+    
+    if not worker or not rows:
+        await update.message.reply_text("Ошибка сессии. Начните сначала.", reply_markup=MAIN_MENU)
+        context.user_data.clear()
+        return ConversationHandler.END
+        
+    num_workers = len(rows)
+    if target_num < 1 or target_num > num_workers:
+        await update.message.reply_text(f"Недопустимый порядковый номер. Пожалуйста, введите число от 1 до {num_workers}:")
+        return ASK_EDIT_SORT_ORDER
+        
+    target_idx = target_num - 1 # 0-based target index
+    
+    position = worker["position"]
+    all_dept_workers = [dict(r) for r in get_workers_by_position(position)]
+    
+    target_worker_id = worker["telegram_id"]
+    worker_to_move = None
+    for idx, w in enumerate(all_dept_workers):
+        if w["telegram_id"] == target_worker_id:
+            worker_to_move = all_dept_workers.pop(idx)
+            break
+            
+    if worker_to_move is not None:
+        all_dept_workers.insert(target_idx, worker_to_move)
+        
+        conn = get_db()
+        for i, w in enumerate(all_dept_workers):
+            conn.execute("UPDATE workers SET sort_order = ? WHERE telegram_id = ?", (i, w["telegram_id"]))
+        conn.commit()
+        conn.close()
+        
+        name = f"{worker['last_name']} {worker['first_name']}"
+        await update.message.reply_text(
+            f"✅ Порядковый номер сотрудника {name} успешно изменен на {target_num}.",
+            reply_markup=MAIN_MENU
+        )
+    else:
+        await update.message.reply_text("Сотрудник не найден в текущем списке отдела.", reply_markup=MAIN_MENU)
+        
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1636,6 +1702,7 @@ def main():
             ASK_EDIT_GROUP_VALUE: [MessageHandler(DIALOG_TEXT, edit_group_finish)],
             ASK_EDIT_SCHEDULE: [MessageHandler(DIALOG_TEXT, edit_schedule_finish)],
             ASK_EDIT_DAILY_FACT: [MessageHandler(DIALOG_TEXT, edit_daily_fact_finish)],
+            ASK_EDIT_SORT_ORDER: [MessageHandler(DIALOG_TEXT, edit_sort_order_finish)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
     )
