@@ -21,13 +21,13 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Настройки и конфигурация из окружения
+# Конфигурация из переменных окружения
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DB_PATH = os.environ.get("DB_PATH", "workers.db")
 DEFAULT_GROUP_ID = int(os.environ.get("GROUP_ID", "-1003804380536"))
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-# 1. Исправление: Поддержка списка администраторов через запятую
+# 1. Список администраторов вместо одного ID
 ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "0").split(",") if x.strip().isdigit()}
 if not ADMIN_IDS and os.environ.get("ADMIN_ID"):
     ADMIN_IDS = {int(os.environ.get("ADMIN_ID"))}
@@ -46,7 +46,7 @@ SCHEDULE_A = ["10:00", "12:00", "15:00", "17:00"]
 SCHEDULE_B = ["11:00", "13:00", "16:00", "18:00"]
 SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
 
-# Состояния разговорных обработчиков
+# Состояния ConversationHandler
 (
     ASK_WORKER_ID,
     ASK_LASTNAME,
@@ -66,17 +66,13 @@ SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
     ASK_EDIT_SCHEDULE,
     ASK_EDIT_DAILY_FACT,
     ASK_EDIT_GROUP_VALUE,
-    ASK_ORDER_DEPARTMENT,
-    ASK_ORDER_WORKER,
-    ASK_ORDER_DIRECTION,
-) = range(21)
+) = range(18)
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         ["📋 Сотрудники", "📊 Сводка сейчас"],
         ["➕ Добавить сотрудника", "➖ Удалить сотрудника"],
-        ["🏢 Сотрудники отдела", "⏰ Время сводки"],
-        ["🆔 ID чата"],
+        ["⏰ Время сводки", "🆔 ID чата"],
     ],
     resize_keyboard=True,
 )
@@ -88,7 +84,7 @@ CANCEL_TEXT = "❌ Отмена"
 DIALOG_TEXT = filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{CANCEL_TEXT}$")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# База данных
+# БАЗА ДАННЫХ
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_db():
@@ -112,8 +108,7 @@ def init_db():
         )
         """
     )
-    
-    # 12. Исправление: Таблица для сохранения системных настроек (время сводки и т.д.)
+    # 12. Сохранение системных настроек в базу данных
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS settings (
@@ -122,16 +117,6 @@ def init_db():
         )
         """
     )
-
-    cols = {row["name"] for row in conn.execute("PRAGMA table_info(workers)").fetchall()}
-    for col, definition in [
-        ("schedule", "TEXT NOT NULL DEFAULT 'A'"),
-        ("needs_daily_fact", "INTEGER NOT NULL DEFAULT 1"),
-        ("sort_order", "INTEGER NOT NULL DEFAULT 0"),
-    ]:
-        if col not in cols:
-            conn.execute(f"ALTER TABLE workers ADD COLUMN {col} {definition}")
-
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS groups (
@@ -140,8 +125,7 @@ def init_db():
         )
         """
     )
-
-    # 5. Исправление: Добавлен UNIQUE constraint для исключения дубликатов в рамках одного слота/типа за день
+    # 4. и 5. Исправление дублей и явное разделение на status и daily_fact
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS reports (
@@ -159,6 +143,17 @@ def init_db():
         )
         """
     )
+    
+    # Миграция колонок на всякий случай
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(workers)").fetchall()}
+    for col, definition in [
+        ("schedule", "TEXT NOT NULL DEFAULT 'A'"),
+        ("needs_daily_fact", "INTEGER NOT NULL DEFAULT 1"),
+        ("sort_order", "INTEGER NOT NULL DEFAULT 0"),
+    ]:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE workers ADD COLUMN {col} {definition}")
+            
     conn.commit()
     conn.close()
 
@@ -170,9 +165,7 @@ def get_worker(telegram_id: int):
 
 def get_all_workers():
     conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM workers ORDER BY position, sort_order, last_name, first_name"
-    ).fetchall()
+    rows = conn.execute("SELECT * FROM workers ORDER BY position, sort_order, last_name, first_name").fetchall()
     conn.close()
     return rows
 
@@ -185,13 +178,25 @@ def get_workers_by_position(position: str):
     conn.close()
     return rows
 
-def update_worker_field(telegram_id: int, field: str, value):
-    allowed = {"last_name", "first_name", "position", "group_id", "schedule", "needs_daily_fact", "sort_order"}
-    if field not in allowed:
-        raise ValueError(f"Недопустимое поле: {field}")
-    
+def upsert_worker(telegram_id: int, last_name: str, first_name: str, position: str, group_id: int, schedule: str, needs_daily_fact: bool, sort_order: int = 0):
     conn = get_db()
-    # 9. Исправление: Если меняется отдел (position), сбрасываем sort_order в 0
+    conn.execute(
+        """
+        INSERT INTO workers (telegram_id, last_name, first_name, position, group_id, schedule, needs_daily_fact, sort_order)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET
+            last_name=excluded.last_name, first_name=excluded.first_name, position=excluded.position,
+            group_id=excluded.group_id, schedule=excluded.schedule, needs_daily_fact=excluded.needs_daily_fact,
+            sort_order=excluded.sort_order
+        """,
+        (telegram_id, last_name, first_name, position, group_id, schedule, int(needs_daily_fact), sort_order),
+    )
+    conn.commit()
+    conn.close()
+
+def update_worker_field(telegram_id: int, field: str, value):
+    conn = get_db()
+    # 9. Сброс индекса сортировки при переводе в другой отдел
     if field == "position":
         conn.execute("UPDATE workers SET position = ?, sort_order = 0 WHERE telegram_id = ?", (value, telegram_id))
     else:
@@ -208,6 +213,14 @@ def swap_sort_order(id1: int, id2: int):
         conn.execute("UPDATE workers SET sort_order = ? WHERE telegram_id = ?", (r1["sort_order"], id2))
         conn.commit()
     conn.close()
+
+def delete_worker(telegram_id: int) -> bool:
+    conn = get_db()
+    cur = conn.execute("DELETE FROM workers WHERE telegram_id = ?", (telegram_id,))
+    conn.commit()
+    deleted = cur.rowcount > 0
+    conn.close()
+    return deleted
 
 def save_group_name(group_id: int, group_name: str):
     conn = get_db()
@@ -239,29 +252,17 @@ async def fetch_and_save_group_name(bot, group_id: int) -> str:
     save_group_name(group_id, name)
     return name
 
-def save_report(telegram_id: int, report_date: str, report_type: str, slot_time: str | None, received_at: str, is_ok: bool, is_late: bool, format_comment: str, required_action: str):
-    conn = get_db()
-    conn.execute(
-        """
-        INSERT INTO reports (telegram_id, report_date, report_type, slot_time, received_at, is_ok, is_late, format_comment, required_action)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (telegram_id, report_date, report_type, slot_time, received_at, int(is_ok), int(is_late), format_comment, required_action),
-    )
-    conn.commit()
-    conn.close()
-
-# 6. Улучшение: Получение истории последних 7 отчетов сотрудника
+# 6. История отчетов по сотруднику
 def get_worker_history(telegram_id: int, limit: int = 7):
     conn = get_db()
     rows = conn.execute(
-        "SELECT report_date, report_type, slot_time, is_ok, format_comment FROM reports WHERE telegram_id = ? ORDER BY received_at DESC LIMIT ?",
+        "SELECT report_date, report_type, slot_time, is_ok, format_comment FROM reports WHERE telegram_id = ? ORDER BY id DESC LIMIT ?",
         (telegram_id, limit)
     ).fetchall()
     conn.close()
     return rows
 
-# 7. Улучшение: Прямое принудительное исправление статуса отчета по его ID (Кнопки ИИ проверки)
+# 7. Изменение оценки ИИ вручную администратором
 def update_report_status_by_id(report_id: int, is_ok: bool, comment: str, action: str):
     conn = get_db()
     conn.execute(
@@ -283,7 +284,7 @@ async def require_admin(update: Update) -> bool:
 def menu_for_user(user_id: int):
     return MAIN_MENU if is_admin(user_id) else ReplyKeyboardRemove()
 
-def positions_keyboard(rows, extra=None):
+def positions_keyboard(rows):
     positions = sorted({row["position"] for row in rows})
     keyboard = [[p] for p in positions]
     keyboard.append(["❌ Отмена"])
@@ -297,21 +298,17 @@ def numbered_workers_keyboard(rows):
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ИИ / Анализ
+# ИИ АНАЛИЗАТОР
 # ══════════════════════════════════════════════════════════════════════════════
 
 def normalize_ai_result(data: dict, source_text: str) -> dict:
     text_lower = source_text.lower()
     report_type = str(data.get("report_type", "status")).strip().lower()
-
     fact_words = ("факт", "факт дня", "за день", "итог дня", "итоги дня", "сегодня за день", "дневной отчет")
-    status_words = ("статус", "сейчас", "на данный момент", "за 10", "за 11", "за 12", "за 13", "за 15", "за 16", "за 17", "за 18")
 
     if any(word in text_lower for word in fact_words):
         report_type = "daily_fact"
-    elif any(word in text_lower for word in status_words):
-        report_type = "status"
-    elif report_type not in ("status", "daily_fact"):
+    else:
         report_type = "status"
 
     is_ok = bool(data.get("is_ok", False))
@@ -320,17 +317,13 @@ def normalize_ai_result(data: dict, source_text: str) -> dict:
     employee_message = str(data.get("employee_message") or "").strip()
 
     if is_ok:
-        issue = ""
         format_comment = "всё ОК"
         required_action = "ничего не предпринимать"
-        employee_message = ""
     else:
-        if not issue:
-            issue = "есть замечания по отчету"
+        if not issue: issue = "есть замечания по отчету"
         format_comment = f"не ОК, {issue}"
         required_action = f"сделал замечание сотруднику: {issue}"
-        if not employee_message:
-            employee_message = f"В отчете есть замечание: {issue}. В следующем отчете исправьте это."
+        if not employee_message: employee_message = f"В отчете есть замечание: {issue}."
 
     return {
         "report_type": report_type,
@@ -342,82 +335,57 @@ def normalize_ai_result(data: dict, source_text: str) -> dict:
 
 def find_nearest_slot(schedule: list[str], now: datetime):
     current_minutes = now.hour * 60 + now.minute
-    nearest_slot = None
-    nearest_diff = None
-
+    nearest_slot, nearest_diff = None, None
     for slot in schedule:
         hour, minute = map(int, slot.split(":"))
-        slot_minutes = hour * 60 + minute
-        diff = abs(current_minutes - slot_minutes)
+        diff = abs(current_minutes - (hour * 60 + minute))
         if nearest_diff is None or diff < nearest_diff:
             nearest_diff = diff
             nearest_slot = slot
-
-    is_late = nearest_diff is not None and nearest_diff > LATE_THRESHOLD_MIN
-    return nearest_slot, is_late
+    return nearest_slot, (nearest_diff is not None and nearest_diff > LATE_THRESHOLD_MIN)
 
 def transcribe_audio(file_path: str) -> str:
-    if groq_client is None:
-        return "Не задан GROQ_API_KEY, аудио не распознано."
+    if groq_client is None: return "Не задан GROQ_API_KEY."
     try:
         with open(file_path, "rb") as f:
-            transcription = groq_client.audio.transcriptions.create(
-                file=(os.path.basename(file_path), f),
-                model="whisper-large-v3",
-                language="ru",
-                response_format="text",
-            )
-        return transcription.strip()
+            return groq_client.audio.transcriptions.create(
+                file=(os.path.basename(file_path), f), model="whisper-large-v3", language="ru", response_format="text"
+            ).strip()
     except Exception as e:
-        return f"Ошибка распознавания аудио: {e}"
+        return f"Ошибка распознавания: {e}"
 
-# 10. Улучшение: Использование более точной промышленной модели llama-3.3-70b-versatile
+# 10. Замена на мощную контекстную модель Llama-3.3-70b
 CHECK_PROMPT_TEMPLATE = """
-Ты — строгий, но справедливый проверяющий видеоотчётов сотрудников строительной бригады.
-
-━━━ ДВА ТИПА ОТЧЁТА ━━━
-1. «status» — текущий статус за конкретное время суток.
-2. «daily_fact» — итог за весь день.
-
-Объём работы НЕ обязательно должен быть числом. Если ясно, ЧТО именно делалось («шпаклевал стену», «работал на экскаваторе») — объём считается указанным.
-
-Верни только JSON без Markdown:
+Ты — строгий проверяющий строительных видеоотчётов.
+Верни только плоский JSON:
 {{
   "report_type": "status" или "daily_fact",
   "is_ok": true или false,
-  "issue": "короткое замечание или пустая строка",
-  "required_action": "ничего не предпринимать или конкретное действие",
-  "employee_message": "сообщение сотруднику или пустая строка"
+  "issue": "замечание или пустая строка",
+  "required_action": "действие",
+  "employee_message": "сообщение работнику"
 }}
-
-━━━ РАСШИФРОВКА ОТЧЁТА ━━━
-{text}
+Текст отчета: {text}
 """
 
 def check_status(text: str) -> dict:
-    if groq_client is None:
-        return normalize_ai_result({"report_type": "status", "is_ok": False, "issue": "GROQ_API_KEY не задан"}, text)
-
-    prompt = CHECK_PROMPT_TEMPLATE.format(text=text)
+    if groq_client is None: return normalize_ai_result({"is_ok": False}, text)
     try:
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "Отвечай только валидным JSON без Markdown."},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": "Отвечай только валидным JSON без markdown."},
+                {"role": "user", "content": CHECK_PROMPT_TEMPLATE.format(text=text)},
             ],
-            max_tokens=400,
             temperature=0,
-            response_format={"type": "json_object"},
+            response_format={"type": "json_object"}
         )
-        raw = response.choices[0].message.content.strip()
-        data = json.loads(raw)
-        return normalize_ai_result(data, text)
+        return normalize_ai_result(json.loads(response.choices[0].message.content.strip()), text)
     except Exception as e:
-        return normalize_ai_result({"report_type": "status", "is_ok": False, "issue": f"Ошибка ИИ: {e}"}, text)
+        return normalize_ai_result({"is_ok": False, "issue": f"Ошибка ИИ: {e}"}, text)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Обработчики интерфейса управления
+# ОБРАБОТЧИКИ ИНТЕРФЕЙСА УПРАВЛЕНИЯ
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -436,7 +404,7 @@ async def list_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("В базе пока нет сотрудников.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
     kbd, _ = positions_keyboard(rows)
-    await update.message.reply_text("Выберите отдел для управления сотрудниками:", reply_markup=kbd)
+    await update.message.reply_text("Выберите отдел:", reply_markup=kbd)
     return ASK_LIST_DEPARTMENT
 
 async def list_workers_department(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -457,8 +425,8 @@ async def list_workers_department(update: Update, context: ContextTypes.DEFAULT_
         gname = group_names.get(row["group_id"], str(row["group_id"]))
         lines.append(f"{i}. {row['last_name']} {row['first_name']}\n   График: {row['schedule']} ({schedule_str})\n   Группа: {gname} | Факт дня: {fact}")
 
-    # 11. Исправление: Текст и инлайн-интерфейс объединены в один аккуратный вызов клавиатуры
-    await update.message.reply_text("\n".join(lines) + "\n\nВыберите сотрудника для редактирования:", reply_markup=numbered_workers_keyboard(rows))
+    # 11. Сообщения объединены в один вызов для улучшения UX
+    await update.message.reply_text("\n".join(lines) + "\n\nВыберите сотрудника для действий:", reply_markup=numbered_workers_keyboard(rows))
     return ASK_LIST_WORKER
 
 async def list_workers_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -479,25 +447,16 @@ async def list_workers_select(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["edit_worker_idx"] = idx
 
     schedule_str = ", ".join(SCHEDULES.get(worker["schedule"], SCHEDULE_A))
-    fact = "да" if worker["needs_daily_fact"] else "нет"
     gname = get_group_name(worker["group_id"])
-    
-    info = (
-        f"👤 {worker['last_name']} {worker['first_name']}\n"
-        f"Отдел: {worker['position']}\n"
-        f"График: {worker['schedule']} ({schedule_str})\n"
-        f"Группа: {gname}\n"
-        f"Факт дня: {fact}\n\n"
-        "Доступные действия:"
-    )
+    info = f"👤 {worker['last_name']} {worker['first_name']}\nОтдел: {worker['position']}\nГрафик: {worker['schedule']} ({schedule_str})\nГруппа: {gname}\nФакт дня: {'да' if worker['needs_daily_fact'] else 'нет'}"
 
     kbd = ReplyKeyboardMarkup(
         [
             ["✏️ Изменить фамилию", "✏️ Изменить имя"],
             ["✏️ Изменить отдел", "✏️ Изменить график"],
             ["✏️ Изменить группу", "✏️ Факт дня"],
-            ["📊 История отчетов", "🔼 Вверх в списке"],
-            ["🔽 Вниз в списке", "❌ Отмена"],
+            ["📊 История отчетов", "🔼 Вверх", "🔽 Вниз"],
+            ["❌ Отмена"],
         ],
         resize_keyboard=True,
     )
@@ -510,57 +469,48 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     rows = context.user_data.get("list_rows", [])
     idx = context.user_data.get("edit_worker_idx", 0)
 
-    if not worker:
-        await update.message.reply_text("Ошибка сессии. Начните сначала.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
+    if not worker: return ConversationHandler.END
 
-    # 6. Улучшение: Показ истории по сотруднику при выборе кнопки
     if action == "📊 История отчетов":
         history = get_worker_history(worker["telegram_id"])
         if not history:
-            await update.message.reply_text("История отчетов пуста.", reply_markup=MAIN_MENU)
+            await update.message.reply_text("История пуста.", reply_markup=MAIN_MENU)
         else:
-            text = f"📋 Последние отчеты: {worker['last_name']} {worker['first_name']}:\n\n"
+            text = f"📋 Последние отчеты {worker['last_name']}:\n\n"
             for h in history:
-                status_icon = "✅" if h["is_ok"] else "❌"
-                t_type = "Факт" if h["report_type"] == "daily_fact" else f"Статус ({h['slot_time']})"
-                text += f"{status_icon} [{h['report_date']}] {t_type}: {h['format_comment']}\n"
+                text += f"{'✅' if h['is_ok'] else '❌'} [{h['report_date']}] {h['report_type']} ({h['slot_time'] or 'Итог'}): {h['format_comment']}\n"
             await update.message.reply_text(text, reply_markup=MAIN_MENU)
         context.user_data.clear()
         return ConversationHandler.END
 
-    if action in ("🔼 Вверх в списке", "🔽 Вниз в списке"):
-        target_idx = idx - 1 if action == "🔼 Вверх в списке" else idx + 1
+    if action in ("🔼 Вверх", "🔽 Вниз"):
+        target_idx = idx - 1 if action == "🔼 Вверх" else idx + 1
         if target_idx < 0 or target_idx >= len(rows):
-            await update.message.reply_text("Сотрудник уже на краю списка.", reply_markup=MAIN_MENU)
+            await update.message.reply_text("Предел списка.", reply_markup=MAIN_MENU)
             return ConversationHandler.END
-
         swap_sort_order(worker["telegram_id"], rows[target_idx]["telegram_id"])
-        await update.message.reply_text(f"Порядок сортировки изменен.", reply_markup=MAIN_MENU)
+        await update.message.reply_text("Порядок изменен.", reply_markup=MAIN_MENU)
         context.user_data.clear()
         return ConversationHandler.END
 
     field_map = {
-        "✏️ Изменить фамилию": ("last_name", "Введите новую фамилию:"),
-        "✏️ Изменить имя": ("first_name", "Введите новое имя:"),
-        "✏️ Изменить отдел": ("position", "Введите новое название отдела (сортировка сбросится):"),
-        "✏️ Изменить группу": ("group_id", f"Введите новый ID группы Telegram (0 = по умолчанию):"),
+        "✏️ Изменить фамилию": ("last_name", "Новая фамилия:"),
+        "✏️ Изменить имя": ("first_name", "Новое имя:"),
+        "✏️ Изменить отдел": ("position", "Новый отдел (позиция сбросится):"),
+        "✏️ Изменить группу": ("group_id", "Новый ID группы (0 = дефолт):"),
         "✏️ Изменить график": ("schedule", None),
         "✏️ Факт дня": ("needs_daily_fact", None),
     }
 
-    if action not in field_map:
-        await update.message.reply_text("Действие отменено.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
-
+    if action not in field_map: return ConversationHandler.END
     field, prompt = field_map[action]
     context.user_data["edit_field"] = field
 
     if field == "schedule":
-        await update.message.reply_text("Выберите новый график:", reply_markup=SCHEDULE_KEYBOARD)
+        await update.message.reply_text("Выберите график:", reply_markup=SCHEDULE_KEYBOARD)
         return ASK_EDIT_SCHEDULE
     if field == "needs_daily_fact":
-        await update.message.reply_text("Нужен ли сотруднику ежедневный факт дня?", reply_markup=YES_NO_KEYBOARD)
+        await update.message.reply_text("Нужен ли факт дня?", reply_markup=YES_NO_KEYBOARD)
         return ASK_EDIT_DAILY_FACT
     if field == "group_id":
         await update.message.reply_text(prompt, reply_markup=CANCEL_KEYBOARD)
@@ -572,25 +522,18 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def edit_value_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value = update.message.text.strip()
     worker = context.user_data.get("edit_worker")
-    field = context.user_data.get("edit_field")
-
-    update_worker_field(worker["telegram_id"], field, value)
-    await update.message.reply_text(f"Успешно изменено.", reply_markup=MAIN_MENU)
+    update_worker_field(worker["telegram_id"], context.user_data.get("edit_field"), value)
+    await update.message.reply_text("Изменения внесены.", reply_markup=MAIN_MENU)
     context.user_data.clear()
     return ConversationHandler.END
 
 async def edit_group_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.strip()
     try:
-        group_id = int(raw)
-    except ValueError:
-        await update.message.reply_text("Введите корректный ID.")
-        return ASK_EDIT_GROUP_VALUE
-
+        group_id = int(update.message.text.strip())
+    except ValueError: return ASK_EDIT_GROUP_VALUE
     worker = context.user_data.get("edit_worker")
     final_id = DEFAULT_GROUP_ID if group_id == 0 else group_id
     update_worker_field(worker["telegram_id"], "group_id", final_id)
-
     gname = await fetch_and_save_group_name(context.bot, final_id)
     await update.message.reply_text(f"Группа привязана: {gname}", reply_markup=MAIN_MENU)
     context.user_data.clear()
@@ -599,96 +542,157 @@ async def edit_group_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def edit_schedule_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip().upper()
     if raw not in SCHEDULES: return ASK_EDIT_SCHEDULE
-    worker = context.user_data.get("edit_worker")
-    update_worker_field(worker["telegram_id"], "schedule", raw)
-    await update.message.reply_text(f"График обновлен на {raw}", reply_markup=MAIN_MENU)
+    update_worker_field(context.user_data.get("edit_worker")["telegram_id"], "schedule", raw)
+    await update.message.reply_text("График обновлен.", reply_markup=MAIN_MENU)
     context.user_data.clear()
     return ConversationHandler.END
 
 async def edit_daily_fact_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip().lower()
     if raw not in ("да", "нет"): return ASK_EDIT_DAILY_FACT
-    worker = context.user_data.get("edit_worker")
-    update_worker_field(worker["telegram_id"], "needs_daily_fact", 1 if raw == "да" else 0)
-    await update.message.reply_text(f"Изменения сохранены.", reply_markup=MAIN_MENU)
+    update_worker_field(context.user_data.get("edit_worker")["telegram_id"], "needs_daily_fact", 1 if raw == "да" else 0)
+    await update.message.reply_text("Настройка сохранена.", reply_markup=MAIN_MENU)
     context.user_data.clear()
     return ConversationHandler.END
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Обработчик входящих видео и аудио отчетов
+# ИНТЕГРАЦИЯ ДОБАВЛЕНИЯ И УДАЛЕНИЯ СОТРУДНИКОВ
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def add_worker_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return ConversationHandler.END
+    context.user_data.clear()
+    
+    # 3. Безопасное получение данных из словаря незарегистрированных пользователей
+    pending_users = context.application.bot_data.get("pending_users", {})
+    if pending_users:
+        uid, p_user = pending_users.popitem()
+        context.user_data["new_worker_id"] = p_user["telegram_id"]
+        await update.message.reply_text(f"ID заполнен из очереди: {p_user['telegram_id']} ({p_user['name']})\nВведите фамилию:", reply_markup=CANCEL_KEYBOARD)
+        return ASK_LASTNAME
+
+    await update.message.reply_text("Введите Telegram ID сотрудника:", reply_markup=CANCEL_KEYBOARD)
+    return ASK_WORKER_ID
+
+async def add_worker_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    if not raw.lstrip("-").isdigit(): return ASK_WORKER_ID
+    context.user_data["new_worker_id"] = int(raw)
+    await update.message.reply_text("Введите фамилию:", reply_markup=CANCEL_KEYBOARD)
+    return ASK_LASTNAME
+
+async def add_worker_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["last_name"] = update.message.text.strip()
+    await update.message.reply_text("Введите имя:", reply_markup=CANCEL_KEYBOARD)
+    return ASK_FIRSTNAME
+
+async def add_worker_firstname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["first_name"] = update.message.text.strip()
+    await update.message.reply_text("Введите отдел/должность:", reply_markup=CANCEL_KEYBOARD)
+    return ASK_POSITION
+
+async def add_worker_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["position"] = update.message.text.strip()
+    await update.message.reply_text("Введите ID рабочей группы (0 = по умолчанию):", reply_markup=CANCEL_KEYBOARD)
+    return ASK_GROUP
+
+async def add_worker_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        gid = int(update.message.text.strip())
+    except ValueError: return ASK_GROUP
+    context.user_data["group_id"] = DEFAULT_GROUP_ID if gid == 0 else gid
+    await update.message.reply_text("Выберите график:", reply_markup=SCHEDULE_KEYBOARD)
+    return ASK_SCHEDULE
+
+async def add_worker_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip().upper()
+    if raw not in SCHEDULES: return ASK_SCHEDULE
+    context.user_data["schedule"] = raw
+    await update.message.reply_text("Нужен ли факт дня? (Да/Нет):", reply_markup=YES_NO_KEYBOARD)
+    return ASK_NEEDS_DAILY_FACT
+
+async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip().lower()
+    if raw not in ("да", "нет"): return ASK_NEEDS_DAILY_FACT
+    
+    upsert_worker(
+        telegram_id=context.user_data["new_worker_id"],
+        last_name=context.user_data["last_name"],
+        first_name=context.user_data["first_name"],
+        position=context.user_data["position"],
+        group_id=context.user_data["group_id"],
+        schedule=context.user_data["schedule"],
+        needs_daily_fact=(raw == "да")
+    )
+    await update.message.reply_text("Сотрудник успешно добавлен!", reply_markup=MAIN_MENU)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def remove_worker_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return ConversationHandler.END
+    rows = get_all_workers()
+    if not rows:
+        await update.message.reply_text("База пуста.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+    await update.message.reply_text("Введите Telegram ID сотрудника для удаления:", reply_markup=CANCEL_KEYBOARD)
+    return ASK_REMOVE_WORKER
+
+async def remove_worker_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        uid = int(update.message.text.strip())
+    except ValueError: return ASK_REMOVE_WORKER
+    if delete_worker(uid):
+        await update.message.reply_text("Сотрудник удален.", reply_markup=MAIN_MENU)
+    else:
+        await update.message.reply_text("ID не найден.", reply_markup=MAIN_MENU)
+    return ConversationHandler.END
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ПРИЕМ И ПЕРЕОПРЕДЕЛЕНИЕ ОБРАБОТКИ ОТЧЕТОВ
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_report_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     worker = get_worker(user.id)
-    
-    # 3. Исправление: Ввод потокобезопасного хранения во внутренний словарь bot_data
+
     if "pending_users" not in context.application.bot_data:
         context.application.bot_data["pending_users"] = {}
 
     if not worker:
-        context.application.bot_data["pending_users"][user.id] = {
-            "telegram_id": user.id,
-            "name": user.full_name,
-            "username": f"@{user.username}" if user.username else "нет"
-        }
-        # Уведомление админам о новом незарегистрированном пользователе
+        context.application.bot_data["pending_users"][user.id] = {"telegram_id": user.id, "name": user.full_name}
         for admin_id in ADMIN_IDS:
             try:
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=f"🤖 Неизвестный пользователь прислал файл!\nID: {user.id}\nИмя: {user.full_name}\n\nНажмите '➕ Добавить сотрудника' для быстрой привязки."
-                )
-            except Exception:
-                pass
-        await update.message.reply_text("Вы не зарегистрированы в системе. Администратор уведомлен.")
+                await context.bot.send_message(chat_id=admin_id, text=f"🤖 Неизвестный пользователь прислал отчет!\nID: {user.id}\nИмя: {user.full_name}")
+            except Exception: pass
+        await update.message.reply_text("Вы не зарегистрированы в системе.")
         return
 
-    # Загрузка и обработка аудио/видео файлов
     attachment = update.message.video or update.message.video_note or update.message.voice or update.message.audio
-    if not attachment:
-        await update.message.reply_text("Пожалуйста, отправьте видеоотчет или голосовое сообщение.")
-        return
+    if not attachment: return
 
-    msg = await update.message.reply_text("⏳ Получение файла и расшифровка ИИ...")
-    
-    # Генерация уникального локального пути в tmp
+    msg = await update.message.reply_text("⏳ Расшифровка медиа и анализ ИИ...")
     os.makedirs("tmp", exist_ok=True)
-    temp_file_path = f"tmp/file_{user.id}_{int(datetime.now().timestamp())}.mp4"
+    temp_path = f"tmp/file_{user.id}_{int(datetime.now().timestamp())}.mp4"
 
     try:
-        # Получение объекта файла
-        if update.message.video_note:
-            tg_file = await update.message.video_note.get_file()
-        elif update.message.video:
-            tg_file = await update.message.video.get_file()
-        elif update.message.voice:
-            tg_file = await update.message.voice.get_file()
-        else:
-            tg_file = await attachment.get_file()
-
-        await tg_file.download_to_drive(temp_file_path)
-
-        # Распознавание речи через Whisper
-        text_transcription = transcribe_audio(temp_file_path)
-        if not text_transcription or "Ошибка" in text_transcription:
-            await msg.edit_text(f"❌ Ошибка аудио: {text_transcription}")
+        tg_file = await attachment.get_file()
+        await tg_file.download_to_drive(temp_path)
+        
+        text = transcribe_audio(temp_path)
+        if not text or "Ошибка" in text:
+            await msg.edit_text("❌ Не удалось распознать аудиодорожку.")
             return
 
-        # Анализ параметров текста бизнес-логикой
-        ai_analysis = check_status(text_transcription)
+        ai = check_status(text)
         now = now_local()
-        current_date_str = now.strftime("%Y-%m-%d")
-        current_time_str = now.strftime("%H:%M:%S")
+        date_str = now.strftime("%Y-%m-%d")
+        time_str = now.strftime("%H:%M:%S")
 
         slot_time = None
         is_late = False
+        if ai["report_type"] == "status":
+            slot_time, is_late = find_nearest_slot(SCHEDULES.get(worker["schedule"], SCHEDULE_A), now)
 
-        if ai_analysis["report_type"] == "status":
-            worker_schedule = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
-            slot_time, is_late = find_nearest_slot(worker_schedule, now)
-
-        # Сохранение в базу данных
         conn = get_db()
         cursor = conn.cursor()
         cursor.execute(
@@ -696,147 +700,100 @@ async def handle_report_video(update: Update, context: ContextTypes.DEFAULT_TYPE
             INSERT INTO reports (telegram_id, report_date, report_type, slot_time, received_at, is_ok, is_late, format_comment, required_action)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user.id, current_date_str, ai_analysis["report_type"], slot_time, current_time_str, int(ai_analysis["is_ok"]), int(is_late), ai_analysis["format_comment"], ai_analysis["required_action"])
+            (user.id, date_str, ai["report_type"], slot_time, time_str, int(ai["is_ok"]), int(is_late), ai["format_comment"], ai["required_action"])
         )
-        report_db_id = cursor.lastrowid
+        report_id = cursor.lastrowid
         conn.commit()
         conn.close()
 
-        # Формирование ответа сотруднику
-        if ai_analysis["is_ok"]:
-            late_text = " (С опозданием!)" if is_late else ""
-            await msg.edit_text(f"✅ Отчет успешно принят! Тип: {ai_analysis['report_type']}{late_text}")
-        else:
-            await msg.edit_text(f"⚠️ Отчет принят, но ИИ выявил замечание: {ai_analysis['employee_message']}")
+        await msg.edit_text("✅ Отчет успешно принят и сохранен!" if ai["is_ok"] else f"⚠️ Замечание ИИ: {ai['employee_message']}")
 
-        # 7. Улучшение: Инлайн-клавиатура для ручного переопределения оценки ИИ администратором в группе
+        # 7. Инлайн-кнопки для оперативного изменения решения ИИ админом
         inline_kbd = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("✅ Одобрить", callback_data=f"force_ok_{report_db_id}"),
-                InlineKeyboardButton("❌ Замечание", callback_data=f"force_fail_{report_db_id}")
+                InlineKeyboardButton("✅ Одобрить", callback_data=f"force_ok_{report_id}"),
+                InlineKeyboardButton("❌ Замечание", callback_data=f"force_fail_{report_id}")
             ]
         ])
 
-        # Дублирование отчета в целевую рабочую группу
-        report_header = f"📊 **Отчет: {worker['last_name']} {worker['first_name']}** ({worker['position']})\n"
-        report_body = (
-            f"• Тип: {ai_analysis['report_type']} " + (f"[{slot_time}]" if slot_time else "") + "\n"
-            f"• Время: {current_time_str}\n"
-            f"• Оценка ИИ: " + ("✅ ОК" if ai_analysis["is_ok"] else f"❌ {ai_analysis['format_comment']}") + "\n"
-            f"• Текст: _\"{text_transcription}\"_\n"
-        )
+        header = f"📊 **Отчет: {worker['last_name']} {worker['first_name']}** ({worker['position']})\n"
+        body = f"• Тип: {ai['report_type']} " + (f"[{slot_time}]" if slot_time else "[Итог]") + f"\n• Оценка ИИ: {'✅ ОК' if ai['is_ok'] else '❌ ' + ai['format_comment']}\n• Текст: _\"{text}\"_"
         
-        await context.bot.send_message(
-            chat_id=worker["group_id"],
-            text=report_header + report_body,
-            parse_mode="Markdown",
-            reply_markup=inline_kbd
-        )
+        await context.bot.send_message(chat_id=worker["group_id"], text=header + body, parse_mode="Markdown", reply_markup=inline_kbd)
 
-    except Exception as general_error:
-        logger.error(f"Ошибка при обработке файла: {general_error}")
-        await msg.edit_text("Произошла критическая ошибка при обработке медиафайла.")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
     finally:
-        # 2. Исправление: Принудительное удаление временного файла с диска во избежание переполнения памяти
-        if os.path.exists(temp_file_path):
-            try:
-                os.remove(temp_file_path)
-            except Exception as e:
-                logger.error(f"Не удалось удалить файл {temp_file_path}: {e}")
+        # 2. Гарантированная чистка диска от временных файлов
+        if os.path.exists(temp_path):
+            try: os.remove(temp_path)
+            except Exception: pass
 
-# 7. Улучшение: Callback query обработчик для мгновенного изменения оценки ИИ
 async def handle_report_correction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if not (query.data.startswith("force_ok_") or query.data.startswith("force_fail_")): return
 
-    data = query.data
-    if not (data.startswith("force_ok_") or data.startswith("force_fail_")):
-        return
-
-    report_id = int(data.split("_")[-1])
-    is_ok = data.startswith("force_ok_")
+    report_id = int(query.data.split("_")[-1])
+    is_ok = query.data.startswith("force_ok_")
 
     if is_ok:
-        update_report_status_by_id(report_id, True, "всё ОК (исправлено вручную)", "ничего не предпринимать")
-        new_text = query.message.text + "\n\n♻️ **Статус изменен вручную: Одобрено Руководителем**"
+        update_report_status_by_id(report_id, True, "всё ОК (исправлено админом)", "Администратор подтвердил отчет")
+        new_text = query.message.text + "\n\n♻️ **Статус переопределен: Одобрено Руководителем**"
     else:
-        update_report_status_by_id(report_id, False, "не ОК, выставлено вручную", "руководитель выставил замечание")
-        new_text = query.message.text + "\n\n♻️ **Статус изменен вручную: Выставлено Замечание**"
+        update_report_status_by_id(report_id, False, "не ОК (выставлено админом)", "Администратор выставил замечание")
+        new_text = query.message.text + "\n\n♻️ **Статус переопределен: Выставлено Замечание**"
 
     await query.edit_message_text(text=new_text, reply_markup=None)
 
-# 4. Исправление: Сводка теперь четко распределяет и группирует status и daily_fact отдельно
-async def generate_summary_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update): return
+# ══════════════════════════════════════════════════════════════════════════════
+# ФОРМИРОВАНИЕ И ПЛАНИРОВАНИЕ СВОДКИ
+# ══════════════════════════════════════════════════════════════════════════════
 
-    now = now_local()
-    date_str = now.strftime("%Y-%m-%d")
+def build_summary_text(date_str: str) -> str:
     workers = get_all_workers()
-    
     conn = get_db()
     reports = conn.execute("SELECT * FROM reports WHERE report_date = ?", (date_str,)).fetchall()
     conn.close()
 
     rep_map = {}
     for r in reports:
-        if r["telegram_id"] not in rep_map:
-            rep_map[r["telegram_id"]] = {"status": {}, "daily_fact": None}
-        if r["report_type"] == "status":
-            rep_map[r["telegram_id"]]["status"][r["slot_time"]] = r
-        else:
-            rep_map[r["telegram_id"]]["daily_fact"] = r
+        if r["telegram_id"] not in rep_map: rep_map[r["telegram_id"]] = {"status": {}, "daily_fact": None}
+        if r["report_type"] == "status": rep_map[r["telegram_id"]]["status"][r["slot_time"]] = r
+        else: rep_map[r["telegram_id"]]["daily_fact"] = r
 
     text = f"📊 **Сводная статистика за {date_str}**\n\n"
-    
     current_pos = None
     for w in workers:
         if w["position"] != current_pos:
             current_pos = w["position"]
             text += f"🏗 **Отдел: {current_pos}**\n"
 
-        w_reports = rep_map.get(w["telegram_id"], {"status": {}, "daily_fact": None})
-        
-        # Сборка статусов
-        sched = SCHEDULES.get(w["schedule"], SCHEDULE_A)
-        status_line_items = []
-        for slot in sched:
-            r = w_reports["status"].get(slot)
-            if r:
-                icon = "✅" if r["is_ok"] else "⚠️"
-                if r["is_late"]: icon = "⏳"
-                status_line_items.append(f"{slot}:{icon}")
-            else:
-                status_line_items.append(f"{slot}:❌")
-        
-        status_str = " | ".join(status_line_items)
+        w_rep = rep_map.get(w["telegram_id"], {"status": {}, "daily_fact": None})
+        status_items = []
+        for slot in SCHEDULES.get(w["schedule"], SCHEDULE_A):
+            r = w_rep["status"].get(slot)
+            if r: status_items.append(f"{slot}:{'⏳' if r['is_late'] else ('✅' if r['is_ok'] else '⚠️')}")
+            else: status_items.append(f"{slot}:❌")
 
-        # Сборка факта дня
-        if w["needs_daily_fact"]:
-            f_rep = w_reports["daily_fact"]
-            if f_rep:
-                fact_str = "✅ Итог: ОК" if f_rep["is_ok"] else "⚠️ Итог: Зам."
-            else:
-                fact_str = "❌ Итог: нет"
-        else:
-            fact_str = "➖"
+        fact_str = "✅ Итог" if (w_rep["daily_fact"] and w_rep["daily_fact"]["is_ok"]) else ("⚠️ Зам." if w_rep["daily_fact"] else "❌ нет")
+        text += f"• {w['last_name']} {w['first_name']}\n  ⏱ Спуты: {' | '.join(status_items)}\n  📋 {fact_str if w['needs_daily_fact'] else '➖'}\n"
+    return text
 
-        text += f"• {w['last_name']} {w['first_name']}\n  ⏱ Спуты: {status_str}\n  📋 {fact_str}\n"
-
+async def generate_summary_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return
+    text = build_summary_text(now_local().strftime("%Y-%m-%d"))
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_MENU)
 
-# 12. Исправление: Логика сохранения времени сводки в персистентную БД
 async def set_summary_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return ConversationHandler.END
-    await update.message.reply_text("Введите время в формате ЧЧ:ММ для автоматической сводки ежедневно:", reply_markup=CANCEL_KEYBOARD)
+    await update.message.reply_text("Введите время автосводки (ЧЧ:ММ):", reply_markup=CANCEL_KEYBOARD)
     return ASK_REPORT_TIME
 
 async def set_summary_time_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
-    try:
-        datetime.strptime(raw, "%H:%M")
-    except ValueError:
-        await update.message.reply_text("Неверный формат. Попробуйте еще раз (например 19:30):")
-        return ASK_REPORT_TIME
+    try: datetime.strptime(raw, "%H:%M")
+    except ValueError: return ASK_REPORT_TIME
 
     conn = get_db()
     conn.execute("INSERT INTO settings (key, value) VALUES ('summary_time', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (raw,))
@@ -844,6 +801,8 @@ async def set_summary_time_finish(update: Update, context: ContextTypes.DEFAULT_
     conn.close()
 
     await update.message.reply_text(f"Время автоматической сводки сохранено: {raw}", reply_markup=MAIN_MENU)
+    # Перезапуск задачи планировщика
+    await setup_scheduler(context.application)
     return ConversationHandler.END
 
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -852,24 +811,50 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Инициализация и старт приложения
+# АВТОМАТИЧЕСКИЙ ПЛАНИРОВЩИК (JOB QUEUE)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def cron_summary_job(context: ContextTypes.DEFAULT_TYPE):
+    text = build_summary_text(now_local().strftime("%Y-%m-%d"))
+    if SUMMARY_CHAT_ID:
+        try: await context.bot.send_message(chat_id=SUMMARY_CHAT_ID, text=text, parse_mode="Markdown")
+        except Exception: pass
+
+async def setup_scheduler(application: Application):
+    # Очистка старых задач
+    current_jobs = application.job_queue.get_jobs_by_name("auto_summary")
+    for job in current_jobs: job.schedule_removal()
+
+    conn = get_db()
+    row = conn.execute("SELECT value FROM settings WHERE key = 'summary_time'").fetchone()
+    conn.close()
+    
+    if row:
+        try:
+            t = datetime.strptime(row["value"], "%H:%M").time()
+            # 12. Время автосводки теперь гарантированно восстанавливается после перезапуска процесса
+            application.job_queue.run_daily(cron_summary_job, time=dtime(t.hour, t.minute, tzinfo=LOCAL_TZ), name="auto_summary")
+            logger.info(f"Планировщик сводок успешно инициализирован на время: {row['value']}")
+        except Exception as e:
+            logger.error(f"Не удалось запустить планировщик: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ЗАПУСК ПРИЛОЖЕНИЯ
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     init_db()
 
-    # 8. Улучшение: Динамический разовый запрос названия дефолтной группы при старте для исключения ID в логах
+    # 8. Разовое кэширование названия дефолтной группы
     try:
         import asyncio
         loop = asyncio.get_event_loop()
-        proxy_app = Application.builder().token(TOKEN).build()
-        loop.run_until_complete(fetch_and_save_group_name(proxy_app.bot, DEFAULT_GROUP_ID))
-    except Exception as err:
-        logger.warning(f"Не удалось подтянуть имя группы по умолчанию при старте: {err}")
+        proxy = Application.builder().token(TOKEN).build()
+        loop.run_until_complete(fetch_and_save_group_name(proxy.bot, DEFAULT_GROUP_ID))
+    except Exception: pass
 
     app = Application.builder().token(TOKEN).build()
 
-    # Разговорный обработчик для вывода списка и редактирования полей
     list_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📋 Сотрудники$"), list_workers)],
         states={
@@ -884,7 +869,26 @@ def main():
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel_handler)],
     )
 
-    # Разговорный обработчик настройки времени
+    add_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^➕ Добавить сотрудника$"), add_worker_start)],
+        states={
+            ASK_WORKER_ID: [MessageHandler(DIALOG_TEXT, add_worker_id)],
+            ASK_LASTNAME: [MessageHandler(DIALOG_TEXT, add_worker_lastname)],
+            ASK_FIRSTNAME: [MessageHandler(DIALOG_TEXT, add_worker_firstname)],
+            ASK_POSITION: [MessageHandler(DIALOG_TEXT, add_worker_position)],
+            ASK_GROUP: [MessageHandler(DIALOG_TEXT, add_worker_group)],
+            ASK_SCHEDULE: [MessageHandler(DIALOG_TEXT, add_worker_schedule)],
+            ASK_NEEDS_DAILY_FACT: [MessageHandler(DIALOG_TEXT, add_worker_needs_daily_fact)],
+        },
+        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel_handler)],
+    )
+
+    remove_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^➖ Удалить сотрудника$"), remove_worker_start)],
+        states={ASK_REMOVE_WORKER: [MessageHandler(DIALOG_TEXT, remove_worker_finish)]},
+        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel_handler)],
+    )
+
     time_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^⏰ Время сводки$"), set_summary_time_start)],
         states={ASK_REPORT_TIME: [MessageHandler(DIALOG_TEXT, set_summary_time_finish)]},
@@ -895,15 +899,20 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^🆔 ID чата$"), get_chat_id))
     app.add_handler(MessageHandler(filters.Regex("^📊 Сводка сейчас$"), generate_summary_now))
     app.add_handler(list_handler)
+    app.add_handler(add_handler)
+    app.add_handler(remove_handler)
     app.add_handler(time_handler)
-    
-    # Специфический инлайн-обработчик ручного изменения ИИ проверок
     app.add_handler(CallbackQueryHandler(handle_report_correction))
-
-    # Логика захвата любых входящих медиа-отчетов (Аудио, Видео, Голосовые, Заметки)
     app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE | filters.VOICE | filters.AUDIO, handle_report_video))
 
-    logger.info("Бот успешно запущен и готов к работе.")
+    # Накатываем задачи планировщика при старте приложения
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(setup_scheduler(app))
+    except Exception: pass
+
+    logger.info("Бот полностью готов к развертыванию.")
     app.run_polling()
 
 if __name__ == "__main__":
