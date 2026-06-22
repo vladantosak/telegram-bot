@@ -157,10 +157,15 @@ def init_db():
             is_ok INTEGER NOT NULL,
             is_late INTEGER NOT NULL DEFAULT 0,
             format_comment TEXT,
-            required_action TEXT
+            required_action TEXT,
+            raw_text TEXT NOT NULL DEFAULT ''
         )
         """
     )
+
+    cols_reports = {row["name"] for row in conn.execute("PRAGMA table_info(reports)").fetchall()}
+    if "raw_text" not in cols_reports:
+        conn.execute("ALTER TABLE reports ADD COLUMN raw_text TEXT NOT NULL DEFAULT ''")
 
     # Таблица для настроек (для сохранения расписания сводок)
     conn.execute(
@@ -307,21 +312,34 @@ async def fetch_and_save_group_name(bot, group_id: int) -> str:
     save_group_name(group_id, name)
     return name
 
-def save_report(telegram_id: int, report_date: str, report_type: str, slot_time: str | None, received_at: str, is_ok: bool, is_late: bool, format_comment: str, required_action: str) -> int:
+def save_report(telegram_id: int, report_date: str, report_type: str, slot_time: str | None, received_at: str, is_ok: bool, is_late: bool, format_comment: str, required_action: str, raw_text: str = "") -> int:
     """Слегка изменена для возврата ID новой записи (для исправления оценок ИИ)."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO reports (telegram_id, report_date, report_type, slot_time, received_at, is_ok, is_late, format_comment, required_action)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO reports (telegram_id, report_date, report_type, slot_time, received_at, is_ok, is_late, format_comment, required_action, raw_text)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (telegram_id, report_date, report_type, slot_time, received_at, int(is_ok), int(is_late), format_comment, required_action),
+        (telegram_id, report_date, report_type, slot_time, received_at, int(is_ok), int(is_late), format_comment, required_action, raw_text),
     )
     conn.commit()
     inserted_id = cur.lastrowid
     conn.close()
     return inserted_id
+
+def update_report_text_and_ai(report_id: int, is_ok: bool, format_comment: str, required_action: str, raw_text: str, received_at: str):
+    conn = get_db()
+    conn.execute(
+        """
+        UPDATE reports
+        SET is_ok = ?, format_comment = ?, required_action = ?, raw_text = ?, received_at = ?
+        WHERE id = ?
+        """,
+        (int(is_ok), format_comment, required_action, raw_text, received_at, report_id)
+    )
+    conn.commit()
+    conn.close()
 
 def get_reports_for_date(report_date: str):
     conn = get_db()
@@ -1539,33 +1557,77 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Анализ промптом Llama
-        ai_res = check_status(text_content)
-        cleaned_text = clean_report(text_content)
+        # Анализ промптом Llama для определения типа отчета
+        ai_res_pre = check_status(text_content)
+        report_type = ai_res_pre["report_type"]
         now = now_local()
         date_str = now.strftime("%Y-%m-%d")
         sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
         nearest_slot, is_late = find_nearest_slot(sched_list, now)
 
-        report_id = save_report(
-            telegram_id=user_id,
-            report_date=date_str,
-            report_type=ai_res["report_type"],
-            slot_time=nearest_slot if ai_res["report_type"] == "status" else None,
-            received_at=now.strftime("%H:%M:%S"),
-            is_ok=ai_res["is_ok"],
-            is_late=is_late if ai_res["report_type"] == "status" else 0,
-            format_comment=ai_res["format_comment"],
-            required_action=ai_res["required_action"]
-        )
+        # Проверяем, существует ли отчет у этого сотрудника за этот слот (status) или день (daily_fact)
+        conn = get_db()
+        if report_type == "status":
+            existing_report = conn.execute(
+                "SELECT * FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = 'status' AND slot_time = ?",
+                (user_id, date_str, nearest_slot)
+            ).fetchone()
+        else:
+            existing_report = conn.execute(
+                "SELECT * FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = 'daily_fact'",
+                (user_id, date_str)
+            ).fetchone()
+        conn.close()
+
+        is_addon = False
+        if existing_report:
+            is_addon = True
+            existing_raw = existing_report["raw_text"] or ""
+            # Склеиваем предыдущий текст и новое дополнение
+            text_content = f"{existing_raw}\n[Дополнение]: {text_content}" if existing_raw else text_content
+            # Прогоняем КЛАССИФИКАЦИЮ и АНАЛИЗ заново для объединенного контента
+            ai_res = check_status(text_content)
+            cleaned_text = clean_report(text_content)
+            report_id = existing_report["id"]
+            
+            # Обновляем существующий отчет в БД
+            update_report_text_and_ai(
+                report_id=report_id,
+                is_ok=ai_res["is_ok"],
+                format_comment=ai_res["format_comment"],
+                required_action=ai_res["required_action"],
+                raw_text=text_content,
+                received_at=now.strftime("%H:%M:%S")
+            )
+        else:
+            ai_res = ai_res_pre
+            cleaned_text = clean_report(text_content)
+            report_id = save_report(
+                telegram_id=user_id,
+                report_date=date_str,
+                report_type=ai_res["report_type"],
+                slot_time=nearest_slot if ai_res["report_type"] == "status" else None,
+                received_at=now.strftime("%H:%M:%S"),
+                is_ok=ai_res["is_ok"],
+                is_late=is_late if ai_res["report_type"] == "status" else 0,
+                format_comment=ai_res["format_comment"],
+                required_action=ai_res["required_action"],
+                raw_text=text_content
+            )
 
         w_name = f"{worker['last_name']} {worker['first_name']}"
         
         # Информирование сотрудника
         if ai_res["is_ok"]:
-            await update.message.reply_text("✅ Отчёт успешно проверен ИИ и принят без замечаний! Спасибо.")
+            if is_addon:
+                await update.message.reply_text("🔄 Дополнение к отчёту успешно проверено ИИ и принято без замечаний! Спасибо.")
+            else:
+                await update.message.reply_text("✅ Отчёт успешно проверен ИИ и принят без замечаний! Спасибо.")
         else:
-            await update.message.reply_text(f"⚠️ Оценка отчета: {ai_res['employee_message']}")
+            if is_addon:
+                await update.message.reply_text(f"⚠️ Оценка дополненного отчета: {ai_res['employee_message']}")
+            else:
+                await update.message.reply_text(f"⚠️ Оценка отчета: {ai_res['employee_message']}")
 
         # Решение проблемы 7: Кнопка «Исправить оценку» во всех отчетах для администраторов или в группе
         is_ok_emoji = "✅" if ai_res["is_ok"] else "⚠️"
@@ -1574,14 +1636,16 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Получаем красивое название группы
         gname = await get_group_name_async(context.bot, dest_chat)
         
+        title_text = f"📊 {is_ok_emoji} Дополнение к отчету (отчет обновлен): {w_name}" if is_addon else f"📊 {is_ok_emoji} Новый отчет: {w_name}"
+
         notify_text = (
-            f"📊 {is_ok_emoji} Новый отчет: {w_name}\n"
+            f"{title_text}\n"
             f"Тип/Статус: {nearest_slot if ai_res['report_type'] == 'status' else 'Факт дня (Итог)'}\n"
             f"Оценка ИИ: {'ОК' if ai_res['is_ok'] else 'НЕ ОК'}\n"
             f"Комментарий ИИ: {ai_res['format_comment']}\n"
             f"Группа: {gname}\n\n"
             f"📝 Официальный отчет:\n\"{cleaned_text}\"\n\n"
-            f"🗣 Оригинальный текст:\n\"{text_content}\""
+            f"🗣 Оригинальный текст (объединенный):\n\"{text_content}\"" if is_addon else f"🗣 Оригинальный текст:\n\"{text_content}\""
         )
         
         inline_kbd = InlineKeyboardMarkup([
