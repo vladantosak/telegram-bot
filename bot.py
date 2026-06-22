@@ -2,24 +2,38 @@ import json
 import os
 import sqlite3
 from datetime import datetime
+import datetime as dt_module
 from zoneinfo import ZoneInfo
 
 from groq import Groq
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import (
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
 )
 
 # ── Настройки и переменные окружения ─────────────────────────────────────────
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-# Считываем ADMIN_IDS из Railway и превращаем в список чисел для проверки
-ADMIN_IDS_RAW = os.environ.get("ADMIN_IDS", "0")
-ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().lstrip("-").isdigit()]
+
+# Чтение ADMIN_IDS из переменных окружения
+ADMIN_IDS_RAW = os.environ.get("ADMIN_IDS", "")
+ADMIN_IDS = []
+if ADMIN_IDS_RAW:
+    for x in ADMIN_IDS_RAW.split(","):
+        x = x.strip()
+        if x.replace("-", "").isdigit():
+            ADMIN_IDS.append(int(x))
 
 DB_PATH = os.environ.get("DB_PATH", "workers.db")
 DEFAULT_GROUP_ID = int(os.environ.get("GROUP_ID", "-1003804380536"))
@@ -34,6 +48,9 @@ def now_local() -> datetime:
     return datetime.now(LOCAL_TZ)
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+# Словарь для хранения данных незарегистрированных пользователей {telegram_id: данные}
+pending_unregistered_users = {}
 
 LATE_THRESHOLD_MIN = 15
 SCHEDULE_A = ["10:00", "12:00", "15:00", "17:00"]
@@ -143,6 +160,17 @@ def init_db():
         )
         """
     )
+
+    # Таблица для настроек (для сохранения расписания сводок)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -194,7 +222,13 @@ def update_worker_field(telegram_id: int, field: str, value):
     if field not in allowed:
         raise ValueError(f"Недопустимое поле: {field}")
     conn = get_db()
-    conn.execute(f"UPDATE workers SET {field} = ? WHERE telegram_id = ?", (value, telegram_id))
+    
+    # Решение проблемы 9: Сброс sort_order в 0 при смене отдела (position)
+    if field == "position":
+        conn.execute("UPDATE workers SET position = ?, sort_order = 0 WHERE telegram_id = ?", (value, telegram_id))
+    else:
+        conn.execute(f"UPDATE workers SET {field} = ? WHERE telegram_id = ?", (value, telegram_id))
+        
     conn.commit()
     conn.close()
 
@@ -234,11 +268,29 @@ def get_group_name(group_id: int) -> str:
     conn.close()
     return row["group_name"] if row else str(group_id)
 
+async def get_group_name_async(bot, group_id: int) -> str:
+    """Решение проблемы 8: автоматическое подтягивание названия некэшированной группы из Telegram."""
+    conn = get_db()
+    row = conn.execute("SELECT group_name FROM groups WHERE group_id = ?", (group_id,)).fetchone()
+    conn.close()
+    if row:
+        return row["group_name"]
+    try:
+        chat = await bot.get_chat(group_id)
+        name = chat.title or str(group_id)
+        save_group_name(group_id, name)
+        return name
+    except Exception:
+        return str(group_id)
+
 def get_all_group_names() -> dict:
     conn = get_db()
     rows = conn.execute("SELECT group_id, group_name FROM groups").fetchall()
     conn.close()
-    return {row["group_id"]: row["group_name"] for row in rows}
+    res = {row["group_id"]: row["group_name"] for row in rows}
+    if DEFAULT_GROUP_ID not in res:
+        res[DEFAULT_GROUP_ID] = str(DEFAULT_GROUP_ID)
+    return res
 
 async def fetch_and_save_group_name(bot, group_id: int) -> str:
     try:
@@ -249,9 +301,11 @@ async def fetch_and_save_group_name(bot, group_id: int) -> str:
     save_group_name(group_id, name)
     return name
 
-def save_report(telegram_id: int, report_date: str, report_type: str, slot_time: str | None, received_at: str, is_ok: bool, is_late: bool, format_comment: str, required_action: str):
+def save_report(telegram_id: int, report_date: str, report_type: str, slot_time: str | None, received_at: str, is_ok: bool, is_late: bool, format_comment: str, required_action: str) -> int:
+    """Слегка изменена для возврата ID новой записи (для исправления оценок ИИ)."""
     conn = get_db()
-    conn.execute(
+    cur = conn.cursor()
+    cur.execute(
         """
         INSERT INTO reports (telegram_id, report_date, report_type, slot_time, received_at, is_ok, is_late, format_comment, required_action)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -259,13 +313,133 @@ def save_report(telegram_id: int, report_date: str, report_type: str, slot_time:
         (telegram_id, report_date, report_type, slot_time, received_at, int(is_ok), int(is_late), format_comment, required_action),
     )
     conn.commit()
+    inserted_id = cur.lastrowid
     conn.close()
+    return inserted_id
 
 def get_reports_for_date(report_date: str):
     conn = get_db()
     rows = conn.execute("SELECT * FROM reports WHERE report_date = ?", (report_date,)).fetchall()
     conn.close()
     return rows
+
+def check_duplicate_report(telegram_id: int, report_date: str, report_type: str, slot_time: str | None) -> bool:
+    """Решение проблемы 5: Защита от дублей. Возвращает True, если отчет уже существует."""
+    conn = get_db()
+    if report_type == "status":
+        row = conn.execute(
+            "SELECT id FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = ? AND slot_time = ?",
+            (telegram_id, report_date, report_type, slot_time),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT id FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = ?",
+            (telegram_id, report_date, report_type),
+        ).fetchone()
+    conn.close()
+    return row is not None
+
+def get_worker_history_last_week(telegram_id: int) -> str:
+    """Решение проблемы 6: Логирование истории отчетов сотрудника за неделю."""
+    conn = get_db()
+    rows = conn.execute(
+        """
+        SELECT * FROM reports 
+        WHERE telegram_id = ? 
+        AND report_date >= date('now', '-7 days')
+        ORDER BY report_date DESC, received_at DESC
+        """,
+        (telegram_id,)
+    ).fetchall()
+    
+    worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (telegram_id,)).fetchone()
+    conn.close()
+    
+    if not worker:
+        return "Сотрудник не найден."
+        
+    if not rows:
+        return f"📅 У сотрудника {worker['last_name']} {worker['first_name']} нет отчетов за последние 7 дней."
+        
+    lines = [f"📅 История отчетов за прошедшую неделю для {worker['last_name']} {worker['first_name']}:\n"]
+    for r in rows:
+        r_type = "Статус" if r["report_type"] == "status" else "Итог дня"
+        slot_str = f" за {r['slot_time']}" if r["slot_time"] and r["report_type"] == "status" else ""
+        ok_str = "✅ ОК" if r["is_ok"] else f"⚠️ Замечание: {r['format_comment']}"
+        late_str = " ⏰ Опоздание" if r["is_late"] else ""
+        lines.append(
+            f"📍 {r['report_date']} в {r['received_at']}\n"
+            f"   Тип: {r_type}{slot_str}\n"
+            f"   Результат: {ok_str}{late_str}\n"
+        )
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Решение проблемы 12 (Хранение расписания сводок в БД)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_scheduled_times() -> list[str]:
+    conn = get_db()
+    row = conn.execute("SELECT value FROM settings WHERE key = 'summary_times'").fetchone()
+    conn.close()
+    if row:
+        try:
+            return json.loads(row["value"])
+        except Exception:
+            return ["19:00"]
+    return ["19:00"]
+
+def save_scheduled_times(times: list[str]):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('summary_times', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (json.dumps(sorted(times)),)
+    )
+    conn.commit()
+    conn.close()
+
+def reschedule_summary_jobs(application: Application):
+    job_queue = application.job_queue
+    if not job_queue:
+        print("JobQueue недоступен.")
+        return
+
+    # Удаление существующих задач сводки
+    for job in job_queue.get_jobs_by_name("daily_summary"):
+        job.schedule_removal()
+
+    times = get_scheduled_times()
+    for t_str in times:
+        try:
+            hour, minute = map(int, t_str.split(":"))
+            time_obj = dt_module.time(hour=hour, minute=minute, tzinfo=LOCAL_TZ)
+            job_queue.run_daily(
+                scheduled_summary_callback,
+                time=time_obj,
+                days=(0, 1, 2, 3, 4, 5, 6),
+                name="daily_summary"
+            )
+            print(f"Запланирована сводка на {t_str}")
+        except Exception as e:
+            print(f"Критическая ошибка при планировании сводки на {t_str}: {e}")
+
+async def scheduled_summary_callback(context: ContextTypes.DEFAULT_TYPE):
+    now = now_local()
+    date_str = now.strftime("%Y-%m-%d")
+    summary_text = f"⏰ Автоматическая запланированная сводка:\n\n" + generate_daily_summary_text(date_str)
+    
+    if SUMMARY_CHAT_ID:
+        try:
+            await context.bot.send_message(chat_id=SUMMARY_CHAT_ID, text=summary_text)
+        except Exception as e:
+            print(f"Ошибка при отправке автоматической сводки в {SUMMARY_CHAT_ID}: {e}")
+            
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=summary_text)
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -402,7 +576,8 @@ def check_status(text: str) -> dict:
         return normalize_ai_result({"report_type": "status", "is_ok": False, "issue": "GROQ_API_KEY не задан"}, text)
     try:
         response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            # Решение проблемы 10: смена модели на llama-3.3-70b-versatile
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "Отвечай только валидным JSON без Markdown."},
                 {"role": "user", "content": CHECK_PROMPT_TEMPLATE.format(text=text)},
@@ -415,6 +590,139 @@ def check_status(text: str) -> dict:
         return normalize_ai_result(json.loads(raw), text)
     except Exception as e:
         return normalize_ai_result({"report_type": "status", "is_ok": False, "issue": f"Ошибка ИИ: {e}"}, text)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Решение проблемы 4 (Детализированная сводка, различающая статус и факт дня)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_daily_summary_text(report_date: str) -> str:
+    conn = get_db()
+    workers = conn.execute("SELECT * FROM workers ORDER BY position, sort_order, last_name, first_name").fetchall()
+    reports = conn.execute("SELECT * FROM reports WHERE report_date = ?", (report_date,)).fetchall()
+    conn.close()
+
+    reports_by_worker = {}
+    for r in reports:
+        tid = r["telegram_id"]
+        r_dict = dict(r)
+        if tid not in reports_by_worker:
+            reports_by_worker[tid] = {"status": {}, "daily_fact": []}
+        
+        if r_dict["report_type"] == "status":
+            slot = r_dict["slot_time"]
+            reports_by_worker[tid]["status"][slot] = r_dict
+        elif r_dict["report_type"] == "daily_fact":
+            reports_by_worker[tid]["daily_fact"].append(r_dict)
+
+    summary_lines = [f"📊 Сводка отчетов за {report_date}\n"]
+    
+    workers_by_dept = {}
+    for w in workers:
+        dept = w["position"]
+        if dept not in workers_by_dept:
+            workers_by_dept[dept] = []
+        workers_by_dept[dept].append(w)
+
+    for dept, dept_workers in workers_by_dept.items():
+        summary_lines.append(f"🏢 Отдел: {dept}")
+        for w in dept_workers:
+            tid = w["telegram_id"]
+            name = f"{w['last_name']} {w['first_name']}"
+            w_reports = reports_by_worker.get(tid, {"status": {}, "daily_fact": []})
+            
+            # 1. Почасовые статусы
+            schedule_slots = SCHEDULES.get(w["schedule"], SCHEDULE_A)
+            status_segments = []
+            for slot in schedule_slots:
+                rep = w_reports["status"].get(slot)
+                if rep:
+                    status_icon = "✅" if rep["is_ok"] else "⚠️"
+                    late_icon = "⏰" if rep["is_late"] else ""
+                    comment = f" ({rep['format_comment']})" if not rep["is_ok"] else ""
+                    status_segments.append(f"{slot}:{status_icon}{late_icon}{comment}")
+                else:
+                    status_segments.append(f"{slot}:❌")
+            
+            status_str = " | ".join(status_segments)
+            summary_lines.append(f"  • {name}")
+            summary_lines.append(f"    📢 Статусы: {status_str}")
+
+            # 2. Факт дня (daily_fact)
+            if w["needs_daily_fact"]:
+                fact_reps = w_reports["daily_fact"]
+                if fact_reps:
+                    f_rep = fact_reps[-1]
+                    fact_icon = "✅" if f_rep["is_ok"] else "⚠️"
+                    comment = f" ({f_rep['format_comment']})" if not f_rep["is_ok"] else ""
+                    summary_lines.append(f"    📝 Итог дня (Факт): {fact_icon}{comment}")
+                else:
+                    summary_lines.append(f"    📝 Итог дня (Факт): ❌ Не отправлен")
+            else:
+                summary_lines.append(f"    📝 Итог дня (Факт): Не требуется")
+        summary_lines.append("")
+
+    return "\n".join(summary_lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Решение проблемы 7 (Обработчик Callback-кнопки переключения результатов)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not is_admin(user_id):
+        await query.answer("У вас нет прав администратора для корректировки оценок.", show_alert=True)
+        return
+        
+    data = query.data
+    if data.startswith("fix_toggle_"):
+        report_id = int(data.split("_")[-1])
+        
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        if not report:
+            conn.close()
+            await query.answer("Запись отчета в БД не найдена.", show_alert=True)
+            return
+            
+        new_ok = 1 if report["is_ok"] == 0 else 0
+        new_comment = "ОК (изменено администратором вручную)" if new_ok == 1 else "Замечание (изменено администратором вручную)"
+        new_action = f"Скорректировано вручную администратором @{query.from_user.username or user_id}"
+        
+        conn.execute(
+            "UPDATE reports SET is_ok = ?, format_comment = ?, required_action = ? WHERE id = ?",
+            (new_ok, new_comment, new_action, report_id)
+        )
+        
+        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
+        conn.commit()
+        conn.close()
+        
+        worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+        status_emoji = "✅" if new_ok == 1 else "⚠️"
+        
+        await query.answer("Оценка скорректирована!")
+        
+        # Обновляем текст сообщения, сохраняя историю
+        new_text = (
+            f"🔧 Оценка отчета изменена вручную администратором @{query.from_user.username or user_id}:\n"
+            f"Сотрудник: {worker_name}\n"
+            f"Дата отчета: {report['report_date']}\n"
+            f"Слот/Тип: {report['slot_time'] or report['report_type']}\n"
+            f"Новый статус: {status_emoji} ({new_comment})"
+        )
+        
+        kbd = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Изменить оценку повторно", callback_data=f"fix_toggle_{report_id}")]
+        ])
+        
+        try:
+            await query.edit_message_text(text=new_text, reply_markup=kbd)
+        except Exception as e:
+            print(f"Ошибка обновления интерактивной кнопки: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -468,6 +776,8 @@ async def list_workers_department(update: Update, context: ContextTypes.DEFAULT_
         gname = group_names.get(row["group_id"], str(row["group_id"]))
         lines.append(f"{i}. {row['last_name']} {row['first_name']}\n   График: {row['schedule']} ({schedule_str})\n   Группа: {gname} | Факт дня: {fact}")
 
+    # Решение проблемы 11: Объединение уведомления со списком сотрудников
+    lines.append("\n👉 Выберите сотрудника по номеру из списка:")
     await update.message.reply_text("\n".join(lines), reply_markup=numbered_workers_keyboard(rows))
     return ASK_LIST_WORKER
 
@@ -490,11 +800,19 @@ async def list_workers_select(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     schedule_str = ", ".join(SCHEDULES.get(worker["schedule"], SCHEDULE_A))
     fact = "да" if worker["needs_daily_fact"] else "нет"
-    gname = get_group_name(worker["group_id"])
+    gname = await get_group_name_async(context.bot, worker["group_id"])
     info = f"👤 {worker['last_name']} {worker['first_name']}\nОтдел: {worker['position']}\nГрафик: {worker['schedule']} ({schedule_str})\nГруппа: {gname}\nФакт дня: {fact}\n\nЧто хотите сделать?"
 
+    # Добавление кнопки Истории еженедельных оценок (проблема 6)
     kbd = ReplyKeyboardMarkup(
-        [["✏️ Изменить фамилию", "✏️ Изменить имя"], ["✏️ Изменить отдел", "✏️ Изменить график"], ["✏️ Изменить группу", "✏️ Факт дня"], ["🔼 Вверх в списке", "🔽 Вниз в списке"], ["❌ Отмена"]],
+        [
+            ["📅 История за неделю"],
+            ["✏️ Изменить фамилию", "✏️ Изменить имя"],
+            ["✏️ Изменить отдел", "✏️ Изменить график"],
+            ["✏️ Изменить группу", "✏️ Факт дня"],
+            ["🔼 Вверх в списке", "🔽 Вниз в списке"],
+            ["❌ Отмена"]
+        ],
         resize_keyboard=True,
     )
     await update.message.reply_text(info, reply_markup=kbd)
@@ -508,6 +826,12 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not worker:
         await update.message.reply_text("Ошибка состояния. Начните сначала.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+
+    if action == "📅 История за неделю":
+        history_text = get_worker_history_last_week(worker["telegram_id"])
+        await update.message.reply_text(history_text, reply_markup=MAIN_MENU)
+        context.user_data.clear()
         return ConversationHandler.END
 
     if action in ("🔼 Вверх в списке", "🔽 Вниз в списке"):
@@ -723,7 +1047,112 @@ async def department_workers_show(update: Update, context: ContextTypes.DEFAULT_
 
 async def send_summary_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
-    await update.message.reply_text("📊 Функция формирования сводки запущена вручную...")
+    now = now_local()
+    date_str = now.strftime("%Y-%m-%d")
+    summary_text = generate_daily_summary_text(date_str)
+    
+    await update.message.reply_text(summary_text, reply_markup=MAIN_MENU)
+    
+    if SUMMARY_CHAT_ID and SUMMARY_CHAT_ID != update.effective_chat.id:
+        try:
+            await context.bot.send_message(chat_id=SUMMARY_CHAT_ID, text=summary_text)
+        except Exception as e:
+            print(f"Не удалось отправить сводку в чат {SUMMARY_CHAT_ID}: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Настройка расписания автоматической сводки (Время сводки)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def summary_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return ConversationHandler.END
+    times = get_scheduled_times()
+    times_str = ", ".join(times) if times else "не настроено"
+    
+    text = (
+        f"⏰ Текущее автоматическое расписание сводки: {times_str}\n\n"
+        f"Выберите действие:"
+    )
+    kbd = ReplyKeyboardMarkup([
+        ["➕ Добавить время", "➖ Удалить время"],
+        ["❌ Назад"]
+    ], resize_keyboard=True)
+    
+    await update.message.reply_text(text, reply_markup=kbd)
+    return ASK_REPORT_TIME
+
+async def summary_time_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    action = update.message.text.strip()
+    
+    if action == "❌ Назад":
+        await update.message.reply_text("Возврат в главное меню.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+        
+    if action == "➕ Добавить время":
+        await update.message.reply_text(
+            "Введите новое время в формате ЧЧ:ММ (например, 19:30):",
+            reply_markup=CANCEL_KEYBOARD
+        )
+        return ASK_EDIT_SCHEDULE
+        
+    if action == "➖ Удалить время":
+        times = get_scheduled_times()
+        if not times:
+            await update.message.reply_text("В расписании пока нет сохраненного времени сводок.", reply_markup=MAIN_MENU)
+            return ConversationHandler.END
+            
+        kbd = ReplyKeyboardMarkup([[t] for t in times] + [["❌ Отмена"]], resize_keyboard=True)
+        await update.message.reply_text(
+            "Выберите время для удаления:",
+            reply_markup=kbd
+        )
+        return ASK_ORDER_DEPARTMENT
+        
+    await update.message.reply_text("Пожалуйста, нажмите на одну из предложенных кнопок.")
+    return ASK_REPORT_TIME
+
+async def summary_time_add_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    parts = raw.split(":")
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        await update.message.reply_text("Некорректный формат времени. Попробуйте еще раз (ЧЧ:ММ, например, 19:30):")
+        return ASK_EDIT_SCHEDULE
+        
+    hour, minute = int(parts[0]), int(parts[1])
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        await update.message.reply_text("Неподходящие часы/минуты. Диапазоны: 00-23 и 00-59:")
+        return ASK_EDIT_SCHEDULE
+        
+    time_str = f"{hour:02d}:{minute:02d}"
+    times = get_scheduled_times()
+    if time_str in times:
+        await update.message.reply_text("Это время уже содержится в расписании сводки.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+        
+    times.append(time_str)
+    save_scheduled_times(times)
+    reschedule_summary_jobs(context.application)
+    
+    await update.message.reply_text(f"✅ Время {time_str} успешно внесено в расписание!", reply_markup=MAIN_MENU)
+    return ConversationHandler.END
+
+async def summary_time_del_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    if raw == "❌ Отмена":
+        await update.message.reply_text("Удаление отменено.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+        
+    times = get_scheduled_times()
+    if raw not in times:
+        await update.message.reply_text("Пожалуйста, выберите существующий элемент из списка:")
+        return ASK_ORDER_DEPARTMENT
+        
+    times.remove(raw)
+    save_scheduled_times(times)
+    reschedule_summary_jobs(context.application)
+    
+    await update.message.reply_text(f"✅ Время сводки {raw} успешно удалено из расписания!", reply_markup=MAIN_MENU)
+    return ConversationHandler.END
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -733,60 +1162,158 @@ async def send_summary_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     worker = get_worker(user_id)
-    if not worker:
-        await update.message.reply_text("Ошибка: Вы не зарегистрированы в системе. Обратитесь к администратору.")
-        return
-
+    
     text_content = ""
-    if update.message.text:
-        text_content = update.message.text.strip()
-    else:
-        # Распознавание аудио/видео сообщений
-        file_obj = None
-        if update.message.voice: file_obj = update.message.voice
-        elif update.message.video: file_obj = update.message.video
-        elif update.message.video_note: file_obj = update.message.video_note
+    # Решение проблемы 2: Обеспечение гарантированного создания каталога tmp/ и очистки через try/finally
+    tmp_path = None
+    
+    try:
+        if update.message.text:
+            text_content = update.message.text.strip()
+        else:
+            file_obj = None
+            if update.message.voice: file_obj = update.message.voice
+            elif update.message.video: file_obj = update.message.video
+            elif update.message.video_note: file_obj = update.message.video_note
 
-        if file_obj:
-            await update.message.reply_text("🎙 Отчет принят на анализ ИИ, ожидайте...")
-            tg_file = await context.bot.get_file(file_obj.file_id)
-            ext = "mp4" if update.message.video or update.message.video_note else "ogg"
-            path = f"file_{user_id}_{int(datetime.now().timestamp())}.{ext}"
-            await tg_file.download_to_drive(path)
-            text_content = transcribe_audio(path)
-            if os.path.exists(path): os.remove(path)
+            if file_obj:
+                await update.message.reply_text("🎙 Отчет получен и отправлен на транскрибацию ИИ, ожидайте оценки...")
+                tg_file = await context.bot.get_file(file_obj.file_id)
+                ext = "mp4" if update.message.video or update.message.video_note else "ogg"
+                
+                os.makedirs("tmp", exist_ok=True)
+                tmp_path = f"tmp/file_{user_id}_{int(datetime.now().timestamp())}.{ext}"
+                
+                await tg_file.download_to_drive(tmp_path)
+                text_content = transcribe_audio(tmp_path)
 
-    if not text_content:
-        await update.message.reply_text("Не удалось распознать текст отчета.")
-        return
+        if not text_content:
+            await update.message.reply_text("Ошибка: Не удалось распознать аудио или медиа отчета.")
+            return
 
-    # Анализ промптом Llama
-    ai_res = check_status(text_content)
-    now = now_local()
-    sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
-    nearest_slot, is_late = find_nearest_slot(sched_list, now)
+        # Решение проблемы 3: Сохранение данных незарегистрированных сотрудников по TELEGRAM_ID
+        if not worker:
+            user_info = {
+                "first_name": update.effective_user.first_name or "",
+                "last_name": update.effective_user.last_name or "",
+                "username": update.effective_user.username or "",
+                "timestamp": datetime.now().isoformat(),
+                "text": text_content
+            }
+            pending_unregistered_users[user_id] = user_info
+            
+            # Оповещение администраторов
+            admin_msg = (
+                f"👤 Обнаружен отчет от незарегистрированного сотрудника!\n"
+                f"TG ID: {user_id}\n"
+                f"Имя в Telegram: {user_info['first_name']} {user_info['last_name']} (@{user_info['username']})\n"
+                f"Текст:\n\"{text_content[:300]}\"\n\n"
+                f"Вы можете добавить его в базу через меню, указав ID."
+            )
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(chat_id=admin_id, text=admin_msg)
+                except Exception:
+                    pass
 
-    save_report(
-        telegram_id=user_id,
-        report_date=now.strftime("%Y-%m-%d"),
-        report_type=ai_res["report_type"],
-        slot_time=nearest_slot,
-        received_at=now.strftime("%H:%M:%S"),
-        is_ok=ai_res["is_ok"],
-        is_late=is_late,
-        format_comment=ai_res["format_comment"],
-        required_action=ai_res["required_action"]
-    )
+            await update.message.reply_text(
+                "Ошибка: Вы не зарегистрированы в системе авторизации бота.\n"
+                "Ваш отчет отправлен администраторам как временный."
+            )
+            return
 
-    if ai_res["is_ok"]:
-        await update.message.reply_text("✅ Отчёт принят! Спасибо.")
-    else:
-        await update.message.reply_text(f"⚠️ {ai_res['employee_message']}")
+        # Анализ промптом Llama
+        ai_res = check_status(text_content)
+        now = now_local()
+        date_str = now.strftime("%Y-%m-%d")
+        sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
+        nearest_slot, is_late = find_nearest_slot(sched_list, now)
+
+        # Решение проблемы 5: Проверка дубликатов для одной даты и слота/типа
+        if check_duplicate_report(user_id, date_str, ai_res["report_type"], nearest_slot):
+            if ai_res["report_type"] == "status":
+                await update.message.reply_text(f"⚠️ Вы уже отправляли отчет по статусу за сегодня (слот {nearest_slot}).")
+            else:
+                await update.message.reply_text("⚠️ Вы уже отправляли итоговый факт дня на сегодня.")
+            return
+
+        report_id = save_report(
+            telegram_id=user_id,
+            report_date=date_str,
+            report_type=ai_res["report_type"],
+            slot_time=nearest_slot if ai_res["report_type"] == "status" else None,
+            received_at=now.strftime("%H:%M:%S"),
+            is_ok=ai_res["is_ok"],
+            is_late=is_late if ai_res["report_type"] == "status" else 0,
+            format_comment=ai_res["format_comment"],
+            required_action=ai_res["required_action"]
+        )
+
+        w_name = f"{worker['last_name']} {worker['first_name']}"
+        
+        # Информирование сотрудника
+        if ai_res["is_ok"]:
+            await update.message.reply_text("✅ Отчёт успешно проверен ИИ и принят без замечаний! Спасибо.")
+        else:
+            await update.message.reply_text(f"⚠️ Оценка отчета: {ai_res['employee_message']}")
+
+        # Решение проблемы 7: Кнопка «Исправить оценку» во всех отчетах для администраторов или в группе
+        is_ok_emoji = "✅" if ai_res["is_ok"] else "⚠️"
+        dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
+        
+        # Получаем красивое название группы
+        gname = await get_group_name_async(context.bot, dest_chat)
+        
+        notify_text = (
+            f"📊 {is_ok_emoji} Новый отчет: {w_name}\n"
+            f"Тип/Слот: {nearest_slot if ai_res['report_type'] == 'status' else 'Факт дня (Итог)'}\n"
+            f"Оценка ИИ: {'ОК' if ai_res['is_ok'] else 'НЕ ОК'}\n"
+            f"Комментарий ИИ: {ai_res['format_comment']}\n"
+            f"Группа: {gname}\n"
+            f"Текст:\n\"{text_content}\""
+        )
+        
+        inline_kbd = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Изменить оценку (ОК / НЕ ОК)", callback_data=f"fix_toggle_{report_id}")]
+        ])
+        
+        try:
+            await context.bot.send_message(chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd)
+        except Exception as e:
+            # Предохранитель: если отправка в группу сломалась, дублируем всем админам
+            print(f"Ошибка отправки оценки в чат {dest_chat}: {e}")
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(chat_id=admin_id, text=notify_text, reply_markup=inline_kbd)
+                except Exception:
+                    pass
+    
+    finally:
+        # Решение проблемы 2: безусловная чистка временного файла
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception as rm_e:
+                print(f"Ошибка удаления файла {tmp_path}: {rm_e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Инициализация и запуск приложения
 # ══════════════════════════════════════════════════════════════════════════════
+
+async def post_init(application: Application):
+    """Срабатывает после запуска приложения Telegram."""
+    # Решение проблемы 8: автоматическое сохранение имени группы по умолчанию при старте
+    try:
+        chat = await application.bot.get_chat(DEFAULT_GROUP_ID)
+        name = chat.title or str(DEFAULT_GROUP_ID)
+        save_group_name(DEFAULT_GROUP_ID, name)
+        print(f"Группа по умолчанию кэширована: {name}")
+    except Exception as e:
+        print(f"Не удалось получить название DEFAULT_GROUP_ID {DEFAULT_GROUP_ID}: {e}")
+
+    # Решение проблемы 12: Восстановление автосводок из БД при старте / перезапуске
+    reschedule_summary_jobs(application)
 
 def main():
     init_db()
@@ -794,12 +1321,16 @@ def main():
         print("Критическая ошибка: не задан TELEGRAM_TOKEN")
         return
 
-    application = Application.builder().token(TOKEN).build()
+    # Запуск бота с подключением к функции post_init для восстановления кеша и сводок
+    application = Application.builder().token(TOKEN).post_init(post_init).build()
 
     # Точечные команды и кнопки меню (срабатывают моментально)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.Regex("^🆔 ID чата$"), get_chat_id))
     application.add_handler(MessageHandler(filters.Regex("^📊 Сводка сейчас$"), send_summary_now))
+    
+    # Callback-кнопки (для изменения оценок)
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
 
     # Диалоговые обработчики (ConversationHandlers)
     list_handler = ConversationHandler(
@@ -847,13 +1378,25 @@ def main():
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
     )
 
-    # 1. Сначала регистрируем админские интерактивные диалоги
+    # Решение проблемы 12: хэндлер для настройки времени сводки
+    summary_scheduler_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^⏰ Время сводки$"), summary_time_start)],
+        states={
+            ASK_REPORT_TIME: [MessageHandler(DIALOG_TEXT, summary_time_action)],
+            ASK_EDIT_SCHEDULE: [MessageHandler(DIALOG_TEXT, summary_time_add_finish)],
+            ASK_ORDER_DEPARTMENT: [MessageHandler(DIALOG_TEXT, summary_time_del_finish)],
+        },
+        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+    )
+
+    # Регистрация диалогов
     application.add_handler(list_handler)
     application.add_handler(add_handler)
     application.add_handler(delete_handler)
     application.add_handler(view_dept_handler)
+    application.add_handler(summary_scheduler_handler)
 
-    # 2. В самом конце — хэндлер для приема аудио/видео/текстовых отчетов сотрудников
+    # Хэндлер для приема аудио/видео/текстовых отчетов сотрудников (регистрируется в самом конце)
     application.add_handler(MessageHandler(
         filters.VOICE | filters.VIDEO | filters.VIDEO_NOTE | filters.TEXT & ~filters.COMMAND, 
         handle_report
@@ -864,4 +1407,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
