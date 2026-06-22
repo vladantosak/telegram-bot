@@ -118,6 +118,16 @@ def init_db():
         if col not in cols:
             conn.execute(f"ALTER TABLE workers ADD COLUMN {col} {definition}")
 
+    # Таблица групп: id → название
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS groups (
+            group_id INTEGER PRIMARY KEY,
+            group_name TEXT NOT NULL
+        )
+        """
+    )
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS reports (
@@ -224,6 +234,48 @@ def delete_worker(telegram_id: int) -> bool:
     deleted = cur.rowcount > 0
     conn.close()
     return deleted
+
+
+# ── Группы: название ──────────────────────────────────────────────────────────
+
+def save_group_name(group_id: int, group_name: str):
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO groups (group_id, group_name) VALUES (?, ?)
+        ON CONFLICT(group_id) DO UPDATE SET group_name=excluded.group_name
+        """,
+        (group_id, group_name),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_group_name(group_id: int) -> str:
+    """Возвращает название группы из кэша БД или строку с ID если не найдено."""
+    conn = get_db()
+    row = conn.execute("SELECT group_name FROM groups WHERE group_id = ?", (group_id,)).fetchone()
+    conn.close()
+    return row["group_name"] if row else str(group_id)
+
+
+def get_all_group_names() -> dict:
+    """Возвращает словарь {group_id: group_name}."""
+    conn = get_db()
+    rows = conn.execute("SELECT group_id, group_name FROM groups").fetchall()
+    conn.close()
+    return {row["group_id"]: row["group_name"] for row in rows}
+
+
+async def fetch_and_save_group_name(bot, group_id: int) -> str:
+    """Запрашивает название группы у Telegram и сохраняет в БД."""
+    try:
+        chat = await bot.get_chat(group_id)
+        name = chat.title or str(group_id)
+    except Exception:
+        name = str(group_id)
+    save_group_name(group_id, name)
+    return name
 
 
 def save_report(
@@ -531,14 +583,16 @@ async def list_workers_department(update: Update, context: ContextTypes.DEFAULT_
     context.user_data["list_position"] = position
     context.user_data["list_rows"] = [dict(r) for r in rows]
 
+    group_names = get_all_group_names()
     lines = [f"Сотрудники отдела «{position}»:\n"]
     for i, row in enumerate(rows, 1):
         schedule_str = ", ".join(SCHEDULES.get(row["schedule"], SCHEDULE_A))
         fact = "да" if row["needs_daily_fact"] else "нет"
+        gname = group_names.get(row["group_id"], str(row["group_id"]))
         lines.append(
             f"{i}. {row['last_name']} {row['first_name']}\n"
             f"   График: {row['schedule']} ({schedule_str})\n"
-            f"   Группа: {row['group_id']} | Факт дня: {fact}"
+            f"   Группа: {gname} | Факт дня: {fact}"
         )
 
     await update.message.reply_text(
@@ -574,11 +628,12 @@ async def list_workers_select(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     schedule_str = ", ".join(SCHEDULES.get(worker["schedule"], SCHEDULE_A))
     fact = "да" if worker["needs_daily_fact"] else "нет"
+    gname = get_group_name(worker["group_id"])
     info = (
         f"👤 {worker['last_name']} {worker['first_name']}\n"
         f"Отдел: {worker['position']}\n"
         f"График: {worker['schedule']} ({schedule_str})\n"
-        f"Группа: {worker['group_id']}\n"
+        f"Группа: {gname}\n"
         f"Факт дня: {fact}\n\n"
         "Что хотите сделать?"
     )
@@ -634,7 +689,7 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         "✏️ Изменить фамилию": ("last_name", "Введите новую фамилию:"),
         "✏️ Изменить имя": ("first_name", "Введите новое имя:"),
         "✏️ Изменить отдел": ("position", "Введите новое название отдела/должности:"),
-        "✏️ Изменить группу": ("group_id", f"Введите новый ID группы Telegram (0 = по умолчанию {DEFAULT_GROUP_ID}):"),
+        "✏️ Изменить группу": ("group_id", f"Введите новый ID группы Telegram (0 = по умолчанию «{get_group_name(DEFAULT_GROUP_ID)}»):"),
         "✏️ Изменить график": ("schedule", None),
         "✏️ Факт дня": ("needs_daily_fact", None),
     }
@@ -681,7 +736,7 @@ async def edit_value_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def edit_group_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сохраняем ID группы."""
+    """Сохраняем ID группы и автоматически получаем её название."""
     raw = update.message.text.strip()
     try:
         group_id = int(raw)
@@ -692,7 +747,10 @@ async def edit_group_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker = context.user_data.get("edit_worker")
     final_id = DEFAULT_GROUP_ID if group_id == 0 else group_id
     update_worker_field(worker["telegram_id"], "group_id", final_id)
-    await update.message.reply_text(f"Группа обновлена: {final_id}", reply_markup=MAIN_MENU)
+
+    # Получаем и сохраняем название группы
+    gname = await fetch_and_save_group_name(context.bot, final_id)
+    await update.message.reply_text(f"Группа обновлена: {gname}", reply_markup=MAIN_MENU)
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -773,8 +831,10 @@ async def add_worker_firstname(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def add_worker_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["position"] = update.message.text.strip()
+    default_name = get_group_name(DEFAULT_GROUP_ID)
     await update.message.reply_text(
-        f"Введите ID группы Telegram (0 = по умолчанию {DEFAULT_GROUP_ID}):",
+        f"Введите ID группы Telegram, куда отправлять отчеты.\n"
+        f"Введите 0, чтобы использовать группу по умолчанию: «{default_name}»",
         reply_markup=CANCEL_KEYBOARD,
     )
     return ASK_GROUP
@@ -793,7 +853,6 @@ async def add_worker_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=SCHEDULE_KEYBOARD,
     )
     return ASK_SCHEDULE
-
 
 async def add_worker_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip().upper()
@@ -829,9 +888,12 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
 
     upsert_worker(worker_id, last_name, first_name, position, group_id, schedule, needs_daily_fact, sort_order)
 
+    # Автоматически получаем и сохраняем название группы
+    gname = await fetch_and_save_group_name(context.bot, group_id)
+
     await update.message.reply_text(
         f"Готово! Сотрудник добавлен:\n{last_name} {first_name} ({position})\n"
-        f"Группа: {group_id} | График: {', '.join(SCHEDULES[schedule])} | Факт дня: {'да' if needs_daily_fact else 'нет'}",
+        f"Группа: {gname} | График: {', '.join(SCHEDULES[schedule])} | Факт дня: {'да' if needs_daily_fact else 'нет'}",
         reply_markup=MAIN_MENU,
     )
 
@@ -1199,6 +1261,16 @@ async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # main
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def post_init(application: Application) -> None:
+    """При старте бота подтягиваем названия групп для всех существующих сотрудников."""
+    workers = get_all_workers()
+    group_ids = {w["group_id"] for w in workers}
+    known = get_all_group_names()
+    for gid in group_ids:
+        if gid not in known:
+            await fetch_and_save_group_name(application.bot, gid)
+
+
 def main():
     if not TOKEN:
         raise ValueError("Не задана переменная TELEGRAM_TOKEN")
@@ -1208,7 +1280,7 @@ def main():
         print("Предупреждение: ADMIN_ID не задан.")
 
     init_db()
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     # ── Диалог: просмотр и редактирование сотрудников ─────────────────────
     list_workers_conv = ConversationHandler(
