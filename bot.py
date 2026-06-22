@@ -965,13 +965,38 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
         
         kbd = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Изменить оценку повторно", callback_data=f"fix_toggle_{report_id}")]
+            [
+                InlineKeyboardButton("🔄 Изменить оценку (ОК / НЕ ОК)", callback_data=f"fix_toggle_{report_id}"),
+                InlineKeyboardButton("✏️ Изменить комментарий", callback_data=f"edit_comment_{report_id}")
+            ]
         ])
         
         try:
             await query.edit_message_text(text=new_text, reply_markup=kbd)
         except Exception as e:
             print(f"Ошибка обновления интерактивной кнопки: {e}")
+
+    elif data.startswith("edit_comment_"):
+        report_id = int(data.split("_")[-1])
+        
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        conn.close()
+        
+        if not report:
+            await query.answer("Запись отчета в БД не найдена.", show_alert=True)
+            return
+            
+        context.user_data["editing_comment_report_id"] = report_id
+        context.user_data["editing_comment_chat_id"] = query.message.chat_id
+        context.user_data["editing_comment_message_id"] = query.message.message_id
+        context.user_data["editing_comment_original_text"] = query.message.text
+        
+        await query.answer()
+        await query.message.reply_text(
+            f"✏️ Введите новый комментарий ИИ для этого отчета:",
+            reply_markup=CANCEL_KEYBOARD
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1475,6 +1500,98 @@ async def summary_time_del_finish(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    
+    # Проверка, не редактирует ли администратор комментарий ИИ к отчету
+    if is_admin(user_id) and context.user_data.get("editing_comment_report_id"):
+        report_id = context.user_data["editing_comment_report_id"]
+        original_chat_id = context.user_data.get("editing_comment_chat_id")
+        original_msg_id = context.user_data.get("editing_comment_message_id")
+        original_text = context.user_data.get("editing_comment_original_text", "")
+        
+        # Сброс состояния
+        del context.user_data["editing_comment_report_id"]
+        context.user_data.pop("editing_comment_chat_id", None)
+        context.user_data.pop("editing_comment_message_id", None)
+        context.user_data.pop("editing_comment_original_text", None)
+        
+        new_comment = update.message.text.strip() if update.message.text else ""
+        if not new_comment or new_comment == "❌ Отмена":
+            await update.message.reply_text("Редактирование комментария отменено.", reply_markup=MAIN_MENU)
+            return
+            
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        if not report:
+            conn.close()
+            await update.message.reply_text("Запись отчета в БД не найдена.", reply_markup=MAIN_MENU)
+            return
+            
+        # Обновляем комментарий в БД
+        new_action = f"Комментарий изменен администратором вручную: {new_comment}"
+        conn.execute(
+            "UPDATE reports SET format_comment = ?, required_action = ? WHERE id = ?",
+            (new_comment, new_action, report_id)
+        )
+        # Получаем обновленное состояние
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
+        conn.commit()
+        conn.close()
+        
+        worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+        status_emoji = "✅" if report["is_ok"] == 1 else "⚠️"
+        
+        await update.message.reply_text(
+            f"✅ Комментарий к отчету {worker_name} успешно обновлен на:\n\"{new_comment}\"",
+            reply_markup=MAIN_MENU
+        )
+        
+        # Обновляем оригинальное сообщение в группе / чате
+        if original_chat_id and original_msg_id:
+            try:
+                # Если исходное сообщение в укороченном формате
+                if "Официальный отчет:" not in (original_text or ""):
+                    updated_text = (
+                        f"🔧 Оценка отчета изменена вручную администратором @{update.effective_user.username or user_id}:\n"
+                        f"Сотрудник: {worker_name}\n"
+                        f"Дата отчета: {report['report_date']}\n"
+                        f"Статус/Тип: {report['slot_time'] or report['report_type']}\n"
+                        f"Новый статус: {status_emoji} ({new_comment})"
+                    )
+                else:
+                    dest_chat = (worker["group_id"] if worker else 0) or DEFAULT_GROUP_ID
+                    gname = await get_group_name_async(context.bot, dest_chat)
+                    is_addon = "[Дополнение]:" in (report["raw_text"] or "")
+                    cleaned_text = clean_report(report["raw_text"] or "")
+                    is_ok_emoji = "✅" if report["is_ok"] == 1 else "⚠️"
+                    title_text = f"📊 {is_ok_emoji} Дополнение к отчету (отчет обновлен): {worker_name}" if is_addon else f"📊 {is_ok_emoji} Новый отчет: {worker_name}"
+                    
+                    updated_text = (
+                        f"{title_text}\n"
+                        f"Тип/Статус: {report['slot_time'] or 'Факт дня (Итог)'}\n"
+                        f"Оценка ИИ: {'ОК' if report['is_ok'] == 1 else 'НЕ ОК'}\n"
+                        f"Комментарий ИИ: {new_comment}\n"
+                        f"Группа: {gname}\n\n"
+                        f"📝 Официальный отчет:\n\"{cleaned_text}\"\n\n"
+                        f"🗣 Оригинальный текст (объединенный):\n\"{report['raw_text']}\"" if is_addon else f"🗣 Оригинальный текст:\n\"{report['raw_text']}\""
+                    )
+                
+                kbd = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("🔄 Изменить оценку (ОК / НЕ ОК)", callback_data=f"fix_toggle_{report_id}"),
+                        InlineKeyboardButton("✏️ Изменить комментарий", callback_data=f"edit_comment_{report_id}")
+                    ]
+                ])
+                await context.bot.edit_message_text(
+                    chat_id=original_chat_id,
+                    message_id=original_msg_id,
+                    text=updated_text,
+                    reply_markup=kbd
+                )
+            except Exception as e:
+                print(f"Ошибка при обновлении сообщения после редактирования комментария: {e}")
+        return
+
     worker = get_worker(user_id)
     
     text_content = ""
@@ -1649,7 +1766,10 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         inline_kbd = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Изменить оценку (ОК / НЕ ОК)", callback_data=f"fix_toggle_{report_id}")]
+            [
+                InlineKeyboardButton("🔄 Изменить оценку (ОК / НЕ ОК)", callback_data=f"fix_toggle_{report_id}"),
+                InlineKeyboardButton("✏️ Изменить комментарий", callback_data=f"edit_comment_{report_id}")
+            ]
         ])
         
         copied_msg_id = None
