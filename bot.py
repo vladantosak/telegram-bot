@@ -1191,6 +1191,8 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Ошибка: Не удалось распознать аудио или медиа отчета.")
             return
 
+        is_media = bool(update.message.voice or update.message.video or update.message.video_note)
+
         # Решение проблемы 3: Сохранение данных незарегистрированных сотрудников по TELEGRAM_ID
         if not worker:
             user_info = {
@@ -1212,7 +1214,26 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             for admin_id in ADMIN_IDS:
                 try:
-                    await context.bot.send_message(chat_id=admin_id, text=admin_msg)
+                    admin_copied_msg_id = None
+                    if is_media:
+                        try:
+                            admin_copied = await context.bot.copy_message(
+                                chat_id=admin_id,
+                                from_chat_id=update.effective_chat.id,
+                                message_id=update.message.message_id
+                            )
+                            admin_copied_msg_id = admin_copied.message_id
+                        except Exception as copy_err:
+                            print(f"Ошибка копирования медиа незарегистрированного пользователя администратору {admin_id}: {copy_err}")
+                    
+                    if admin_copied_msg_id:
+                        await context.bot.send_message(
+                            chat_id=admin_id,
+                            text=admin_msg,
+                            reply_to_message_id=admin_copied_msg_id
+                        )
+                    else:
+                        await context.bot.send_message(chat_id=admin_id, text=admin_msg)
                 except Exception:
                     pass
 
@@ -1277,14 +1298,62 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🔄 Изменить оценку (ОК / НЕ ОК)", callback_data=f"fix_toggle_{report_id}")]
         ])
         
+        copied_msg_id = None
+        if is_media:
+            try:
+                copied_msg = await context.bot.copy_message(
+                    chat_id=dest_chat,
+                    from_chat_id=update.effective_chat.id,
+                    message_id=update.message.message_id
+                )
+                copied_msg_id = copied_msg.message_id
+            except Exception as e:
+                print(f"Ошибка копирования медиа в чат {dest_chat}: {e}")
+
         try:
-            await context.bot.send_message(chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd)
+            if copied_msg_id:
+                await context.bot.send_message(
+                    chat_id=dest_chat,
+                    text=notify_text,
+                    reply_markup=inline_kbd,
+                    reply_to_message_id=copied_msg_id
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=dest_chat,
+                    text=notify_text,
+                    reply_markup=inline_kbd
+                )
         except Exception as e:
             # Предохранитель: если отправка в группу сломалась, дублируем всем админам
             print(f"Ошибка отправки оценки в чат {dest_chat}: {e}")
             for admin_id in ADMIN_IDS:
                 try:
-                    await context.bot.send_message(chat_id=admin_id, text=notify_text, reply_markup=inline_kbd)
+                    admin_copied_msg_id = None
+                    if is_media:
+                        try:
+                            admin_copied = await context.bot.copy_message(
+                                chat_id=admin_id,
+                                from_chat_id=update.effective_chat.id,
+                                message_id=update.message.message_id
+                            )
+                            admin_copied_msg_id = admin_copied.message_id
+                        except Exception:
+                            pass
+                    
+                    if admin_copied_msg_id:
+                        await context.bot.send_message(
+                            chat_id=admin_id,
+                            text=notify_text,
+                            reply_markup=inline_kbd,
+                            reply_to_message_id=admin_copied_msg_id
+                        )
+                    else:
+                        await context.bot.send_message(
+                            chat_id=admin_id,
+                            text=notify_text,
+                            reply_markup=inline_kbd
+                        )
                 except Exception:
                     pass
     
