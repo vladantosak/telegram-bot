@@ -1814,7 +1814,7 @@ async def department_workers_show(update: Update, context: ContextTypes.DEFAULT_
     
     lines = [f"📋 Отдел: {position}"]
     for r in rows:
-        lines.append(f"• {r['last_name']} {r['first_name']} (ID: {r['telegram_id']})")
+        lines.append(f"• {r['last_name']} {r['first_name']}")
     await update.message.reply_text("\n".join(lines), reply_markup=MAIN_MENU)
     return ConversationHandler.END
 
