@@ -1144,19 +1144,36 @@ def generate_daily_summary_text(report_date: str) -> str:
 # Решение проблемы 7 (Обработчик Callback-кнопки переключения результатов)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def update_message_metadata(original_text: str, is_ok: bool | None = None, comment: str | None = None, status_val: str | None = None) -> str:
+def format_show_date(date_str: str) -> str:
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return dt.strftime("%d.%m.%Y")
+    except Exception:
+        return date_str
+
+def format_status_or_fact_line(report_type: str, slot_time: str | None, report_date: str) -> str:
+    formatted_date = format_show_date(report_date)
+    if report_type == "daily_fact":
+        return f"Факт за {formatted_date}"
+    else:
+        slot_str = slot_time or "Неизвестно"
+        return f"Статус за {slot_str} за {formatted_date}"
+
+def update_message_metadata(original_text: str, is_ok: bool | None = None, comment: str | None = None, status_val: str | None = None, is_manual: bool = False) -> str:
     lines = original_text.split("\n")
     for i, line in enumerate(lines):
-        if line.startswith("Статус:") and status_val is not None:
-            lines[i] = f"Статус: {status_val}"
-        elif line.startswith("Оценка ИИ:") and is_ok is not None:
-            lines[i] = f"Оценка ИИ: {'ОК' if is_ok else 'НЕ ОК'}"
-        elif line.startswith("Комментарий ИИ:") and comment is not None:
-            lines[i] = f"Комментарий ИИ: {comment}"
+        if (line.startswith("Статус:") or line.startswith("Статус за") or line.startswith("Факт за")) and status_val is not None:
+            lines[i] = status_val
+        elif (line.startswith("Оценка ИИ:") or line.startswith("Оценка:")) and is_ok is not None:
+            label = "Оценка" if (is_manual or line.startswith("Оценка:")) else "Оценка ИИ"
+            lines[i] = f"{label}: {'ОК' if is_ok else 'НЕ ОК'}"
+        elif (line.startswith("Комментарий ИИ:") or line.startswith("Комментарий:")) and comment is not None:
+            label = "Комментарий" if (is_manual or line.startswith("Комментарий:")) else "Комментарий ИИ"
+            lines[i] = f"{label}: {comment}"
     return "\n".join(lines)
 
 def update_message_text_fields(original_text: str, is_ok: bool, new_comment: str) -> str:
-    return update_message_metadata(original_text, is_ok=is_ok, comment=new_comment)
+    return update_message_metadata(original_text, is_ok=is_ok, comment=new_comment, is_manual=True)
 
 def make_report_keyboard(report_id: int, report_type: str | None = None) -> InlineKeyboardMarkup:
     if report_type is None:
@@ -1280,7 +1297,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             new_type = "daily_fact"
             new_slot = None
             is_late = 0
-            status_display_val = "Факт дня (Итог)"
+            status_display_val = format_status_or_fact_line(new_type, new_slot, report["report_date"])
         else:
             new_type = "status"
             schedule_slots = SCHEDULES.get(worker["schedule"] if worker else "A", SCHEDULE_A)
@@ -1290,7 +1307,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception:
                 now_dt = now_local()
             new_slot, wait_is_late = find_nearest_slot(schedule_slots, now_dt)
-            status_display_val = new_slot or "Статус"
+            status_display_val = format_status_or_fact_line(new_type, new_slot, report["report_date"])
             is_late = int(wait_is_late)
             
         conn.execute(
@@ -2471,7 +2488,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         orig_label = "🗣 Оригинальный текст (объединенный):" if is_addon else "🗣 Оригинальный текст:"
         notify_text = (
             f"{title_text}\n"
-            f"Статус: {nearest_slot if ai_res['report_type'] == 'status' else 'Факт дня (Итог)'}\n"
+            f"{format_status_or_fact_line(ai_res['report_type'], nearest_slot if ai_res['report_type'] == 'status' else None, date_str)}\n"
             f"Оценка ИИ: {'ОК' if ai_res['is_ok'] else 'НЕ ОК'}\n"
             f"Комментарий ИИ: {ai_res['format_comment']}\n\n"
             f"📝 Официальный отчет:\n\"{cleaned_text}\"\n\n"
