@@ -110,7 +110,9 @@ SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
     ASK_EDIT_SORT_ORDER,
     ASK_CONFIRM_DELETE,
     ASK_EDIT_STATUS_WORK,
-) = range(22)
+    ASK_EXPORT_TYPE,
+    ASK_EXPORT_DEPARTMENT,
+) = range(24)
 
 # Клавиатуры
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -1541,24 +1543,31 @@ async def myreports(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(part)
 
 
-async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update): return
+async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TYPE, dept: str = None):
     await update.message.reply_text("⏳ Формирую выгрузку отчетов в формате CSV...")
     
     conn = get_db()
-    query = """
-        SELECT r.id, r.telegram_id, w.last_name, w.first_name, w.position, 
-               r.report_date, r.report_type, r.slot_time, r.received_at, 
-               r.is_ok, r.is_late, r.format_comment, r.required_action, r.raw_text
-        FROM reports r
-        LEFT JOIN workers w ON r.telegram_id = w.telegram_id
-        ORDER BY r.report_date DESC, r.received_at DESC
-    """
-    reports = conn.execute(query).fetchall()
+    if dept is None:
+        query = """
+            SELECT w.last_name, w.first_name, w.position, r.is_ok, r.format_comment
+            FROM reports r
+            LEFT JOIN workers w ON r.telegram_id = w.telegram_id
+            ORDER BY r.report_date DESC, r.received_at DESC
+        """
+        reports = conn.execute(query).fetchall()
+    else:
+        query = """
+            SELECT w.last_name, w.first_name, w.position, r.is_ok, r.format_comment
+            FROM reports r
+            LEFT JOIN workers w ON r.telegram_id = w.telegram_id
+            WHERE lower(w.position) = lower(?)
+            ORDER BY r.report_date DESC, r.received_at DESC
+        """
+        reports = conn.execute(query, (dept,)).fetchall()
     conn.close()
     
     if not reports:
-        await update.message.reply_text("В базе данных пока нет ни одного отчета для выгрузки.")
+        await update.message.reply_text("В базе данных пока нет ни одного отчета для выгрузки по данному критерию.", reply_markup=MAIN_MENU)
         return
         
     output = io.StringIO()
@@ -1568,40 +1577,115 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Заголовки
     writer.writerow([
-        "ID отчета", "Telegram ID", "Фамилия", "Имя", "Отдел", 
-        "Дата отчета", "Тип отчета", "Интервал (Слот)", "Время получения", 
-        "Статус (ОК/НЕ ОК)", "Опоздание", "Комментарий ИИ", "Требуемые действия", "Оригинальный текст"
+        "Имя", "Фамилия", "Должность", "Отдел", "Статус", "Причина замечания"
     ])
     
     for r in reports:
-        r_type_str = "Почасовой статус" if r["report_type"] == "status" else "Итог дня"
+        last_name = r["last_name"] or "Неизвестный"
+        first_name = r["first_name"] or ""
+        position = r["position"] or "Не указано"
+        
+        status_str = "Сдал" if r["is_ok"] == 1 else "Не сдал"
+        
+        comment_str = ""
+        if r["is_ok"] == 0:
+            comment_str = r["format_comment"] or "Без комментария"
+            if comment_str.startswith("не ОК, "):
+                comment_str = comment_str[len("не ОК, "):]
+            elif comment_str.startswith("не ОК: "):
+                comment_str = comment_str[len("не ОК: "):]
+        
         writer.writerow([
-            r["id"],
-            r["telegram_id"],
-            r["last_name"] or "Неизвестный",
-            r["first_name"] or "",
-            r["position"] or "",
-            r["report_date"],
-            r_type_str,
-            r["slot_time"] or "",
-            r["received_at"],
-            "ОК" if r["is_ok"] else "НЕ ОК",
-            "Да" if r["is_late"] else "Нет",
-            r["format_comment"] or "",
-            r["required_action"] or "",
-            r["raw_text"] or "",
+            first_name,
+            last_name,
+            position,
+            position,
+            status_str,
+            comment_str
         ])
         
     csv_data = output.getvalue().encode('utf-8')
     bio = io.BytesIO(csv_data)
-    bio.name = f"reports_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    if dept is None:
+        bio.name = f"reports_all_{timestamp}.csv"
+        caption = "📊 Общая выгрузка всех отчетов успешно сформирована!"
+    else:
+        safe_dept = "".join(c for c in dept if c.isalnum() or c in (" ", "_", "-")).strip()
+        bio.name = f"reports_dept_{safe_dept}_{timestamp}.csv"
+        caption = f"📊 Выгрузка отчетов для отдела «{dept}» успешно сформирована!"
+        
     await context.bot.send_document(
         chat_id=update.effective_chat.id,
         document=bio,
         filename=bio.name,
-        caption="📊 Выгрузка всех отчетов успешно сформирована!"
+        caption=caption,
+        reply_markup=MAIN_MENU
     )
+
+
+async def export_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update):
+        return ConversationHandler.END
+        
+    kbd = ReplyKeyboardMarkup([
+        ["📊 Общая выгрузка", "🏢 Выгрузка по отделу"],
+        ["❌ Отмена"]
+    ], resize_keyboard=True)
+    
+    await update.message.reply_text(
+        "Выберите тип выгрузки отчетов:",
+        reply_markup=kbd
+    )
+    return ASK_EXPORT_TYPE
+
+
+async def export_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    choice = update.message.text.strip()
+    if choice == "❌ Отмена":
+        await update.message.reply_text("Выгрузка отменена.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+        
+    if choice == "📊 Общая выгрузка":
+        await generate_and_send_csv(update, context, dept=None)
+        return ConversationHandler.END
+        
+    if choice == "🏢 Выгрузка по отделу":
+        conn = get_db()
+        rows = conn.execute("SELECT DISTINCT position FROM workers ORDER BY position").fetchall()
+        conn.close()
+        
+        depts = [r["position"] for r in rows if r["position"] and r["position"] != "Не указано"]
+        if not depts:
+            await update.message.reply_text(
+                "В базе данных нет зарегистрированных отделов у сотрудников.",
+                reply_markup=MAIN_MENU
+            )
+            return ConversationHandler.END
+            
+        kbd_rows = [[d] for d in depts]
+        kbd_rows.append(["❌ Отмена"])
+        kbd = ReplyKeyboardMarkup(kbd_rows, resize_keyboard=True)
+        
+        await update.message.reply_text(
+            "Выберите отдел для выгрузки:",
+            reply_markup=kbd
+        )
+        return ASK_EXPORT_DEPARTMENT
+        
+    await update.message.reply_text("Пожалуйста, выберите один из вариантов на клавиатуре.")
+    return ASK_EXPORT_TYPE
+
+
+async def export_department_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    choice = update.message.text.strip()
+    if choice == "❌ Отмена":
+        await update.message.reply_text("Выгрузка отменена.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+        
+    await generate_and_send_csv(update, context, dept=choice)
+    return ConversationHandler.END
 
 
 async def check_missing_reports_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2185,7 +2269,6 @@ def main():
     application.add_handler(CommandHandler("myreports", myreports))
     application.add_handler(MessageHandler(filters.Regex("^🆔 ID чата$"), get_chat_id))
     application.add_handler(MessageHandler(filters.Regex("^📊 Сводка сейчас$"), send_summary_now))
-    application.add_handler(MessageHandler(filters.Regex("^📥 Выгрузить отчеты$"), export_csv))
     application.add_handler(MessageHandler(filters.Regex("^📣 Напомнить всем$"), remind_all_missing))
     
     # Callback-кнопки (для изменения оценок)
@@ -2251,12 +2334,22 @@ def main():
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
     )
 
+    export_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📥 Выгрузить отчеты$"), export_start)],
+        states={
+            ASK_EXPORT_TYPE: [MessageHandler(DIALOG_TEXT, export_type_selected)],
+            ASK_EXPORT_DEPARTMENT: [MessageHandler(DIALOG_TEXT, export_department_selected)],
+        },
+        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+    )
+
     # Регистрация диалогов
     application.add_handler(list_handler)
     application.add_handler(add_handler)
     application.add_handler(delete_handler)
     application.add_handler(view_dept_handler)
     application.add_handler(summary_scheduler_handler)
+    application.add_handler(export_handler)
 
     # Хэндлер для приема аудио/видео/текстовых отчетов сотрудников (регистрируется в самом конце)
     application.add_handler(MessageHandler(
