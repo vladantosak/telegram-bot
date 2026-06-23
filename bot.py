@@ -1147,7 +1147,7 @@ def generate_daily_summary_text(report_date: str) -> str:
 def format_show_date(date_str: str) -> str:
     try:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
-        return dt.strftime("%d.%m.%Y")
+        return dt.strftime("%d.%m")
     except Exception:
         return date_str
 
@@ -1813,8 +1813,8 @@ async def department_workers_show(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
     
     lines = [f"📋 Отдел: {position}"]
-    for r in rows:
-        lines.append(f"• {r['last_name']} {r['first_name']}")
+    for i, r in enumerate(rows, 1):
+        lines.append(f"{i}. {r['last_name']} {r['first_name']}")
     await update.message.reply_text("\n".join(lines), reply_markup=MAIN_MENU)
     return ConversationHandler.END
 
@@ -2483,7 +2483,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Получаем красивое название группы
         gname = await get_group_name_async(context.bot, dest_chat)
         
-        title_text = f"Дополнение к отчету (отчет обновлен): {w_name}" if is_addon else f"Новый отчет: {w_name}"
+        title_text = f"Дополнение к отчету (отчет обновлен): {w_name}" if is_addon else w_name
 
         orig_label = "🗣 Оригинальный текст (объединенный):" if is_addon else "🗣 Оригинальный текст:"
         notify_text = (
