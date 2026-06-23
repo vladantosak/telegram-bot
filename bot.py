@@ -1144,14 +1144,40 @@ def generate_daily_summary_text(report_date: str) -> str:
 # Решение проблемы 7 (Обработчик Callback-кнопки переключения результатов)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def update_message_text_fields(original_text: str, is_ok: bool, new_comment: str) -> str:
+def update_message_metadata(original_text: str, is_ok: bool | None = None, comment: str | None = None, status_val: str | None = None) -> str:
     lines = original_text.split("\n")
     for i, line in enumerate(lines):
-        if line.startswith("Оценка ИИ:"):
+        if line.startswith("Статус:") and status_val is not None:
+            lines[i] = f"Статус: {status_val}"
+        elif line.startswith("Оценка ИИ:") and is_ok is not None:
             lines[i] = f"Оценка ИИ: {'ОК' if is_ok else 'НЕ ОК'}"
-        elif line.startswith("Комментарий ИИ:"):
-            lines[i] = f"Комментарий ИИ: {new_comment}"
+        elif line.startswith("Комментарий ИИ:") and comment is not None:
+            lines[i] = f"Комментарий ИИ: {comment}"
     return "\n".join(lines)
+
+def update_message_text_fields(original_text: str, is_ok: bool, new_comment: str) -> str:
+    return update_message_metadata(original_text, is_ok=is_ok, comment=new_comment)
+
+def make_report_keyboard(report_id: int, report_type: str | None = None) -> InlineKeyboardMarkup:
+    if report_type is None:
+        try:
+            conn = get_db()
+            row = conn.execute("SELECT report_type FROM reports WHERE id = ?", (report_id,)).fetchone()
+            conn.close()
+            report_type = row["report_type"] if row else "status"
+        except Exception:
+            report_type = "status"
+            
+    type_btn_text = "📋 Сделать Итогом дня" if report_type == "status" else "⏱ Сделать Статусом"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Изменить оценку (ОК / НЕ ОК)", callback_data=f"fix_toggle_{report_id}"),
+            InlineKeyboardButton("✏️ Изменить комментарий", callback_data=f"edit_comment_{report_id}")
+        ],
+        [
+            InlineKeyboardButton(type_btn_text, callback_data=f"toggle_type_{report_id}")
+        ]
+    ])
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1203,12 +1229,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"Новый статус: {status_emoji} ({new_comment})"
             )
         
-        kbd = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔄 Изменить оценку (ОК / НЕ ОК)", callback_data=f"fix_toggle_{report_id}"),
-                InlineKeyboardButton("✏️ Изменить комментарий", callback_data=f"edit_comment_{report_id}")
-            ]
-        ])
+        kbd = make_report_keyboard(report_id, report["report_type"] if report else None)
         
         try:
             await query.edit_message_text(text=new_text, reply_markup=kbd)
@@ -1241,6 +1262,54 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             context.user_data["editing_comment_prompt_message_id"] = prompt_msg.message_id
         except Exception as e:
             print(f"Ошибка отправки ForceReply: {e}")
+
+    elif data.startswith("toggle_type_"):
+        report_id = int(data.split("_")[-1])
+        
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        if not report:
+            conn.close()
+            await query.answer("Запись отчета в БД не найдена.", show_alert=True)
+            return
+            
+        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
+        
+        current_type = report["report_type"]
+        if current_type == "status":
+            new_type = "daily_fact"
+            new_slot = None
+            is_late = 0
+            status_display_val = "Факт дня (Итог)"
+        else:
+            new_type = "status"
+            schedule_slots = SCHEDULES.get(worker["schedule"] if worker else "A", SCHEDULE_A)
+            try:
+                h, m, s = map(int, (report["received_at"] or "00:00:00").split(":"))
+                now_dt = now_local().replace(hour=h, minute=m, second=s)
+            except Exception:
+                now_dt = now_local()
+            new_slot, wait_is_late = find_nearest_slot(schedule_slots, now_dt)
+            status_display_val = new_slot or "Статус"
+            is_late = int(wait_is_late)
+            
+        conn.execute(
+            "UPDATE reports SET report_type = ?, slot_time = ?, is_late = ? WHERE id = ?",
+            (new_type, new_slot, is_late, report_id)
+        )
+        conn.commit()
+        conn.close()
+        
+        await query.answer("Тип отчета изменен!")
+        
+        original_text = query.message.text or ""
+        new_text = update_message_metadata(original_text, status_val=status_display_val)
+        
+        kbd = make_report_keyboard(report_id, new_type)
+        try:
+            await query.edit_message_text(text=new_text, reply_markup=kbd)
+        except Exception as e:
+            print(f"Ошибка обновления типа отчета в сообщении: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2222,12 +2291,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     updated_text = update_message_text_fields(original_text, report["is_ok"] == 1, new_comment)
                 
-                kbd = InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("🔄 Изменить оценку (ОК / НЕ ОК)", callback_data=f"fix_toggle_{report_id}"),
-                        InlineKeyboardButton("✏️ Изменить комментарий", callback_data=f"edit_comment_{report_id}")
-                    ]
-                ])
+                kbd = make_report_keyboard(report_id, report["report_type"] if report else None)
                 await context.bot.edit_message_text(
                     chat_id=original_chat_id,
                     message_id=original_msg_id,
@@ -2414,12 +2478,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{orig_label}\n\"{text_content}\""
         )
         
-        inline_kbd = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔄 Изменить оценку (ОК / НЕ ОК)", callback_data=f"fix_toggle_{report_id}"),
-                InlineKeyboardButton("✏️ Изменить комментарий", callback_data=f"edit_comment_{report_id}")
-            ]
-        ])
+        inline_kbd = make_report_keyboard(report_id, ai_res["report_type"])
         
         copied_msg_id = None
         if is_media:
