@@ -1944,7 +1944,7 @@ async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TY
         FROM reports r
         LEFT JOIN workers w ON r.telegram_id = w.telegram_id
         {where_clause}
-        ORDER BY COALESCE(w.position, 'Не указано') ASC, w.sort_order ASC, (COALESCE(w.last_name, '') || ' ' || COALESCE(w.first_name, '')) ASC, r.report_date DESC, r.received_at DESC
+        ORDER BY COALESCE(w.position, 'Не указано') ASC, w.sort_order ASC, (COALESCE(w.last_name, '') || ' ' || COALESCE(w.first_name, '')) ASC, r.report_date DESC, r.report_type DESC, COALESCE(r.slot_time, '') ASC, r.received_at ASC
     """
     reports = conn.execute(query, params).fetchall()
     conn.close()
@@ -1966,7 +1966,7 @@ async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TY
         "Сотрудник", "Отдел", "Дата", "Тип отчета", "Слот", "Время сдачи", "Статус", "Причина замечания"
     ])
     
-    last_processed_dept = None
+    current_group_key = None  # (position, employee_name, report_date)
     
     for r in reports:
         last_name = r["last_name"] or "Неизвестный"
@@ -1975,12 +1975,16 @@ async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TY
         
         # Объединяем Имя и Фамилия
         employee_name = f"{last_name} {first_name}".strip() if first_name else last_name
+        report_date_str = format_date_no_year(r["report_date"])
         
-        # Если изменился отдел (position), вставим красивую пустую строку
-        if last_processed_dept is not None and last_processed_dept != position:
+        group_key = (position, employee_name, report_date_str)
+        
+        # Если изменился блок (Сотрудник, Отдел, Дата), вставим красивую пустую строку
+        if current_group_key is not None and current_group_key != group_key:
             writer.writerow([])
             
-        last_processed_dept = position
+        is_first_row_of_group = (current_group_key != group_key)
+        current_group_key = group_key
         
         status_str = "Сдал" if r["is_ok"] == 1 else "Не сдал"
         
@@ -1995,18 +1999,29 @@ async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TY
         r_type_rus = "Статус" if r["report_type"] == "status" else "Факт дня"
         slot_str = r["slot_time"] or "-"
         received_at_str = format_time_no_seconds(r["received_at"])
-        report_date_str = format_date_no_year(r["report_date"])
         
-        writer.writerow([
-            employee_name,
-            position,
-            report_date_str,
-            r_type_rus,
-            slot_str,
-            received_at_str,
-            status_str,
-            comment_str
-        ])
+        if is_first_row_of_group:
+            writer.writerow([
+                employee_name,
+                position,
+                report_date_str,
+                r_type_rus,
+                slot_str,
+                received_at_str,
+                status_str,
+                comment_str
+            ])
+        else:
+            writer.writerow([
+                "",
+                "",
+                "",
+                r_type_rus,
+                slot_str,
+                received_at_str,
+                status_str,
+                comment_str
+            ])
         
     csv_data = output.getvalue().encode('utf-8')
     bio = io.BytesIO(csv_data)
