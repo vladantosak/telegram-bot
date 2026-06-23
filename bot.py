@@ -720,7 +720,11 @@ def normalize_ai_result(data: dict, source_text: str) -> dict:
     elif report_type not in ("status", "daily_fact"):
         report_type = "status"
 
-    is_ok = bool(data.get("is_ok", False))
+    raw_ok = data.get("is_ok", False)
+    if isinstance(raw_ok, str):
+        is_ok = raw_ok.strip().lower() in ("true", "1", "yes", "да")
+    else:
+        is_ok = bool(raw_ok)
     issue = str(data.get("issue") or data.get("format_comment") or "").strip()
     required_action = str(data.get("required_action") or "").strip()
     employee_message = str(data.get("employee_message") or "").strip()
@@ -2209,13 +2213,14 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     cleaned_text = await clean_report_async(report["raw_text"] or "")
                     title_text = f"Дополнение к отчету (отчет обновлен): {worker_name}" if is_addon else f"Новый отчет: {worker_name}"
                     
+                    orig_label = "🗣 Оригинальный текст (объединенный):" if is_addon else "🗣 Оригинальный текст:"
                     updated_text = (
                         f"{title_text}\n"
                         f"Статус: {report['slot_time'] or 'Факт дня (Итог)'}\n"
                         f"Оценка ИИ: {'ОК' if report['is_ok'] == 1 else 'НЕ ОК'}\n"
                         f"Комментарий ИИ: {new_comment}\n\n"
                         f"📝 Официальный отчет:\n\"{cleaned_text}\"\n\n"
-                        f"🗣 Оригинальный текст (объединенный):\n\"{report['raw_text']}\"" if is_addon else f"🗣 Оригинальный текст:\n\"{report['raw_text']}\""
+                        f"{orig_label}\n\"{report['raw_text']}\""
                     )
                 
                 kbd = InlineKeyboardMarkup([
@@ -2400,13 +2405,14 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         title_text = f"Дополнение к отчету (отчет обновлен): {w_name}" if is_addon else f"Новый отчет: {w_name}"
 
+        orig_label = "🗣 Оригинальный текст (объединенный):" if is_addon else "🗣 Оригинальный текст:"
         notify_text = (
             f"{title_text}\n"
             f"Статус: {nearest_slot if ai_res['report_type'] == 'status' else 'Факт дня (Итог)'}\n"
             f"Оценка ИИ: {'ОК' if ai_res['is_ok'] else 'НЕ ОК'}\n"
             f"Комментарий ИИ: {ai_res['format_comment']}\n\n"
             f"📝 Официальный отчет:\n\"{cleaned_text}\"\n\n"
-            f"🗣 Оригинальный текст (объединенный):\n\"{text_content}\"" if is_addon else f"🗣 Оригинальный текст:\n\"{text_content}\""
+            f"{orig_label}\n\"{text_content}\""
         )
         
         inline_kbd = InlineKeyboardMarkup([
