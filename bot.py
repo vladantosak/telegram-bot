@@ -17,6 +17,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ForceReply,
 )
 from telegram.ext import (
     Application,
@@ -1062,21 +1063,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         
         await query.answer()
         try:
-            # Отправляем сообщение для редактирования комментария напрямую администратору в личный чат!
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"✏️ Введите новый комментарий ИИ для отчета #{report_id}:",
-                reply_markup=CANCEL_KEYBOARD
+            prompt_msg = await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="✏️ Введите новый комментарий ИИ:",
+                reply_markup=ForceReply(selective=True)
             )
-        except Exception:
-            # Если не получилось начать приватный диалог с администратором
-            try:
-                await query.message.reply_text(
-                    "⚠️ Пожалуйста, напишите сначала боту в ЛС (нажмите /start в личке с ботом), чтобы редактировать комментарии без засорения общего чата.",
-                    reply_markup=ReplyKeyboardRemove()
-                )
-            except Exception:
-                pass
+            context.user_data["editing_comment_prompt_message_id"] = prompt_msg.message_id
+        except Exception as e:
+            print(f"Ошибка отправки ForceReply: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1945,17 +1939,27 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("editing_comment_chat_id", None)
         context.user_data.pop("editing_comment_message_id", None)
         context.user_data.pop("editing_comment_original_text", None)
+        prompt_message_id = context.user_data.pop("editing_comment_prompt_message_id", None)
         
+        # Попытка удалить сообщение-запрос и ответ администратора
+        if prompt_message_id and original_chat_id:
+            try:
+                await context.bot.delete_message(chat_id=original_chat_id, message_id=prompt_message_id)
+            except Exception:
+                pass
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+            
         new_comment = update.message.text.strip() if update.message.text else ""
-        if not new_comment or new_comment == "❌ Отмена":
-            await update.message.reply_text("Редактирование комментария отменено.", reply_markup=MAIN_MENU)
+        if not new_comment or new_comment.lower() in ("отмена", "❌ отмена"):
             return
             
         conn = get_db()
         report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
         if not report:
             conn.close()
-            await update.message.reply_text("Запись отчета в БД не найдена.", reply_markup=MAIN_MENU)
             return
             
         # Обновляем комментарий в БД
@@ -1972,11 +1976,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
         status_emoji = "✅" if report["is_ok"] == 1 else "⚠️"
-        
-        await update.message.reply_text(
-            f"✅ Комментарий к отчету {worker_name} успешно обновлен на:\n\"{new_comment}\"",
-            reply_markup=MAIN_MENU
-        )
         
         # Обновляем оригинальное сообщение в группе / чате
         if original_chat_id and original_msg_id:
