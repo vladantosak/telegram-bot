@@ -1538,7 +1538,12 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
 
-    # 2. Rate limiting
+    # 2. Администраторы не отправляют отчёты — игнорируем их сообщения
+    #    (кроме случая редактирования комментария, который обработан выше)
+    if is_admin(user_id):
+        return
+
+    # 3. Rate limiting
     if not check_rate_limit(user_id):
         await update.message.reply_text(
             f"⏳ Вы отправляете отчёты слишком часто. Подождите {REPORT_COOLDOWN_SEC} секунд."
