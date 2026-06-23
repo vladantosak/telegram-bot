@@ -1880,6 +1880,49 @@ async def myreports(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(part)
 
 
+def format_date_no_year(date_str) -> str:
+    if date_str is None:
+        return "-"
+    date_str = str(date_str).strip()
+    if not date_str or date_str == "-":
+        return "-"
+    try:
+        # Try YYYY-MM-DD
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return dt.strftime("%d.%m")
+    except Exception:
+        try:
+            # Try DD.MM.YYYY
+            dt = datetime.strptime(date_str, "%d.%m.%Y")
+            return dt.strftime("%d.%m")
+        except Exception:
+            parts = date_str.split('.')
+            if len(parts) >= 2:
+                return f"{parts[0]}.{parts[1]}"
+            return date_str
+
+def format_time_no_seconds(time_str) -> str:
+    if time_str is None:
+        return "-"
+    time_str = str(time_str).strip()
+    if not time_str or time_str == "-":
+        return "-"
+    try:
+        # Try HH:MM:SS
+        dt = datetime.strptime(time_str, "%H:%M:%S")
+        return dt.strftime("%H:%M")
+    except Exception:
+        try:
+            # Try HH:MM
+            dt = datetime.strptime(time_str, "%H:%M")
+            return dt.strftime("%H:%M")
+        except Exception:
+            parts = time_str.split(':')
+            if len(parts) >= 2:
+                return f"{parts[0]}:{parts[1]}"
+            return time_str
+
+
 async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TYPE, dept: str = None, only_facts: bool = False):
     await update.message.reply_text("⏳ Формирую выгрузку отчетов в формате CSV...")
     
@@ -1897,11 +1940,11 @@ async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TY
     where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
     
     query = f"""
-        SELECT w.last_name, w.first_name, w.position, r.is_ok, r.format_comment, r.report_type, r.slot_time, r.received_at, r.report_date
+        SELECT w.last_name, w.first_name, w.position, w.sort_order, r.is_ok, r.format_comment, r.report_type, r.slot_time, r.received_at, r.report_date
         FROM reports r
         LEFT JOIN workers w ON r.telegram_id = w.telegram_id
         {where_clause}
-        ORDER BY r.report_date DESC, r.received_at DESC
+        ORDER BY COALESCE(w.position, 'Не указано') ASC, w.sort_order ASC, (COALESCE(w.last_name, '') || ' ' || COALESCE(w.first_name, '')) ASC, r.report_date DESC, r.received_at DESC
     """
     reports = conn.execute(query, params).fetchall()
     conn.close()
@@ -1912,21 +1955,32 @@ async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TY
             criteria_msg = "по фактам дня."
         await update.message.reply_text(f"В базе данных пока нет ни одного отчета {criteria_msg}", reply_markup=MAIN_MENU)
         return
-        
+    
     output = io.StringIO()
     # Записываем BOM для Excel, чтобы он корректно отображал UTF-8 символы
     output.write('\ufeff')
     writer = csv.writer(output, delimiter=';', lineterminator='\n')
     
-    # Заголовки - теперь включаем Время сдачи
+    # Заголовки - теперь объединенное ФИО и только отдел, без Должность
     writer.writerow([
-        "Имя", "Фамилия", "Должность", "Отдел", "Дата", "Тип отчета", "Слот", "Время сдачи", "Статус", "Причина замечания"
+        "Сотрудник", "Отдел", "Дата", "Тип отчета", "Слот", "Время сдачи", "Статус", "Причина замечания"
     ])
+    
+    last_processed_dept = None
     
     for r in reports:
         last_name = r["last_name"] or "Неизвестный"
         first_name = r["first_name"] or ""
         position = r["position"] or "Не указано"
+        
+        # Объединяем Имя и Фамилия
+        employee_name = f"{last_name} {first_name}".strip() if first_name else last_name
+        
+        # Если изменился отдел (position), вставим красивую пустую строку
+        if last_processed_dept is not None and last_processed_dept != position:
+            writer.writerow([])
+            
+        last_processed_dept = position
         
         status_str = "Сдал" if r["is_ok"] == 1 else "Не сдал"
         
@@ -1940,13 +1994,11 @@ async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TY
         
         r_type_rus = "Статус" if r["report_type"] == "status" else "Факт дня"
         slot_str = r["slot_time"] or "-"
-        received_at_str = r["received_at"] or "-"
-        report_date_str = r["report_date"] or "-"
+        received_at_str = format_time_no_seconds(r["received_at"])
+        report_date_str = format_date_no_year(r["report_date"])
         
         writer.writerow([
-            first_name,
-            last_name,
-            position,
+            employee_name,
             position,
             report_date_str,
             r_type_rus,
