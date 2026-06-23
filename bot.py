@@ -112,7 +112,8 @@ SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
     ASK_EDIT_STATUS_WORK,
     ASK_EXPORT_TYPE,
     ASK_EXPORT_DEPARTMENT,
-) = range(24)
+    ASK_EXPORT_DEPARTMENT_SELECT,
+) = range(25)
 
 # Клавиатуры
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -1543,31 +1544,37 @@ async def myreports(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(part)
 
 
-async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TYPE, dept: str = None):
+async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TYPE, dept: str = None, only_facts: bool = False):
     await update.message.reply_text("⏳ Формирую выгрузку отчетов в формате CSV...")
     
     conn = get_db()
-    if dept is None:
-        query = """
-            SELECT w.last_name, w.first_name, w.position, r.is_ok, r.format_comment
-            FROM reports r
-            LEFT JOIN workers w ON r.telegram_id = w.telegram_id
-            ORDER BY r.report_date DESC, r.received_at DESC
-        """
-        reports = conn.execute(query).fetchall()
-    else:
-        query = """
-            SELECT w.last_name, w.first_name, w.position, r.is_ok, r.format_comment
-            FROM reports r
-            LEFT JOIN workers w ON r.telegram_id = w.telegram_id
-            WHERE lower(w.position) = lower(?)
-            ORDER BY r.report_date DESC, r.received_at DESC
-        """
-        reports = conn.execute(query, (dept,)).fetchall()
+    conditions = []
+    params = []
+    
+    if dept is not None:
+        conditions.append("lower(w.position) = lower(?)")
+        params.append(dept)
+        
+    if only_facts:
+        conditions.append("r.report_type = 'daily_fact'")
+        
+    where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
+    
+    query = f"""
+        SELECT w.last_name, w.first_name, w.position, r.is_ok, r.format_comment, r.report_type, r.slot_time, r.received_at, r.report_date
+        FROM reports r
+        LEFT JOIN workers w ON r.telegram_id = w.telegram_id
+        {where_clause}
+        ORDER BY r.report_date DESC, r.received_at DESC
+    """
+    reports = conn.execute(query, params).fetchall()
     conn.close()
     
     if not reports:
-        await update.message.reply_text("В базе данных пока нет ни одного отчета для выгрузки по данному критерию.", reply_markup=MAIN_MENU)
+        criteria_msg = "для выгрузки по данному критерию."
+        if only_facts:
+            criteria_msg = "по фактам дня."
+        await update.message.reply_text(f"В базе данных пока нет ни одного отчета {criteria_msg}", reply_markup=MAIN_MENU)
         return
         
     output = io.StringIO()
@@ -1575,9 +1582,9 @@ async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TY
     output.write('\ufeff')
     writer = csv.writer(output, delimiter=';', lineterminator='\n')
     
-    # Заголовки
+    # Заголовки - теперь включаем Время сдачи
     writer.writerow([
-        "Имя", "Фамилия", "Должность", "Отдел", "Статус", "Причина замечания"
+        "Имя", "Фамилия", "Должность", "Отдел", "Дата", "Тип отчета", "Слот", "Время сдачи", "Статус", "Причина замечания"
     ])
     
     for r in reports:
@@ -1595,11 +1602,20 @@ async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TY
             elif comment_str.startswith("не ОК: "):
                 comment_str = comment_str[len("не ОК: "):]
         
+        r_type_rus = "Статус" if r["report_type"] == "status" else "Факт дня"
+        slot_str = r["slot_time"] or "-"
+        received_at_str = r["received_at"] or "-"
+        report_date_str = r["report_date"] or "-"
+        
         writer.writerow([
             first_name,
             last_name,
             position,
             position,
+            report_date_str,
+            r_type_rus,
+            slot_str,
+            received_at_str,
             status_str,
             comment_str
         ])
@@ -1608,13 +1624,15 @@ async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TY
     bio = io.BytesIO(csv_data)
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    prefix = "facts" if only_facts else "reports"
+    
     if dept is None:
-        bio.name = f"reports_all_{timestamp}.csv"
-        caption = "📊 Общая выгрузка всех отчетов успешно сформирована!"
+        bio.name = f"{prefix}_all_{timestamp}.csv"
+        caption = "📊 Общая выгрузка фактов дня успешно сформирована!" if only_facts else "📊 Общая выгрузка всех отчетов успешно сформирована!"
     else:
         safe_dept = "".join(c for c in dept if c.isalnum() or c in (" ", "_", "-")).strip()
-        bio.name = f"reports_dept_{safe_dept}_{timestamp}.csv"
-        caption = f"📊 Выгрузка отчетов для отдела «{dept}» успешно сформирована!"
+        bio.name = f"{prefix}_dept_{safe_dept}_{timestamp}.csv"
+        caption = f"📊 Выгрузка фактов дня для отдела «{dept}» успешно сформирована!" if only_facts else f"📊 Выгрузка отчетов для отдела «{dept}» успешно сформирована!"
         
     await context.bot.send_document(
         chat_id=update.effective_chat.id,
