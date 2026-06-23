@@ -1144,6 +1144,15 @@ def generate_daily_summary_text(report_date: str) -> str:
 # Решение проблемы 7 (Обработчик Callback-кнопки переключения результатов)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def update_message_text_fields(original_text: str, is_ok: bool, new_comment: str) -> str:
+    lines = original_text.split("\n")
+    for i, line in enumerate(lines):
+        if line.startswith("Оценка ИИ:"):
+            lines[i] = f"Оценка ИИ: {'ОК' if is_ok else 'НЕ ОК'}"
+        elif line.startswith("Комментарий ИИ:"):
+            lines[i] = f"Комментарий ИИ: {new_comment}"
+    return "\n".join(lines)
+
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -1182,13 +1191,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("Оценка скорректирована!")
         
         # Обновляем текст сообщения, сохраняя историю
-        new_text = (
-            f"🔧 Оценка отчета изменена вручную администратором @{query.from_user.username or user_id}:\n"
-            f"Сотрудник: {worker_name}\n"
-            f"Дата отчета: {report['report_date']}\n"
-            f"Статус: {report['slot_time'] or report['report_type']}\n"
-            f"Новый статус: {status_emoji} ({new_comment})"
-        )
+        original_text = query.message.text or ""
+        if "Официальный отчет:" in original_text:
+            new_text = update_message_text_fields(original_text, new_ok == 1, new_comment)
+        else:
+            new_text = (
+                f"🔧 Оценка отчета изменена вручную администратором @{query.from_user.username or user_id}:\n"
+                f"Сотрудник: {worker_name}\n"
+                f"Дата отчета: {report['report_date']}\n"
+                f"Статус: {report['slot_time'] or report['report_type']}\n"
+                f"Новый статус: {status_emoji} ({new_comment})"
+            )
         
         kbd = InlineKeyboardMarkup([
             [
@@ -2207,21 +2220,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"Новый статус: {status_emoji} ({new_comment})"
                     )
                 else:
-                    dest_chat = (worker["group_id"] if worker else 0) or DEFAULT_GROUP_ID
-                    gname = await get_group_name_async(context.bot, dest_chat)
-                    is_addon = "[Дополнение]:" in (report["raw_text"] or "")
-                    cleaned_text = await clean_report_async(report["raw_text"] or "")
-                    title_text = f"Дополнение к отчету (отчет обновлен): {worker_name}" if is_addon else f"Новый отчет: {worker_name}"
-                    
-                    orig_label = "🗣 Оригинальный текст (объединенный):" if is_addon else "🗣 Оригинальный текст:"
-                    updated_text = (
-                        f"{title_text}\n"
-                        f"Статус: {report['slot_time'] or 'Факт дня (Итог)'}\n"
-                        f"Оценка ИИ: {'ОК' if report['is_ok'] == 1 else 'НЕ ОК'}\n"
-                        f"Комментарий ИИ: {new_comment}\n\n"
-                        f"📝 Официальный отчет:\n\"{cleaned_text}\"\n\n"
-                        f"{orig_label}\n\"{report['raw_text']}\""
-                    )
+                    updated_text = update_message_text_fields(original_text, report["is_ok"] == 1, new_comment)
                 
                 kbd = InlineKeyboardMarkup([
                     [
