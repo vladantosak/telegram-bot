@@ -1029,7 +1029,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"🔧 Оценка отчета изменена вручную администратором @{query.from_user.username or user_id}:\n"
             f"Сотрудник: {worker_name}\n"
             f"Дата отчета: {report['report_date']}\n"
-            f"Статус/Тип: {report['slot_time'] or report['report_type']}\n"
+            f"Статус: {report['slot_time'] or report['report_type']}\n"
             f"Новый статус: {status_emoji} ({new_comment})"
         )
         
@@ -1986,7 +1986,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"🔧 Оценка отчета изменена вручную администратором @{update.effective_user.username or user_id}:\n"
                         f"Сотрудник: {worker_name}\n"
                         f"Дата отчета: {report['report_date']}\n"
-                        f"Статус/Тип: {report['slot_time'] or report['report_type']}\n"
+                        f"Статус: {report['slot_time'] or report['report_type']}\n"
                         f"Новый статус: {status_emoji} ({new_comment})"
                     )
                 else:
@@ -1994,15 +1994,13 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     gname = await get_group_name_async(context.bot, dest_chat)
                     is_addon = "[Дополнение]:" in (report["raw_text"] or "")
                     cleaned_text = await clean_report_async(report["raw_text"] or "")
-                    is_ok_emoji = "✅" if report["is_ok"] == 1 else "⚠️"
-                    title_text = f"📊 {is_ok_emoji} Дополнение к отчету (отчет обновлен): {worker_name}" if is_addon else f"📊 {is_ok_emoji} Новый отчет: {worker_name}"
+                    title_text = f"Дополнение к отчету (отчет обновлен): {worker_name}" if is_addon else f"Новый отчет: {worker_name}"
                     
                     updated_text = (
                         f"{title_text}\n"
-                        f"Тип/Статус: {report['slot_time'] or 'Факт дня (Итог)'}\n"
+                        f"Статус: {report['slot_time'] or 'Факт дня (Итог)'}\n"
                         f"Оценка ИИ: {'ОК' if report['is_ok'] == 1 else 'НЕ ОК'}\n"
-                        f"Комментарий ИИ: {new_comment}\n"
-                        f"Группа: {gname}\n\n"
+                        f"Комментарий ИИ: {new_comment}\n\n"
                         f"📝 Официальный отчет:\n\"{cleaned_text}\"\n\n"
                         f"🗣 Оригинальный текст (объединенный):\n\"{report['raw_text']}\"" if is_addon else f"🗣 Оригинальный текст:\n\"{report['raw_text']}\""
                     )
@@ -2182,20 +2180,18 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"⚠️ Оценка отчета: {ai_res['employee_message']}")
 
         # Решение проблемы 7: Кнопка «Исправить оценку» во всех отчетах для администраторов или в группе
-        is_ok_emoji = "✅" if ai_res["is_ok"] else "⚠️"
         dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
         
         # Получаем красивое название группы
         gname = await get_group_name_async(context.bot, dest_chat)
         
-        title_text = f"📊 {is_ok_emoji} Дополнение к отчету (отчет обновлен): {w_name}" if is_addon else f"📊 {is_ok_emoji} Новый отчет: {w_name}"
+        title_text = f"Дополнение к отчету (отчет обновлен): {w_name}" if is_addon else f"Новый отчет: {w_name}"
 
         notify_text = (
             f"{title_text}\n"
-            f"Тип/Статус: {nearest_slot if ai_res['report_type'] == 'status' else 'Факт дня (Итог)'}\n"
+            f"Статус: {nearest_slot if ai_res['report_type'] == 'status' else 'Факт дня (Итог)'}\n"
             f"Оценка ИИ: {'ОК' if ai_res['is_ok'] else 'НЕ ОК'}\n"
-            f"Комментарий ИИ: {ai_res['format_comment']}\n"
-            f"Группа: {gname}\n\n"
+            f"Комментарий ИИ: {ai_res['format_comment']}\n\n"
             f"📝 Официальный отчет:\n\"{cleaned_text}\"\n\n"
             f"🗣 Оригинальный текст (объединенный):\n\"{text_content}\"" if is_addon else f"🗣 Оригинальный текст:\n\"{text_content}\""
         )
