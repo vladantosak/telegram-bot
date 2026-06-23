@@ -9,6 +9,8 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import datetime as dt_module
 from zoneinfo import ZoneInfo
+from openpyxl import load_workbook
+import hashlib
 
 from groq import Groq
 from telegram import (
@@ -116,6 +118,8 @@ SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
     ASK_EXPORT_DEPARTMENT_SELECT,
 ) = range(25)
 
+ASK_IMPORT_FILE = 25
+
 # Клавиатуры
 MAIN_MENU = ReplyKeyboardMarkup(
     [
@@ -123,7 +127,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
         ["➕ Добавить сотрудника", "➖ Удалить сотрудника"],
         ["🏢 Сотрудники отдела", "⏰ Время сводки"],
         ["🆔 ID чата", "📣 Напомнить всем"],
-        ["📥 Выгрузить отчеты"],
+        ["📥 Выгрузить отчеты", "📥 Импорт сотрудников"],
     ],
     resize_keyboard=True,
 )
@@ -268,6 +272,155 @@ def upsert_worker(telegram_id: int, last_name: str, first_name: str, position: s
     )
     conn.commit()
     conn.close()
+
+def read_excel(file_path: str):
+    wb = load_workbook(file_path, data_only=True)
+    sheet = wb.active
+    
+    headers = []
+    for cell in sheet[1]:
+        if cell.value is not None:
+            headers.append(str(cell.value).strip().lower())
+        else:
+            headers.append("")
+            
+    workers = []
+    
+    idx_id = -1
+    idx_lastname = -1
+    idx_firstname = -1
+    idx_name = -1
+    idx_position = -1
+    idx_group = -1
+    idx_schedule = -1
+    idx_daily_fact = -1
+    
+    for idx, h in enumerate(headers):
+        if h in ("telegram_id", "id", "tg id", "telegram", "телеграм id", "тг id"):
+            idx_id = idx
+        elif h in ("last_name", "lastname", "фамилия"):
+            idx_lastname = idx
+        elif h in ("first_name", "firstname", "имя"):
+            idx_firstname = idx
+        elif h in ("name", "фио", "сотрудник", "имя фамилия"):
+            idx_name = idx
+        elif h in ("position", "должность", "отдел", "специальность"):
+            idx_position = idx
+        elif h in ("group_id", "группа", "id группы", "чат", "чат id", "brigade"):
+            idx_group = idx
+        elif h in ("schedule", "график", "расписание"):
+            idx_schedule = idx
+        elif h in ("needs_daily_fact", "факт дня", "ежедневный факт"):
+            idx_daily_fact = idx
+            
+    for row_idx in range(2, sheet.max_row + 1):
+        row_values = []
+        for col_idx in range(1, len(headers) + 1):
+            val = sheet.cell(row=row_idx, column=col_idx).value
+            row_values.append(val)
+        
+        if not any(v is not None for v in row_values):
+            continue
+            
+        tg_id_val = row_values[idx_id] if idx_id != -1 and idx_id < len(row_values) else None
+        lastname_val = row_values[idx_lastname] if idx_lastname != -1 and idx_lastname < len(row_values) else None
+        firstname_val = row_values[idx_firstname] if idx_firstname != -1 and idx_firstname < len(row_values) else None
+        name_val = row_values[idx_name] if idx_name != -1 and idx_name < len(row_values) else None
+        pos_val = row_values[idx_position] if idx_position != -1 and idx_position < len(row_values) else None
+        group_val = row_values[idx_group] if idx_group != -1 and idx_group < len(row_values) else None
+        schedule_val = row_values[idx_schedule] if idx_schedule != -1 and idx_schedule < len(row_values) else None
+        daily_fact_val = row_values[idx_daily_fact] if idx_daily_fact != -1 and idx_daily_fact < len(row_values) else None
+        
+        # We also check if user has name/position/brigade/object columns which we map gracefully:
+        # object column could be mapped to position/department if not specified
+        idx_object = -1
+        for idx, h in enumerate(headers):
+            if h in ("object", "объект"):
+                idx_object = idx
+                break
+        if idx_object != -1 and idx_object < len(row_values) and row_values[idx_object] is not None:
+            obj_val = str(row_values[idx_object]).strip()
+            if pos_val is None:
+                pos_val = obj_val
+            else:
+                pos_val = f"{str(pos_val).strip()} ({obj_val})"
+
+        tg_id = None
+        if tg_id_val is not None:
+            try:
+                tg_id = int(float(str(tg_id_val).strip()))
+            except ValueError:
+                pass
+                
+        last_name = ""
+        first_name = ""
+        if lastname_val is not None:
+            last_name = str(lastname_val).strip()
+        if firstname_val is not None:
+            first_name = str(firstname_val).strip()
+            
+        if not last_name and not first_name and name_val is not None:
+            parts = str(name_val).strip().split()
+            if len(parts) >= 2:
+                last_name = parts[0]
+                first_name = " ".join(parts[1:])
+            elif len(parts) == 1:
+                first_name = parts[0]
+                last_name = "Сотрудник"
+                
+        if not last_name:
+            last_name = "Не указана"
+        if not first_name:
+            first_name = "Не указано"
+            
+        position = str(pos_val).strip() if pos_val is not None else "Не указано"
+        
+        group_id = DEFAULT_GROUP_ID
+        if group_val is not None:
+            try:
+                # If they wrote e.g. "Бригада 1", it isn't an integer, so we ignore or map to DEFAULT_GROUP_ID
+                group_id = int(float(str(group_val).strip()))
+            except ValueError:
+                pass
+                
+        schedule = str(schedule_val).strip().upper() if schedule_val is not None else "A"
+        if schedule not in ("A", "B"):
+            schedule = "A"
+            
+        needs_daily_fact = True
+        if daily_fact_val is not None:
+            df_str = str(daily_fact_val).strip().lower()
+            if df_str in ("0", "false", "нет", "no"):
+                needs_daily_fact = False
+                
+        # Generate a fallback tg_id if not present
+        if tg_id is None:
+            name_str = f"{last_name} {first_name} {position}"
+            tg_id_hash = int(hashlib.md5(name_str.encode('utf-8')).hexdigest()[:7], 16)
+            tg_id = -tg_id_hash
+
+        workers.append({
+            "telegram_id": tg_id,
+            "last_name": last_name,
+            "first_name": first_name,
+            "position": position,
+            "group_id": group_id,
+            "schedule": schedule,
+            "needs_daily_fact": needs_daily_fact
+        })
+        
+    return workers
+
+def add_worker_excel(worker):
+    upsert_worker(
+        telegram_id=worker["telegram_id"],
+        last_name=worker["last_name"],
+        first_name=worker["first_name"],
+        position=worker["position"],
+        group_id=worker["group_id"],
+        schedule=worker["schedule"],
+        needs_daily_fact=worker["needs_daily_fact"],
+    )
 
 def update_worker_field(telegram_id: int, field: str, value):
     allowed = {"last_name", "first_name", "position", "group_id", "schedule", "needs_daily_fact", "sort_order", "is_active"}
@@ -1095,6 +1248,66 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Действие отменено.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
+
+async def import_workers_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return ConversationHandler.END
+    await update.message.reply_text(
+        "📎 Пожалуйста, отправьте файл Excel (.xlsx) со списком сотрудников.\n\n"
+        "Файл должен содержать заголовки: name (или ФИО), position (или должность), и т.д. "
+        "А также telegram_id (или ID), если хотите связать аккаунты напрямую.",
+        reply_markup=CANCEL_KEYBOARD
+    )
+    return ASK_IMPORT_FILE
+
+async def import_workers_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return ConversationHandler.END
+    
+    doc = update.message.document
+    if not doc:
+        await update.message.reply_text("❌ Пожалуйста, отправьте файл типа документ (.xlsx).")
+        return ASK_IMPORT_FILE
+        
+    if not doc.file_name.lower().endswith(".xlsx"):
+        await update.message.reply_text("❌ Формат файла не поддерживается. Пожалуйста, отправьте файл .xlsx")
+        return ASK_IMPORT_FILE
+        
+    await update.message.reply_text("⏳ Получение файла и импорт данных, пожалуйста, подождите...")
+    
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        local_path = "workers_temp_import.xlsx"
+        await tg_file.download_to_drive(local_path)
+        
+        workers = read_excel(local_path)
+        if not workers:
+            await update.message.reply_text("⚠️ Не обнаружено записей в файле или структура не распознана. Проверьте заголовки.", reply_markup=MAIN_MENU)
+            if os.path.exists(local_path):
+                os.remove(local_path)
+            return ConversationHandler.END
+            
+        success_count = 0
+        for w in workers:
+            try:
+                add_worker_excel(w)
+                success_count += 1
+            except Exception as ex:
+                logging.error(f"Error importing worker {w}: {ex}")
+                
+        # Clean up temp file
+        if os.path.exists(local_path):
+            os.remove(local_path)
+            
+        await update.message.reply_text(
+            f"✅ Импорт успешно завершен!\n"
+            f"Загружено/обновлено сотрудников: {success_count}.",
+            reply_markup=MAIN_MENU
+        )
+        return ConversationHandler.END
+        
+    except Exception as e:
+        logging.error(f"Excel import error: {e}")
+        await update.message.reply_text(f"❌ Произошла ошибка во время импорта: {e}", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2382,6 +2595,14 @@ def main():
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
     )
 
+    import_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📥 Импорт сотрудников$"), import_workers_start)],
+        states={
+            ASK_IMPORT_FILE: [MessageHandler(filters.Document.ALL, import_workers_file)],
+        },
+        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+    )
+
     # Регистрация диалогов
     application.add_handler(list_handler)
     application.add_handler(add_handler)
@@ -2389,6 +2610,7 @@ def main():
     application.add_handler(view_dept_handler)
     application.add_handler(summary_scheduler_handler)
     application.add_handler(export_handler)
+    application.add_handler(import_handler)
 
     # Хэндлер для приема аудио/видео/текстовых отчетов сотрудников (регистрируется в самом конце)
     application.add_handler(MessageHandler(
