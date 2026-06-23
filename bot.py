@@ -520,10 +520,19 @@ async def require_admin(update: Update) -> bool:
             reply_markup=ReplyKeyboardRemove(),
         )
         return False
+    if update.effective_chat.type != "private":
+        try:
+            await update.message.reply_text(
+                "⚠️ Эта функция доступна только в личных сообщениях с ботом.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+        except Exception:
+            pass
+        return False
     return True
 
-def menu_for_user(user_id: int):
-    return MAIN_MENU if is_admin(user_id) else ReplyKeyboardRemove()
+def menu_for_user(user_id: int, chat_type: str = "private"):
+    return MAIN_MENU if (is_admin(user_id) and chat_type == "private") else ReplyKeyboardRemove()
 
 def positions_keyboard(rows):
     positions = sorted({row["position"] for row in rows})
@@ -1052,10 +1061,22 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data["editing_comment_original_text"] = query.message.text
         
         await query.answer()
-        await query.message.reply_text(
-            f"✏️ Введите новый комментарий ИИ для этого отчета:",
-            reply_markup=CANCEL_KEYBOARD
-        )
+        try:
+            # Отправляем сообщение для редактирования комментария напрямую администратору в личный чат!
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"✏️ Введите новый комментарий ИИ для отчета #{report_id}:",
+                reply_markup=CANCEL_KEYBOARD
+            )
+        except Exception:
+            # Если не получилось начать приватный диалог с администратором
+            try:
+                await query.message.reply_text(
+                    "⚠️ Пожалуйста, напишите сначала боту в ЛС (нажмите /start в личке с ботом), чтобы редактировать комментарии без засорения общего чата.",
+                    reply_markup=ReplyKeyboardRemove()
+                )
+            except Exception:
+                pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1063,17 +1084,22 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_admin(update.effective_user.id):
+    chat_type = update.effective_chat.type
+    if is_admin(update.effective_user.id) and chat_type == "private":
         await update.message.reply_text("Привет! Выберите действие кнопкой ниже.", reply_markup=MAIN_MENU)
     else:
         await update.message.reply_text("Привет! Отправьте видеоотчет, когда он будет готов.", reply_markup=ReplyKeyboardRemove())
 
 async def get_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"ID чата: {update.effective_chat.id}", reply_markup=menu_for_user(update.effective_user.id))
+    await update.message.reply_text(f"ID чата: {update.effective_chat.id}", reply_markup=menu_for_user(update.effective_user.id, update.effective_chat.type))
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Действие отменено.", reply_markup=MAIN_MENU)
+    chat_type = update.effective_chat.type
+    if is_admin(update.effective_user.id) and chat_type == "private":
+        await update.message.reply_text("Действие отменено.", reply_markup=MAIN_MENU)
+    else:
+        await update.message.reply_text("Действие отменено.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 
