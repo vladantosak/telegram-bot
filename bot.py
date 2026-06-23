@@ -1923,10 +1923,17 @@ def format_time_no_seconds(time_str) -> str:
             return time_str
 
 
-async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TYPE, dept: str = None, only_facts: bool = False):
-    await update.message.reply_text("⏳ Формирую выгрузку отчетов в формате CSV...")
+async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_TYPE, dept: str = None, only_facts: bool = False):
+    await update.message.reply_text("⏳ Формирую выгрузку отчетов в формате Excel (.xlsx)...")
     
     conn = get_db()
+    
+    # 1. Fetch active workers that match dept
+    if dept is not None:
+        workers = conn.execute("SELECT * FROM workers WHERE lower(position) = lower(?)", (dept,)).fetchall()
+    else:
+        workers = conn.execute("SELECT * FROM workers").fetchall()
+        
     conditions = []
     params = []
     
@@ -1939,12 +1946,12 @@ async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TY
         
     where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
     
+    # We fetch relevant reports
     query = f"""
-        SELECT w.last_name, w.first_name, w.position, w.sort_order, r.is_ok, r.format_comment, r.report_type, r.slot_time, r.received_at, r.report_date
+        SELECT r.id, r.telegram_id, r.report_date, r.report_type, r.slot_time, r.is_ok, r.format_comment, r.received_at
         FROM reports r
         LEFT JOIN workers w ON r.telegram_id = w.telegram_id
         {where_clause}
-        ORDER BY COALESCE(w.position, 'Не указано') ASC, w.sort_order ASC, (COALESCE(w.last_name, '') || ' ' || COALESCE(w.first_name, '')) ASC, r.report_date DESC, r.report_type DESC, COALESCE(r.slot_time, '') ASC, r.received_at ASC
     """
     reports = conn.execute(query, params).fetchall()
     conn.close()
@@ -1955,87 +1962,245 @@ async def generate_and_send_csv(update: Update, context: ContextTypes.DEFAULT_TY
             criteria_msg = "по фактам дня."
         await update.message.reply_text(f"В базе данных пока нет ни одного отчета {criteria_msg}", reply_markup=MAIN_MENU)
         return
+        
+    # Find list of unique dates and sort them chronologically
+    unique_dates = sorted(list(set(r["report_date"] for r in reports)))
     
-    output = io.StringIO()
-    # Записываем BOM для Excel, чтобы он корректно отображал UTF-8 символы
-    output.write('\ufeff')
-    writer = csv.writer(output, delimiter=';', lineterminator='\n')
-    
-    # Заголовки - теперь объединенное ФИО и только отдел, без Должность
-    writer.writerow([
-        "Сотрудник", "Отдел", "Дата", "Тип отчета", "Слот", "Время сдачи", "Статус", "Причина замечания"
-    ])
-    
-    current_group_key = None  # (position, employee_name, report_date)
-    
+    # Map report keys: (telegram_id, date, slot/type)
+    reports_map = {}
     for r in reports:
-        last_name = r["last_name"] or "Неизвестный"
-        first_name = r["first_name"] or ""
-        position = r["position"] or "Не указано"
+        tid = r["telegram_id"]
+        r_type = r["report_type"]
+        r_date = r["report_date"]
         
-        # Объединяем Имя и Фамилия
-        employee_name = f"{last_name} {first_name}".strip() if first_name else last_name
-        report_date_str = format_date_no_year(r["report_date"])
-        
-        group_key = (position, employee_name, report_date_str)
-        
-        # Если изменился блок (Сотрудник, Отдел, Дата), вставим красивую пустую строку
-        if current_group_key is not None and current_group_key != group_key:
-            writer.writerow([])
-            
-        is_first_row_of_group = (current_group_key != group_key)
-        current_group_key = group_key
-        
-        status_str = "Сдал" if r["is_ok"] == 1 else "Не сдал"
-        
-        comment_str = ""
-        if r["is_ok"] == 0:
-            comment_str = r["format_comment"] or "Без комментария"
-            if comment_str.startswith("не ОК, "):
-                comment_str = comment_str[len("не ОК, "):]
-            elif comment_str.startswith("не ОК: "):
-                comment_str = comment_str[len("не ОК: "):]
-        
-        r_type_rus = "Статус" if r["report_type"] == "status" else "Факт дня"
-        slot_str = r["slot_time"] or "-"
-        received_at_str = format_time_no_seconds(r["received_at"])
-        
-        if is_first_row_of_group:
-            writer.writerow([
-                employee_name,
-                position,
-                report_date_str,
-                r_type_rus,
-                slot_str,
-                received_at_str,
-                status_str,
-                comment_str
-            ])
+        if r_type == "daily_fact":
+            key = (tid, r_date, "Факт")
         else:
-            writer.writerow([
-                "",
-                "",
-                "",
-                r_type_rus,
-                slot_str,
-                received_at_str,
-                status_str,
-                comment_str
-            ])
+            slot = r["slot_time"] or ""
+            key = (tid, r_date, slot)
+            
+        reports_map[key] = {
+            "is_ok": r["is_ok"],
+            "format_comment": r["format_comment"],
+            "received_at": r["received_at"]
+        }
         
-    csv_data = output.getvalue().encode('utf-8')
-    bio = io.BytesIO(csv_data)
+    # Include all workers we fetched
+    workers_dict = {}
+    for w in workers:
+        workers_dict[w["telegram_id"]] = {
+            "telegram_id": w["telegram_id"],
+            "last_name": w["last_name"],
+            "first_name": w["first_name"],
+            "position": w["position"] or "Не указано",
+            "schedule": w["schedule"] or "A",
+            "needs_daily_fact": bool(w["needs_daily_fact"]),
+            "is_active": bool(w["is_active"]),
+            "sort_order": w["sort_order"] or 0,
+        }
+        
+    # Also include any worker from reports who is not in workers_dict (e.g. deleted worker)
+    for r in reports:
+        tid = r["telegram_id"]
+        if tid not in workers_dict:
+            workers_dict[tid] = {
+                "telegram_id": tid,
+                "last_name": "Удаленный",
+                "first_name": f"Сотрудник (ID {tid})",
+                "position": "Не указано",
+                "schedule": "A",
+                "needs_daily_fact": True,
+                "is_active": True,
+                "sort_order": 99999,
+            }
+            
+    # Group display_workers by dynamic department
+    workers_by_dept = {}
+    for tid, w in workers_dict.items():
+        # Exclude test/placeholder objects
+        lastname_lower = (w["last_name"] or "").lower()
+        firstname_lower = (w["first_name"] or "").lower()
+        dept_lower = (w["position"] or "").lower()
+        if any(x in lastname_lower or x in firstname_lower or x in dept_lower for x in ("отмена", "test", "тест")):
+            continue
+        
+        dept_name = w["position"]
+        if dept_name not in workers_by_dept:
+            workers_by_dept[dept_name] = []
+        workers_by_dept[dept_name].append(w)
+        
+    sorted_depts = sorted(workers_by_dept.keys())
+    for dept_name in sorted_depts:
+        workers_by_dept[dept_name] = sorted(
+            workers_by_dept[dept_name],
+            key=lambda item: (item["sort_order"], (item["last_name"] or "").lower(), (item["first_name"] or "").lower())
+        )
+        
+    # Start Excel Generation
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.comments import Comment
+    import openpyxl.utils as o_utils
+    
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Сводка"
+    ws.views.sheetView[0].showGridLines = True
+    
+    font_family = "Segoe UI"
+    
+    # Style declarations
+    header_font = Font(name=font_family, size=11, bold=True, color="000000")
+    dept_font = Font(name=font_family, size=11, bold=True, color="000000")
+    worker_font = Font(name=font_family, size=11, bold=False, color="000000")
+    slot_font = Font(name=font_family, size=10, bold=False, color="444444")
+    ok_font = Font(name=font_family, size=12, bold=False, color="000000")
+    fail_font = Font(name=font_family, size=12, bold=False, color="000000")
+    
+    # Fills
+    header_fill = PatternFill(start_color="E9E4FC", end_color="E9E4FC", fill_type="solid")
+    dept_fill = PatternFill(start_color="D6C9F5", end_color="D6C9F5", fill_type="solid")
+    fail_fill = PatternFill(start_color="FCE4E4", end_color="FCE4E4", fill_type="solid")
+    
+    # Borders
+    thin_border_side = Side(border_style="thin", color="D3D3D3")
+    grid_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
+    
+    # Alignments
+    center_align = Alignment(vertical="center", horizontal="center")
+    left_align_wrap = Alignment(vertical="center", horizontal="left", wrap_text=True)
+    
+    # Headers
+    ws.cell(row=1, column=1, value="Сотрудник").font = header_font
+    ws.cell(row=1, column=1).fill = header_fill
+    ws.cell(row=1, column=1).alignment = center_align
+    ws.cell(row=1, column=1).border = grid_border
+    
+    ws.cell(row=1, column=2, value="Время").font = header_font
+    ws.cell(row=1, column=2).fill = header_fill
+    ws.cell(row=1, column=2).alignment = center_align
+    ws.cell(row=1, column=2).border = grid_border
+    
+    for c_idx, date in enumerate(unique_dates, start=3):
+        col_letter = o_utils.get_column_letter(c_idx)
+        cell = ws.cell(row=1, column=c_idx, value=format_date_no_year(date))
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center_align
+        cell.border = grid_border
+        ws.column_dimensions[col_letter].width = 8
+        
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 10
+    ws.row_dimensions[1].height = 25
+    
+    ws.freeze_panes = "C2"
+    
+    curr_row = 2
+    
+    for dept_name in sorted_depts:
+        dept_workers = workers_by_dept[dept_name]
+        if not dept_workers:
+            continue
+            
+        # Write Department Section header row
+        ws.row_dimensions[curr_row].height = 22
+        ws.merge_cells(start_row=curr_row, start_column=1, end_row=curr_row, end_column=len(unique_dates) + 2)
+        cell = ws.cell(row=curr_row, column=1, value=f"{dept_name}")
+        cell.font = dept_font
+        cell.alignment = Alignment(vertical="center", horizontal="left")
+        
+        for c_idx in range(1, len(unique_dates) + 3):
+            c = ws.cell(row=curr_row, column=c_idx)
+            c.fill = dept_fill
+            c.border = grid_border
+            
+        curr_row += 1
+        
+        for w in dept_workers:
+            schedule_slots = SCHEDULES.get(w["schedule"], SCHEDULE_A)
+            if only_facts:
+                worker_rows = ["Факт"]
+            else:
+                worker_rows = list(schedule_slots)
+                if w["needs_daily_fact"]:
+                    worker_rows.append("Факт")
+                    
+            num_rows = len(worker_rows)
+            if num_rows == 0:
+                continue
+                
+            name_cell = ws.cell(row=curr_row, column=1, value=f"{w['last_name']} {w['first_name']}")
+            name_cell.font = worker_font
+            name_cell.alignment = left_align_wrap
+            name_cell.border = grid_border
+            
+            if num_rows > 1:
+                ws.merge_cells(start_row=curr_row, start_column=1, end_row=curr_row + num_rows - 1, end_column=1)
+                
+            for sub_idx, slot in enumerate(worker_rows):
+                r_idx = curr_row + sub_idx
+                ws.row_dimensions[r_idx].height = 20
+                
+                # Column B (Time slot)
+                slot_cell = ws.cell(row=r_idx, column=2, value=slot)
+                slot_cell.font = slot_font
+                slot_cell.alignment = center_align
+                slot_cell.border = grid_border
+                
+                # Column C onwards
+                for d_idx, date in enumerate(unique_dates, start=3):
+                    cell = ws.cell(row=r_idx, column=d_idx)
+                    cell.alignment = center_align
+                    cell.border = grid_border
+                    
+                    rep_key = (w["telegram_id"], date, slot)
+                    if rep_key in reports_map:
+                        rep = reports_map[rep_key]
+                        is_ok = bool(rep["is_ok"])
+                        
+                        if is_ok:
+                            cell.value = "☑"
+                            cell.font = ok_font
+                        else:
+                            cell.value = "☐"
+                            cell.font = fail_font
+                            cell.fill = fail_fill
+                            
+                            comment_str = rep["format_comment"] or "В отчете есть замечания"
+                            if comment_str.startswith("не ОК, "):
+                                comment_str = comment_str[len("не ОК, "):]
+                            elif comment_str.startswith("не ОК: "):
+                                comment_str = comment_str[len("не ОК: "):]
+                                
+                            cell.comment = Comment(comment_str, "Прораб-Бот")
+                    else:
+                        cell.value = ""
+                        
+            # Format and set borders inside merged cell parts
+            for sub_idx in range(num_rows):
+                r_idx = curr_row + sub_idx
+                for c_idx in range(1, len(unique_dates) + 3):
+                    ws.cell(row=r_idx, column=c_idx).border = grid_border
+                    
+            curr_row += num_rows
+            
+    # Save Workbook to dynamic ByteIO
+    from io import BytesIO
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     prefix = "facts" if only_facts else "reports"
     
     if dept is None:
-        bio.name = f"{prefix}_all_{timestamp}.csv"
-        caption = "📊 Общая выгрузка фактов дня успешно сформирована!" if only_facts else "📊 Общая выгрузка всех отчетов успешно сформирована!"
+        bio.name = f"{prefix}_all_{timestamp}.xlsx"
+        caption = "📊 Общая выгрузка фактов дня в формате Excel успешно сформирована!" if only_facts else "📊 Общая выгрузка всех отчетов в формате Excel успешно сформирована!"
     else:
         safe_dept = "".join(c for c in dept if c.isalnum() or c in (" ", "_", "-")).strip()
-        bio.name = f"{prefix}_dept_{safe_dept}_{timestamp}.csv"
-        caption = f"📊 Выгрузка фактов дня для отдела «{dept}» успешно сформирована!" if only_facts else f"📊 Выгрузка отчетов для отдела «{dept}» успешно сформирована!"
+        bio.name = f"{prefix}_dept_{safe_dept}_{timestamp}.xlsx"
+        caption = f"📊 Выгрузка фактов дня для отдела «{dept}» в формате Excel успешно сформирована!" if only_facts else f"📊 Выгрузка отчетов для отдела «{dept}» в формате Excel успешно сформирована!"
         
     await context.bot.send_document(
         chat_id=update.effective_chat.id,
@@ -2069,7 +2234,7 @@ async def export_type_selected(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
         
     if choice == "📊 Общая выгрузка":
-        await generate_and_send_csv(update, context, dept=None)
+        await generate_and_send_excel(update, context, dept=None)
         return ConversationHandler.END
         
     if choice == "🏢 Выгрузка по отделу":
@@ -2105,7 +2270,7 @@ async def export_department_selected(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text("Выгрузка отменена.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
         
-    await generate_and_send_csv(update, context, dept=choice)
+    await generate_and_send_excel(update, context, dept=choice)
     return ConversationHandler.END
 
 
