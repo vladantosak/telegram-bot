@@ -2287,27 +2287,58 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
         )
         return
 
+    ws = None
+    existing_map = {}
     try:
         # Check if "Сводка" exists
-        old_ws = None
         try:
-            old_ws = spreadsheet.worksheet("Сводка")
+            ws = spreadsheet.worksheet("Сводка")
+            # Parse existing values to build existing_map of already filled cells
+            try:
+                existing_rows = ws.get_all_values()
+                if existing_rows and len(existing_rows) > 1:
+                    header_row = existing_rows[0]
+                    col_date_map = {}
+                    for col_idx in range(2, len(header_row)):
+                        header_val = header_row[col_idx].strip()
+                        for d in unique_dates:
+                            if format_date_no_year(d) == header_val:
+                                col_date_map[col_idx] = d
+                                break
+                    
+                    current_worker_name = None
+                    for row_idx in range(1, len(existing_rows)):
+                        row = existing_rows[row_idx]
+                        if len(row) < 2:
+                            continue
+                        val_a = row[0].strip()
+                        val_b = row[1].strip()
+                        
+                        if val_b == "":
+                            continue
+                            
+                        if val_a != "":
+                            current_worker_name = val_a
+                            
+                        if current_worker_name:
+                            for col_idx in range(2, len(row)):
+                                if col_idx in col_date_map and col_idx < len(row):
+                                    date_str = col_date_map[col_idx]
+                                    cell_val = row[col_idx].strip()
+                                    existing_map[(current_worker_name, date_str, val_b)] = cell_val
+            except Exception as ex:
+                logger.warning(f"Could not parse existing worksheet: {ex}")
         except gspread.exceptions.WorksheetNotFound:
             pass
             
-        temp_title = "Сводка (Новая)"
-        try:
-            temp_ws = spreadsheet.worksheet(temp_title)
-            spreadsheet.del_worksheet(temp_ws)
-        except gspread.exceptions.WorksheetNotFound:
-            pass
+        if not ws:
+            ws = spreadsheet.add_worksheet(title="Сводка", rows="1000", cols="50")
             
-        ws = spreadsheet.add_worksheet(title=temp_title, rows="1000", cols="50")
         ws_id = ws.id
     except Exception as e:
         logger.exception("Failed to manage worksheets")
         await update.message.reply_text(
-            f"❌ **Ошибка при создании листа в таблице:**\n`{str(e)}`",
+            f"❌ **Ошибка при инициализации листа в таблице:**\n`{str(e)}`",
             reply_markup=MAIN_MENU
         )
         return
@@ -2428,8 +2459,9 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                 r_idx = curr_row + sub_idx
                 row_vals = []
                 
+                worker_full_name = f"{w['last_name']} {w['first_name']}".strip()
                 if sub_idx == 0:
-                    row_vals.append(f"{w['last_name']} {w['first_name']}")
+                    row_vals.append(worker_full_name)
                 else:
                     row_vals.append("")
                     
@@ -2437,40 +2469,53 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                 
                 for d_idx, date in enumerate(unique_dates, start=2):
                     rep_key = (w["telegram_id"], date, slot)
-                    if rep_key in reports_map:
-                        rep = reports_map[rep_key]
-                        is_ok = bool(rep["is_ok"])
-                        if is_ok:
+                    sheet_key = (worker_full_name, date, slot)
+                    existing_val = existing_map.get(sheet_key, "")
+                    
+                    if existing_val != "":
+                        # Preserve existing manual or previously written values in the sheet
+                        if existing_val == "TRUE":
                             row_vals.append(True)
-                        else:
+                        elif existing_val == "FALSE":
                             row_vals.append(False)
-                            
-                            comment_str = rep["format_comment"] or "В отчете есть замечания"
-                            if comment_str.startswith("не ОК, "):
-                                comment_str = comment_str[len("не ОК, "):]
-                            elif comment_str.startswith("не ОК: "):
-                                comment_str = comment_str[len("не ОК: "):]
-                                
-                            requests.append({
-                                "repeatCell": {
-                                    "range": {
-                                        "sheetId": ws_id,
-                                        "startRowIndex": r_idx,
-                                        "endRowIndex": r_idx + 1,
-                                        "startColumnIndex": d_idx, # d_idx is already the correct 0-based column index
-                                        "endColumnIndex": d_idx + 1
-                                    },
-                                    "cell": {
-                                        "userEnteredFormat": {
-                                            "backgroundColor": COLOR_FAIL
-                                        },
-                                        "note": comment_str
-                                    },
-                                    "fields": "userEnteredFormat.backgroundColor,note"
-                                }
-                            })
+                        else:
+                            row_vals.append(existing_val)
                     else:
-                        row_vals.append("")
+                        # Cell is currently empty, so fill it with the database report if available
+                        if rep_key in reports_map:
+                            rep = reports_map[rep_key]
+                            is_ok = bool(rep["is_ok"])
+                            if is_ok:
+                                row_vals.append(True)
+                            else:
+                                row_vals.append(False)
+                                
+                                comment_str = rep["format_comment"] or "В отчете есть замечания"
+                                if comment_str.startswith("не ОК, "):
+                                    comment_str = comment_str[len("не ОК, "):]
+                                elif comment_str.startswith("не ОК: "):
+                                    comment_str = comment_str[len("не ОК: "):]
+                                    
+                                requests.append({
+                                    "repeatCell": {
+                                        "range": {
+                                            "sheetId": ws_id,
+                                            "startRowIndex": r_idx,
+                                            "endRowIndex": r_idx + 1,
+                                            "startColumnIndex": d_idx, # d_idx is already the correct 0-based column index
+                                            "endColumnIndex": d_idx + 1
+                                        },
+                                        "cell": {
+                                            "userEnteredFormat": {
+                                                "backgroundColor": COLOR_FAIL
+                                            },
+                                            "note": comment_str
+                                        },
+                                        "fields": "userEnteredFormat.backgroundColor,note"
+                                    }
+                                })
+                        else:
+                            row_vals.append("")
                         
                 values.append(row_vals)
                 
@@ -2536,6 +2581,12 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
     total_rows = len(values)
     
     try:
+        # Resize worksheet to fit the exact required dimensions (preserves existing cells)
+        try:
+            ws.resize(rows=total_rows, cols=num_cols)
+        except Exception as resize_ex:
+            logger.warning(f"Failed to resize worksheet: {resize_ex}")
+
         # Write values
         try:
             ws.update(values=values, range_name="A1")
@@ -2657,14 +2708,6 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
         ] + requests
         
         spreadsheet.batch_update({"requests": full_requests})
-        
-        # Delete old ws and rename new one
-        if old_ws:
-            try:
-                spreadsheet.del_worksheet(old_ws)
-            except Exception:
-                pass
-        ws.update_title("Сводка")
         
         # Safely delete default empty worksheets so the user only sees 'Сводка'
         for sheet in spreadsheet.worksheets():
