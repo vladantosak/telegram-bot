@@ -2457,8 +2457,8 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                                         "sheetId": ws_id,
                                         "startRowIndex": r_idx,
                                         "endRowIndex": r_idx + 1,
-                                        "startColumnIndex": d_idx + 2, # Offset is 2 since columns are: Employee, Time, dates...
-                                        "endColumnIndex": d_idx + 3
+                                        "startColumnIndex": d_idx, # d_idx is already the correct 0-based column index
+                                        "endColumnIndex": d_idx + 1
                                     },
                                     "cell": {
                                         "userEnteredFormat": {
@@ -2577,7 +2577,7 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                     "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
                 }
             },
-            # Freeze row 1 and columns A/B
+            # Freeze row 1 and columns A/B and make it the first worksheet tab
             {
                 "updateSheetProperties": {
                     "properties": {
@@ -2586,9 +2586,10 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                             "frozenRowCount": 1,
                             "frozenColumnCount": 2,
                             "hideGridlines": False
-                        }
+                        },
+                        "index": 0
                     },
-                    "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount,gridProperties.hideGridlines"
+                    "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount,gridProperties.hideGridlines,index"
                 }
             },
             # Col widths
@@ -2645,6 +2646,14 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
             except Exception:
                 pass
         ws.update_title("Сводка")
+        
+        # Safely delete default empty worksheets so the user only sees 'Сводка'
+        for sheet in spreadsheet.worksheets():
+            if sheet.title in ("Лист1", "Sheet1") and sheet.id != ws_id:
+                try:
+                    spreadsheet.del_worksheet(sheet)
+                except Exception:
+                    pass
     except Exception as e:
         logger.exception("Failed to update Google Sheets")
         await update.message.reply_text(
