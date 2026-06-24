@@ -81,9 +81,6 @@ def now_local() -> datetime:
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# Словарь для хранения данных незарегистрированных пользователей {telegram_id: данные}
-pending_unregistered_users = {}
-
 LATE_THRESHOLD_MIN = 15
 SCHEDULE_A = ["10:00", "12:00", "15:00", "17:00"]
 SCHEDULE_B = ["11:00", "13:00", "16:00", "18:00"]
@@ -115,13 +112,11 @@ SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
     ASK_EDIT_STATUS_WORK,
     ASK_EXPORT_TYPE,
     ASK_EXPORT_DEPARTMENT,
-    ASK_EXPORT_DEPARTMENT_SELECT,
     ASK_EXPORT_FORMAT,
     ASK_GSHEETS_URL,
     ASK_GSHEETS_CREDS,
+    ASK_IMPORT_FILE,
 ) = range(28)
-
-ASK_IMPORT_FILE = 28
 
 # Клавиатуры
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -146,10 +141,40 @@ DIALOG_TEXT = filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{CANCEL_TEXT}$
 # База данных
 # ══════════════════════════════════════════════════════════════════════════════
 
+import threading
+
+_local_db = threading.local()
+
+class SQLiteConnectionProxy:
+    def __init__(self, conn):
+        self._conn = conn
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+    def close(self):
+        # No-op to pool/reuse connection per thread
+        pass
+    def commit(self):
+        self._conn.commit()
+    def rollback(self):
+        self._conn.rollback()
+    def execute(self, *args, **kwargs):
+        return self._conn.execute(*args, **kwargs)
+    def executemany(self, *args, **kwargs):
+        return self._conn.executemany(*args, **kwargs)
+    def cursor(self, *args, **kwargs):
+        return self._conn.cursor(*args, **kwargs)
+
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    conn = getattr(_local_db, "connection", None)
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
+        _local_db.connection = conn
+    return SQLiteConnectionProxy(conn)
 
 def init_db():
     conn = get_db()
@@ -220,6 +245,32 @@ def init_db():
         """
     )
 
+    # Таблица для зафиксированных отправленных напоминаний
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sent_reminders (
+            telegram_id INTEGER,
+            report_date TEXT,
+            slot_time TEXT,
+            PRIMARY KEY (telegram_id, report_date, slot_time)
+        )
+        """
+    )
+
+    # Таблица для сохранения данных незарегистрированных сотрудников
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_unregistered_users (
+            telegram_id INTEGER PRIMARY KEY,
+            first_name TEXT NOT NULL,
+            last_name TEXT NOT NULL,
+            username TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            text_content TEXT NOT NULL
+        )
+        """
+    )
+
     # Индексы
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_date ON reports(report_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_worker_date ON reports(telegram_id, report_date)")
@@ -238,6 +289,30 @@ def get_worker(telegram_id: int):
     row = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (telegram_id,)).fetchone()
     conn.close()
     return row
+
+def save_pending_unregistered_user(telegram_id: int, first_name: str, last_name: str, username: str, timestamp: str, text_content: str):
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO pending_unregistered_users (telegram_id, first_name, last_name, username, timestamp, text_content)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (telegram_id, first_name, last_name, username, timestamp, text_content)
+    )
+    conn.commit()
+    conn.close()
+
+def get_pending_unregistered_user(telegram_id: int):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM pending_unregistered_users WHERE telegram_id = ?", (telegram_id,)).fetchone()
+    conn.close()
+    return row
+
+def delete_pending_unregistered_user(telegram_id: int):
+    conn = get_db()
+    conn.execute("DELETE FROM pending_unregistered_users WHERE telegram_id = ?", (telegram_id,))
+    conn.commit()
+    conn.close()
 
 def get_all_workers():
     conn = get_db()
@@ -269,7 +344,8 @@ def upsert_worker(telegram_id: int, last_name: str, first_name: str, position: s
             group_id=excluded.group_id,
             schedule=excluded.schedule,
             needs_daily_fact=excluded.needs_daily_fact,
-            sort_order=excluded.sort_order
+            sort_order=excluded.sort_order,
+            is_active=excluded.is_active
         """,
         (telegram_id, last_name, first_name, position, group_id, schedule, int(needs_daily_fact), sort_order, is_active),
     )
@@ -297,6 +373,7 @@ def read_excel(file_path: str):
     idx_group = -1
     idx_schedule = -1
     idx_daily_fact = -1
+    idx_object = -1
     
     for idx, h in enumerate(headers):
         if h in ("telegram_id", "id", "tg id", "telegram", "телеграм id", "тг id"):
@@ -315,6 +392,8 @@ def read_excel(file_path: str):
             idx_schedule = idx
         elif h in ("needs_daily_fact", "факт дня", "ежедневный факт"):
             idx_daily_fact = idx
+        elif h in ("object", "объект"):
+            idx_object = idx
             
     for row_idx in range(2, sheet.max_row + 1):
         row_values = []
@@ -336,11 +415,6 @@ def read_excel(file_path: str):
         
         # We also check if user has name/position/brigade/object columns which we map gracefully:
         # object column could be mapped to position/department if not specified
-        idx_object = -1
-        for idx, h in enumerate(headers):
-            if h in ("object", "объект"):
-                idx_object = idx
-                break
         if idx_object != -1 and idx_object < len(row_values) and row_values[idx_object] is not None:
             obj_val = str(row_values[idx_object]).strip()
             if pos_val is None:
@@ -545,22 +619,6 @@ def get_reports_for_date(report_date: str):
     conn.close()
     return rows
 
-def check_duplicate_report(telegram_id: int, report_date: str, report_type: str, slot_time: str | None) -> bool:
-    """Решение проблемы 5: Защита от дублей. Возвращает True, если отчет уже существует."""
-    conn = get_db()
-    if report_type == "status":
-        row = conn.execute(
-            "SELECT id FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = ? AND slot_time = ?",
-            (telegram_id, report_date, report_type, slot_time),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT id FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = ?",
-            (telegram_id, report_date, report_type),
-        ).fetchone()
-    conn.close()
-    return row is not None
-
 def get_worker_history_last_week(telegram_id: int) -> str:
     """Решение проблемы 6: Логирование истории отчетов сотрудника за неделю."""
     conn = get_db()
@@ -653,13 +711,15 @@ async def scheduled_summary_callback(context: ContextTypes.DEFAULT_TYPE):
     
     if SUMMARY_CHAT_ID:
         try:
-            await context.bot.send_message(chat_id=SUMMARY_CHAT_ID, text=summary_text)
+            for part in split_message(summary_text):
+                await context.bot.send_message(chat_id=SUMMARY_CHAT_ID, text=part)
         except Exception as e:
             print(f"Ошибка при отправке автоматической сводки в {SUMMARY_CHAT_ID}: {e}")
             
     for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_message(chat_id=admin_id, text=summary_text)
+            for part in split_message(summary_text):
+                await context.bot.send_message(chat_id=admin_id, text=part)
         except Exception:
             pass
 
@@ -1319,38 +1379,45 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         report_id = int(data.split("_")[-1])
         
         conn = get_db()
-        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        if not report:
+        try:
+            report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            if not report:
+                await query.answer("Запись отчета в БД не найдена.", show_alert=True)
+                return
+                
+            worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
+            
+            current_type = report["report_type"]
+            if current_type == "status":
+                new_type = "daily_fact"
+                new_slot = None
+                is_late = 0
+                status_display_val = format_status_or_fact_line(new_type, new_slot, report["report_date"])
+            else:
+                new_type = "status"
+                schedule_slots = SCHEDULES.get(worker["schedule"] if worker else "A", SCHEDULE_A)
+                try:
+                    parts = (report["received_at"] or "00:00:00").split(":")
+                    if len(parts) >= 3:
+                        h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+                    elif len(parts) == 2:
+                        h, m, s = int(parts[0]), int(parts[1]), 0
+                    else:
+                        h, m, s = 0, 0, 0
+                    now_dt = now_local().replace(hour=h, minute=m, second=s)
+                except Exception:
+                    now_dt = now_local()
+                new_slot, wait_is_late = find_nearest_slot(schedule_slots, now_dt)
+                status_display_val = format_status_or_fact_line(new_type, new_slot, report["report_date"])
+                is_late = int(wait_is_late)
+                
+            conn.execute(
+                "UPDATE reports SET report_type = ?, slot_time = ?, is_late = ? WHERE id = ?",
+                (new_type, new_slot, is_late, report_id)
+            )
+            conn.commit()
+        finally:
             conn.close()
-            await query.answer("Запись отчета в БД не найдена.", show_alert=True)
-            return
-            
-        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
-        
-        current_type = report["report_type"]
-        if current_type == "status":
-            new_type = "daily_fact"
-            new_slot = None
-            is_late = 0
-            status_display_val = format_status_or_fact_line(new_type, new_slot, report["report_date"])
-        else:
-            new_type = "status"
-            schedule_slots = SCHEDULES.get(worker["schedule"] if worker else "A", SCHEDULE_A)
-            try:
-                h, m, s = map(int, (report["received_at"] or "00:00:00").split(":"))
-                now_dt = now_local().replace(hour=h, minute=m, second=s)
-            except Exception:
-                now_dt = now_local()
-            new_slot, wait_is_late = find_nearest_slot(schedule_slots, now_dt)
-            status_display_val = format_status_or_fact_line(new_type, new_slot, report["report_date"])
-            is_late = int(wait_is_late)
-            
-        conn.execute(
-            "UPDATE reports SET report_type = ?, slot_time = ?, is_late = ? WHERE id = ?",
-            (new_type, new_slot, is_late, report_id)
-        )
-        conn.commit()
-        conn.close()
         
         await query.answer("Тип отчета изменен!")
         
@@ -1731,13 +1798,36 @@ async def add_worker_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not raw.lstrip("-").isdigit():
         await update.message.reply_text("Введите числовой ID:")
         return ASK_WORKER_ID
-    context.user_data["new_worker_id"] = int(raw)
-    await update.message.reply_text("Введите фамилию:", reply_markup=CANCEL_KEYBOARD)
+    worker_id = int(raw)
+    context.user_data["new_worker_id"] = worker_id
+    
+    pending = get_pending_unregistered_user(worker_id)
+    if pending:
+        context.user_data["pending_last_name"] = pending["last_name"]
+        context.user_data["pending_first_name"] = pending["first_name"]
+        
+        await update.message.reply_text(
+            f"Найден временный отчет сотрудника!\n"
+            f"ФИО: {pending['last_name']} {pending['first_name']}\n\n"
+            f"Подтвердите фамилию (нажмите на кнопку ниже) или введите новую:",
+            reply_markup=ReplyKeyboardMarkup([[pending["last_name"]], ["❌ Отмена"]], resize_keyboard=True)
+        )
+    else:
+        await update.message.reply_text("Введите фамилию:", reply_markup=CANCEL_KEYBOARD)
     return ASK_LASTNAME
 
 async def add_worker_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["last_name"] = update.message.text.strip()
-    await update.message.reply_text("Введите имя:", reply_markup=CANCEL_KEYBOARD)
+    val = update.message.text.strip()
+    context.user_data["last_name"] = val
+    
+    pending_first = context.user_data.get("pending_first_name")
+    if pending_first:
+        await update.message.reply_text(
+            "Подтвердите имя (нажмите на кнопку ниже) или введите новое:",
+            reply_markup=ReplyKeyboardMarkup([[pending_first], ["❌ Отмена"]], resize_keyboard=True)
+        )
+    else:
+        await update.message.reply_text("Введите имя:", reply_markup=CANCEL_KEYBOARD)
     return ASK_FIRSTNAME
 
 async def add_worker_firstname(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1782,6 +1872,7 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
         needs_daily_fact=(raw == "да"),
         sort_order=next_order,
     )
+    delete_pending_unregistered_user(context.user_data["new_worker_id"])
     await fetch_and_save_group_name(context.bot, context.user_data["group_id"])
     await update.message.reply_text("Сотрудник успешно добавлен в базу!", reply_markup=MAIN_MENU)
     context.user_data.clear()
@@ -1874,11 +1965,16 @@ async def send_summary_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_str = now.strftime("%Y-%m-%d")
     summary_text = generate_daily_summary_text(date_str)
     
-    await update.message.reply_text(summary_text, reply_markup=MAIN_MENU)
+    parts = split_message(summary_text)
+    for part in parts[:-1]:
+        await update.message.reply_text(part)
+    if parts:
+        await update.message.reply_text(parts[-1], reply_markup=MAIN_MENU)
     
     if SUMMARY_CHAT_ID and SUMMARY_CHAT_ID != update.effective_chat.id:
         try:
-            await context.bot.send_message(chat_id=SUMMARY_CHAT_ID, text=summary_text)
+            for part in split_message(summary_text):
+                await context.bot.send_message(chat_id=SUMMARY_CHAT_ID, text=part)
         except Exception as e:
             print(f"Не удалось отправить сводку в чат {SUMMARY_CHAT_ID}: {e}")
 
@@ -2318,116 +2414,73 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
-async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAULT_TYPE, dept: str = None, only_facts: bool = False):
-    spreadsheet_id = get_setting("google_spreadsheet_id")
-    service_account_str = get_setting("google_service_account")
+def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, only_facts: bool, data, cur_date_str: str):
+    import gspread
+    from google.oauth2.service_account import Credentials
     
-    if not spreadsheet_id or not service_account_str:
-        await update.message.reply_text(
-            "⚠️ **Настройки Google Sheets не найдены!**\n\n"
-            "Пожалуйста, настройте интеграцию с помощью меню *⚙️ Настроить Google Таблицу*.",
-            reply_markup=MAIN_MENU,
-            parse_mode="Markdown"
-        )
-        return
-
-    await update.message.reply_text("⏳ Формирую выгрузку отчетов в вашу Google Таблицу...")
-    
-    data = fetch_export_data(dept, only_facts)
-    if not data:
-        criteria_msg = "для выгрузки по данному критерию."
-        if only_facts:
-            criteria_msg = "по фактам дня."
-        await update.message.reply_text(f"В базе данных пока нет ни одного отчета {criteria_msg}", reply_markup=MAIN_MENU)
-        return
-        
     unique_dates, reports_map, sorted_depts, workers_by_dept, first_fact_dates = data
     
-    try:
-        import gspread
-        from google.oauth2.service_account import Credentials
-        
-        creds_dict = json.loads(service_account_str)
-        scopes = [
-            'https://www.googleapis.com/auth/spreadsheets',
-            'https://www.googleapis.com/auth/drive'
-        ]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(spreadsheet_id)
-    except Exception as e:
-        logger.exception("Failed to connect to Google Sheets")
-        await update.message.reply_text(
-            f"❌ **Ошибка подключения к Google Sheets:**\n`{str(e)}`\n\n"
-            "Убедитесь, что ID таблицы и JSON-ключ указаны верно, и сервисный аккаунт добавлен как Редактор вашей таблицы.",
-            reply_markup=MAIN_MENU
-        )
-        return
+    creds_dict = json.loads(service_account_str)
+    scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    client = gspread.authorize(creds)
+    spreadsheet = client.open_by_key(spreadsheet_id)
 
     ws = None
     existing_map = {}
     try:
-        # Check if "Сводка" exists
+        ws = spreadsheet.worksheet("Сводка")
         try:
-            ws = spreadsheet.worksheet("Сводка")
-            # Parse existing values to build existing_map of already filled cells
-            try:
-                existing_rows = ws.get_all_values()
-                if existing_rows and len(existing_rows) > 1:
-                    header_row = existing_rows[0]
-                    col_date_map = {}
-                    for col_idx in range(2, len(header_row)):
-                        header_val = header_row[col_idx].strip()
-                        for d in unique_dates:
-                            if format_date_no_year(d) == header_val:
-                                col_date_map[col_idx] = d
-                                break
+            existing_rows = ws.get_all_values()
+            if existing_rows and len(existing_rows) > 1:
+                header_row = existing_rows[0]
+                col_date_map = {}
+                for col_idx in range(2, len(header_row)):
+                    header_val = header_row[col_idx].strip()
+                    for d in unique_dates:
+                        if format_date_no_year(d) == header_val:
+                            col_date_map[col_idx] = d
+                            break
+                
+                current_worker_name = None
+                for row_idx in range(1, len(existing_rows)):
+                    row = existing_rows[row_idx]
+                    if len(row) < 2:
+                        continue
+                    val_a = row[0].strip()
+                    val_b = row[1].strip()
                     
-                    current_worker_name = None
-                    for row_idx in range(1, len(existing_rows)):
-                        row = existing_rows[row_idx]
-                        if len(row) < 2:
-                            continue
-                        val_a = row[0].strip()
-                        val_b = row[1].strip()
+                    if val_b == "":
+                        continue
                         
-                        if val_b == "":
-                            continue
-                            
-                        if val_a != "":
-                            current_worker_name = val_a
-                            
-                        if current_worker_name:
-                            for col_idx in range(2, len(row)):
-                                if col_idx in col_date_map and col_idx < len(row):
-                                    date_str = col_date_map[col_idx]
-                                    cell_val = row[col_idx].strip()
-                                    existing_map[(current_worker_name, date_str, val_b)] = cell_val
-            except Exception as ex:
-                logger.warning(f"Could not parse existing worksheet: {ex}")
-        except gspread.exceptions.WorksheetNotFound:
-            pass
-            
-        if not ws:
-            ws = spreadsheet.add_worksheet(title="Сводка", rows="1000", cols="50")
-            
-        ws_id = ws.id
-    except Exception as e:
-        logger.exception("Failed to manage worksheets")
-        await update.message.reply_text(
-            f"❌ **Ошибка при инициализации листа в таблице:**\n`{str(e)}`",
-            reply_markup=MAIN_MENU
-        )
-        return
+                    if val_a != "":
+                        current_worker_name = val_a
+                        
+                    if current_worker_name:
+                        for col_idx in range(2, len(row)):
+                            if col_idx in col_date_map and col_idx < len(row):
+                                date_str = col_date_map[col_idx]
+                                cell_val = row[col_idx].strip()
+                                existing_map[(current_worker_name, date_str, val_b)] = cell_val
+        except Exception as ex:
+            logger.warning(f"Could not parse existing worksheet: {ex}")
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+        
+    if not ws:
+        ws = spreadsheet.add_worksheet(title="Сводка", rows="1000", cols="50")
+        
+    ws_id = ws.id
 
-    # Prepare values
     num_cols = len(unique_dates) + 2
     values = []
     
     header_row = ["Сотрудник", "Время"] + [format_date_no_year(d) for d in unique_dates]
     values.append(header_row)
     
-    # Style constants
     COLOR_HEADER = {"red": 0.914, "green": 0.894, "blue": 0.988}
     COLOR_DEPT = {"red": 0.839, "green": 0.788, "blue": 0.961}
     COLOR_FAIL = {"red": 0.988, "green": 0.894, "blue": 0.894}
@@ -2445,7 +2498,6 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
         dept_row = [dept_name] + [""] * (len(unique_dates) + 1)
         values.append(dept_row)
         
-        # Merge dept row (keep inside frozen columns A and B)
         requests.append({
             "mergeCells": {
                 "range": {
@@ -2459,7 +2511,6 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
             }
         })
         
-        # Style dept row
         requests.append({
             "repeatCell": {
                 "range": {
@@ -2499,7 +2550,6 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
             if num_rows == 0:
                 continue
                 
-            # Merge name column A
             if num_rows > 1:
                 requests.append({
                     "mergeCells": {
@@ -2585,7 +2635,6 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                         existing_val = existing_map.get(sheet_key, "")
                         
                         if existing_val != "":
-                            # Preserve existing manual or previously written values in the sheet
                             if existing_val == "TRUE":
                                 row_vals.append(True)
                             elif existing_val == "FALSE":
@@ -2593,7 +2642,6 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                             else:
                                 row_vals.append(existing_val)
                         else:
-                            # Cell is currently empty, so fill it with the database report if available
                             if rep_key in reports_map:
                                 rep = reports_map[rep_key]
                                 is_ok = bool(rep["is_ok"])
@@ -2614,7 +2662,7 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                                                 "sheetId": ws_id,
                                                 "startRowIndex": r_idx,
                                                 "endRowIndex": r_idx + 1,
-                                                "startColumnIndex": d_idx, # d_idx is already the correct 0-based column index
+                                                "startColumnIndex": d_idx,
                                                 "endColumnIndex": d_idx + 1
                                             },
                                             "cell": {
@@ -2629,10 +2677,8 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                             else:
                                 is_hyphen = False
                                 if slot == "Факт":
-                                    cur_date_str = now_local().strftime("%Y-%m-%d")
-                                    tid = w["telegram_id"]
-                                    if tid in first_fact_dates:
-                                        if date < first_fact_dates[tid]:
+                                    if w["telegram_id"] in first_fact_dates:
+                                        if date < first_fact_dates[w["telegram_id"]]:
                                             is_hyphen = True
                                     else:
                                         if date < cur_date_str:
@@ -2656,7 +2702,6 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                         
                 values.append(row_vals)
                 
-                # Add native Google Sheets Checkbox validation for columns C to the end
                 requests.append({
                     "setDataValidation": {
                         "range": {
@@ -2675,7 +2720,6 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                     }
                 })
                 
-                # Center time slot column
                 requests.append({
                     "repeatCell": {
                         "range": {
@@ -2694,7 +2738,6 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                     }
                 })
                 
-                # Center date columns
                 requests.append({
                     "repeatCell": {
                         "range": {
@@ -2718,153 +2761,181 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
     total_rows = len(values)
     
     try:
-        # Resize worksheet to fit the exact required dimensions (preserves existing cells)
-        try:
-            ws.resize(rows=total_rows, cols=num_cols)
-        except Exception as resize_ex:
-            logger.warning(f"Failed to resize worksheet: {resize_ex}")
+        ws.resize(rows=total_rows, cols=num_cols)
+    except Exception as resize_ex:
+        logger.warning(f"Failed to resize worksheet: {resize_ex}")
 
-        # Write values
-        try:
-            ws.update(values=values, range_name="A1")
-        except TypeError:
-            ws.update("A1", values)
-            
-        full_requests = [
-            # Unmerge all cells first to avoid overlapping merge errors
-            {
-                "unmergeCells": {
-                    "range": {
-                        "sheetId": ws_id,
-                        "startRowIndex": 0,
-                        "endRowIndex": total_rows,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": num_cols
-                    }
-                }
-            },
-            # Global grid styling
-            {
-                "repeatCell": {
-                    "range": {
-                        "sheetId": ws_id,
-                        "startRowIndex": 0,
-                        "endRowIndex": total_rows,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": num_cols
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "textFormat": {
-                                "fontFamily": "Segoe UI",
-                                "fontSize": 10,
-                                "foregroundColor": {"red": 0.0, "green": 0.0, "blue": 0.0}
-                            },
-                            "verticalAlignment": "MIDDLE",
-                            "borders": {
-                                "top": {"style": "SOLID", "color": COLOR_BORDER},
-                                "bottom": {"style": "SOLID", "color": COLOR_BORDER},
-                                "left": {"style": "SOLID", "color": COLOR_BORDER},
-                                "right": {"style": "SOLID", "color": COLOR_BORDER}
-                            }
-                        }
-                    },
-                    "fields": "userEnteredFormat(textFormat,verticalAlignment,borders)"
-                }
-            },
-            # Style header
-            {
-                "repeatCell": {
-                    "range": {
-                        "sheetId": ws_id,
-                        "startRowIndex": 0,
-                        "endRowIndex": 1,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": num_cols
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "backgroundColor": COLOR_HEADER,
-                            "textFormat": {
-                                "fontFamily": "Segoe UI",
-                                "fontSize": 11,
-                                "bold": True
-                            },
-                            "horizontalAlignment": "CENTER"
-                        }
-                    },
-                    "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
-                }
-            },
-            # Freeze row 1 and columns A/B and make it the first worksheet tab
-            {
-                "updateSheetProperties": {
-                    "properties": {
-                        "sheetId": ws_id,
-                        "gridProperties": {
-                            "frozenRowCount": 1,
-                            "frozenColumnCount": 2,
-                            "hideGridlines": False
-                        },
-                        "index": 0
-                    },
-                    "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount,gridProperties.hideGridlines,index"
-                }
-            },
-            # Col widths
-            {
-                "updateDimensionProperties": {
-                    "range": {
-                        "sheetId": ws_id,
-                        "dimension": "COLUMNS",
-                        "startIndex": 0,
-                        "endIndex": 1
-                    },
-                    "properties": {
-                        "pixelSize": 250
-                    },
-                    "fields": "pixelSize"
-                }
-            },
-            {
-                "updateDimensionProperties": {
-                    "range": {
-                        "sheetId": ws_id,
-                        "dimension": "COLUMNS",
-                        "startIndex": 1,
-                        "endIndex": 2
-                    },
-                    "properties": {
-                        "pixelSize": 90
-                    },
-                    "fields": "pixelSize"
-                }
-            },
-            {
-                "updateDimensionProperties": {
-                    "range": {
-                        "sheetId": ws_id,
-                        "dimension": "COLUMNS",
-                        "startIndex": 2,
-                        "endIndex": num_cols
-                    },
-                    "properties": {
-                        "pixelSize": 80
-                    },
-                    "fields": "pixelSize"
+    try:
+        ws.update(values=values, range_name="A1")
+    except TypeError:
+        ws.update("A1", values)
+        
+    full_requests = [
+        {
+            "unmergeCells": {
+                "range": {
+                    "sheetId": ws_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": total_rows,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": num_cols
                 }
             }
-        ] + requests
+        },
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": total_rows,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": num_cols
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "textFormat": {
+                            "fontFamily": "Segoe UI",
+                            "fontSize": 10,
+                            "foregroundColor": {"red": 0.0, "green": 0.0, "blue": 0.0}
+                        },
+                        "verticalAlignment": "MIDDLE",
+                        "borders": {
+                            "top": {"style": "SOLID", "color": COLOR_BORDER},
+                            "bottom": {"style": "SOLID", "color": COLOR_BORDER},
+                            "left": {"style": "SOLID", "color": COLOR_BORDER},
+                            "right": {"style": "SOLID", "color": COLOR_BORDER}
+                        }
+                    }
+                },
+                "fields": "userEnteredFormat(textFormat,verticalAlignment,borders)"
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": num_cols
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": COLOR_HEADER,
+                        "textFormat": {
+                            "fontFamily": "Segoe UI",
+                            "fontSize": 11,
+                            "bold": True
+                        },
+                        "horizontalAlignment": "CENTER"
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
+            }
+        },
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": ws_id,
+                    "gridProperties": {
+                        "frozenRowCount": 1,
+                        "frozenColumnCount": 2,
+                        "hideGridlines": False
+                    },
+                    "index": 0
+                },
+                "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount,gridProperties.hideGridlines,index"
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": ws_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 0,
+                    "endIndex": 1
+                },
+                "properties": {
+                    "pixelSize": 250
+                },
+                "fields": "pixelSize"
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": ws_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 1,
+                    "endIndex": 2
+                },
+                "properties": {
+                    "pixelSize": 90
+                },
+                "fields": "pixelSize"
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": ws_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 2,
+                    "endIndex": num_cols
+                },
+                "properties": {
+                    "pixelSize": 80
+                },
+                "fields": "pixelSize"
+            }
+        }
+    ] + requests
+    
+    spreadsheet.batch_update({"requests": full_requests})
+    
+    for sheet in spreadsheet.worksheets():
+        if sheet.title in ("Лист1", "Sheet1") and sheet.id != ws_id:
+            try:
+                spreadsheet.del_worksheet(sheet)
+            except Exception:
+                pass
+
+
+async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAULT_TYPE, dept: str = None, only_facts: bool = False):
+    spreadsheet_id = get_setting("google_spreadsheet_id")
+    service_account_str = get_setting("google_service_account")
+    
+    if not spreadsheet_id or not service_account_str:
+        await update.message.reply_text(
+            "⚠️ **Настройки Google Sheets не найдены!**\n\n"
+            "Пожалуйста, настройте интеграцию с помощью меню *⚙️ Настроить Google Таблицу*.",
+            reply_markup=MAIN_MENU,
+            parse_mode="Markdown"
+        )
+        return
+
+    await update.message.reply_text("⏳ Формирую выгрузку отчетов в вашу Google Таблицу...")
+    
+    data = fetch_export_data(dept, only_facts)
+    if not data:
+        criteria_msg = "для выгрузки по данному критерию."
+        if only_facts:
+            criteria_msg = "по фактам дня."
+        await update.message.reply_text(f"В базе данных пока нет ни одного отчета {criteria_msg}", reply_markup=MAIN_MENU)
+        return
         
-        spreadsheet.batch_update({"requests": full_requests})
-        
-        # Safely delete default empty worksheets so the user only sees 'Сводка'
-        for sheet in spreadsheet.worksheets():
-            if sheet.title in ("Лист1", "Sheet1") and sheet.id != ws_id:
-                try:
-                    spreadsheet.del_worksheet(sheet)
-                except Exception:
-                    pass
+    cur_date_str = now_local().strftime("%Y-%m-%d")
+    
+    try:
+        await asyncio.to_thread(
+            run_gsheets_sync,
+            spreadsheet_id,
+            service_account_str,
+            dept,
+            only_facts,
+            data,
+            cur_date_str
+        )
     except Exception as e:
         logger.exception("Failed to update Google Sheets")
         await update.message.reply_text(
@@ -3110,46 +3181,63 @@ async def export_department_selected(update: Update, context: ContextTypes.DEFAU
 
 async def check_missing_reports_job(context: ContextTypes.DEFAULT_TYPE):
     now = now_local()
-    
-    # Слот наступает 30 минут назад
-    slot_dt = now - dt_module.timedelta(minutes=30)
-    expected_slot = slot_dt.strftime("%H:%M")
+    date_str = now.strftime("%Y-%m-%d")
+    current_mins = now.hour * 60 + now.minute
     
     conn = get_db()
     workers = conn.execute("SELECT * FROM workers WHERE is_active = 1").fetchall()
-    date_str = now.strftime("%Y-%m-%d")
     
     reports = conn.execute(
         "SELECT telegram_id, slot_time FROM reports WHERE report_date = ? AND report_type = 'status'",
         (date_str,)
     ).fetchall()
-    conn.close()
-    
     submitted_worker_slots = {(r["telegram_id"], r["slot_time"]) for r in reports}
     
+    sent = conn.execute(
+        "SELECT telegram_id, slot_time FROM sent_reminders WHERE report_date = ?",
+        (date_str,)
+    ).fetchall()
+    sent_worker_slots = {(s["telegram_id"], s["slot_time"]) for s in sent}
+    
     for w in workers:
+        tid = w["telegram_id"]
         sched_slots = SCHEDULES.get(w["schedule"], SCHEDULE_A)
-        if expected_slot in sched_slots:
-            tid = w["telegram_id"]
-            if (tid, expected_slot) not in submitted_worker_slots:
-                # Отправляем в ЛС сотруднику
-                try:
-                    await context.bot.send_message(
-                        chat_id=tid,
-                        text=f"⏰ Напоминание! Вы забыли отправить отчет за слот **{expected_slot}** в систему.\n\nПожалуйста, отправьте его прямо сейчас голосовым сообщением, кружком, видео или текстом."
-                    )
-                except Exception as e:
-                    logger.warning(f"Ошибка личного уведомления о пропуске слота {tid}: {e}")
+        
+        for slot in sched_slots:
+            try:
+                sh, sm = map(int, slot.split(":"))
+                slot_mins = sh * 60 + sm
+            except Exception:
+                continue
                 
-                # Отправляем в рабочую группу
-                group_id = w["group_id"] or DEFAULT_GROUP_ID
-                try:
-                    await context.bot.send_message(
-                        chat_id=group_id,
-                        text=f"⚠️ {w['last_name']} {w['first_name']} не предоставил вовремя отчет за статус {expected_slot}."
+            if current_mins >= slot_mins + 30 and current_mins <= slot_mins + 90:
+                if (tid, slot) not in submitted_worker_slots and (tid, slot) not in sent_worker_slots:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO sent_reminders (telegram_id, report_date, slot_time) VALUES (?, ?, ?)",
+                        (tid, date_str, slot)
                     )
-                except Exception as e:
-                    logger.warning(f"Ошибка отправки предупреждения нарушителя в группу {group_id}: {e}")
+                    conn.commit()
+                    
+                    try:
+                        await context.bot.send_message(
+                            chat_id=tid,
+                            text=f"⏰ *Напоминание!* Вы забыли отправить отчет за слот *{slot}* в систему.\n\nПожалуйста, отправьте его прямо сейчас голосовым сообщением, кружком, видео или текстом.",
+                            parse_mode="Markdown"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Ошибка личного уведомления о пропуске слота {tid}: {e}")
+                    
+                    group_id = w["group_id"] or DEFAULT_GROUP_ID
+                    try:
+                        await context.bot.send_message(
+                            chat_id=group_id,
+                            text=f"⚠️ *{w['last_name']} {w['first_name']}* не предоставил вовремя отчет за статус *{slot}*.",
+                            parse_mode="Markdown"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Ошибка отправки предупреждения нарушителя в группу {group_id}: {e}")
+                        
+    conn.close()
 
 
 async def remind_all_missing(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3385,6 +3473,9 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print(f"Ошибка при обновлении сообщения после редактирования комментария: {e}")
         return
 
+    if is_admin(user_id):
+        return
+
     worker = get_worker(user_id)
     
     text_content = ""
@@ -3421,7 +3512,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         is_media = bool(update.message.voice or update.message.video or update.message.video_note)
 
-        # Решение проблемы 3: Сохранение данных незарегистрированных сотрудников по TELEGRAM_ID
+        # Решение проблемы 3: Сохранение данных незарегистрированных сотрудников по TELEGRAM_ID (через SQLite)
         if not worker:
             user_info = {
                 "first_name": update.effective_user.first_name or "",
@@ -3430,7 +3521,14 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "timestamp": datetime.now().isoformat(),
                 "text": text_content
             }
-            pending_unregistered_users[user_id] = user_info
+            save_pending_unregistered_user(
+                telegram_id=user_id,
+                first_name=user_info["first_name"],
+                last_name=user_info["last_name"],
+                username=user_info["username"],
+                timestamp=user_info["timestamp"],
+                text_content=user_info["text"]
+            )
             
             # Оповещение администраторов
             admin_msg = (
@@ -3482,53 +3580,78 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            now = now_local()
-            date_str = now.strftime("%Y-%m-%d")
-            
-            conn = get_db()
-            conn.execute(
-                "DELETE FROM reports WHERE telegram_id = ? AND report_date = ?",
-                (user_id, date_str)
-            )
-            conn.commit()
-            conn.close()
-            
-            save_report(
-                telegram_id=user_id,
-                report_date=date_str,
-                report_type="not_working",
-                slot_time=None,
-                received_at=now.strftime("%H:%M:%S"),
-                is_ok=True,
-                is_late=False,
-                format_comment=reason,
-                required_action="Не работает",
-                raw_text=f"Не работает сегодня. Причина: {reason}"
-            )
-            
+            context.user_data["not_working_reason"] = reason
             context.user_data.pop("awaiting_not_working_reason", None)
-            await update.message.reply_text(
-                f"✅ Статус 'Не работаю' успешно сохранен.\nПричина: {reason}",
-                reply_markup=menu_for_user(user_id, update.effective_chat.type)
-            )
+            context.user_data["awaiting_not_working_confirm"] = True
             
-            w_name = f"{worker['last_name']} {worker['first_name']}"
-            dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
-            notify_text = (
-                f"🛌 {w_name} сегодня не работает.\n"
-                f"Причина: {reason}"
+            kbd = ReplyKeyboardMarkup([["Да, я уверен", "❌ Отмена"]], resize_keyboard=True)
+            await update.message.reply_text(
+                f"⚠️ Внимание! При переключении в статус 'Не работаю сегодня' ВСЕ ваши сегодняшние отчеты будут безвозвратно удалены.\n\n"
+                f"Вы уверены, что хотите продолжить? Причина: {reason}",
+                reply_markup=kbd
             )
-            try:
-                await context.bot.send_message(chat_id=dest_chat, text=notify_text)
-            except Exception as e:
-                print(f"Ошибка отправки уведомления в группу: {e}")
-                
-            for admin_id in ADMIN_IDS:
-                try:
-                    await context.bot.send_message(chat_id=admin_id, text=notify_text)
-                except Exception:
-                    pass
             return
+
+        if context.user_data.get("awaiting_not_working_confirm"):
+            confirm = text_content
+            if confirm == "Да, я уверен":
+                reason = context.user_data.pop("not_working_reason", "Без причины")
+                context.user_data.pop("awaiting_not_working_confirm", None)
+                
+                now = now_local()
+                date_str = now.strftime("%Y-%m-%d")
+                
+                conn = get_db()
+                conn.execute(
+                    "DELETE FROM reports WHERE telegram_id = ? AND report_date = ?",
+                    (user_id, date_str)
+                )
+                conn.commit()
+                conn.close()
+                
+                save_report(
+                    telegram_id=user_id,
+                    report_date=date_str,
+                    report_type="not_working",
+                    slot_time=None,
+                    received_at=now.strftime("%H:%M:%S"),
+                    is_ok=True,
+                    is_late=False,
+                    format_comment=reason,
+                    required_action="Не работает",
+                    raw_text=f"Не работает сегодня. Причина: {reason}"
+                )
+                
+                await update.message.reply_text(
+                    f"✅ Статус 'Не работаю' успешно сохранен.\nПричина: {reason}",
+                    reply_markup=menu_for_user(user_id, update.effective_chat.type)
+                )
+                
+                w_name = f"{worker['last_name']} {worker['first_name']}"
+                dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
+                notify_text = (
+                    f"🛌 {w_name} сегодня не работает.\n"
+                    f"Причина: {reason}"
+                )
+                try:
+                    await context.bot.send_message(chat_id=dest_chat, text=notify_text)
+                except Exception as e:
+                    print(f"Ошибка отправки уведомления в группу: {e}")
+                    
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await context.bot.send_message(chat_id=admin_id, text=notify_text)
+                    except Exception:
+                        pass
+                return
+            else:
+                context.user_data.pop("not_working_reason", None)
+                context.user_data.pop("awaiting_not_working_confirm", None)
+                await update.message.reply_text(
+                    "Действие отменено.",
+                    reply_markup=menu_for_user(user_id, update.effective_chat.type)
+                )
+                return
 
         if text_content in ("🛌 Не работаю сегодня", "Не работаю сегодня") or text_content.lower() == "не работаю сегодня":
             context.user_data["awaiting_not_working_reason"] = True
@@ -3719,7 +3842,7 @@ async def post_init(application: Application):
     # Периодическая фоновая проверка забытых/пропущенных отчетов (через 30 минут после слотов)
     job_queue = application.job_queue
     if job_queue:
-        job_queue.run_repeating(check_missing_reports_job, interval=60, first=10)
+        job_queue.run_repeating(check_missing_reports_job, interval=1800, first=10)
 
 def main():
     init_db()
