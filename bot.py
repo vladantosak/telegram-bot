@@ -2441,9 +2441,9 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                         rep = reports_map[rep_key]
                         is_ok = bool(rep["is_ok"])
                         if is_ok:
-                            row_vals.append("☑")
+                            row_vals.append(True)
                         else:
-                            row_vals.append("☐")
+                            row_vals.append(False)
                             
                             comment_str = rep["format_comment"] or "В отчете есть замечания"
                             if comment_str.startswith("не ОК, "):
@@ -2473,6 +2473,25 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                         row_vals.append("")
                         
                 values.append(row_vals)
+                
+                # Add native Google Sheets Checkbox validation for columns C to the end
+                requests.append({
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": ws_id,
+                            "startRowIndex": r_idx,
+                            "endRowIndex": r_idx + 1,
+                            "startColumnIndex": 2,
+                            "endColumnIndex": num_cols
+                        },
+                        "rule": {
+                            "condition": {
+                                "type": "BOOLEAN"
+                            },
+                            "showCustomUi": True
+                        }
+                    }
+                })
                 
                 # Center time slot column
                 requests.append({
