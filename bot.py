@@ -689,7 +689,11 @@ async def require_admin(update: Update) -> bool:
     return True
 
 def menu_for_user(user_id: int, chat_type: str = "private"):
-    return MAIN_MENU if (is_admin(user_id) and chat_type == "private") else ReplyKeyboardRemove()
+    if is_admin(user_id) and chat_type == "private":
+        return MAIN_MENU
+    elif chat_type == "private" and get_worker(user_id) is not None:
+        return ReplyKeyboardMarkup([["🛌 Не работаю сегодня"]], resize_keyboard=True)
+    return ReplyKeyboardRemove()
 
 def positions_keyboard(rows):
     positions = sorted({row["position"] for row in rows})
@@ -1043,13 +1047,15 @@ def generate_daily_summary_text(report_date: str) -> str:
         tid = r["telegram_id"]
         r_dict = dict(r)
         if tid not in reports_by_worker:
-            reports_by_worker[tid] = {"status": {}, "daily_fact": []}
+            reports_by_worker[tid] = {"status": {}, "daily_fact": [], "not_working": None}
         
         if r_dict["report_type"] == "status":
             slot = r_dict["slot_time"]
             reports_by_worker[tid]["status"][slot] = r_dict
         elif r_dict["report_type"] == "daily_fact":
             reports_by_worker[tid]["daily_fact"].append(r_dict)
+        elif r_dict["report_type"] == "not_working":
+            reports_by_worker[tid]["not_working"] = r_dict
 
     summary_lines = [
         f"📊 Сводка отчетов за {report_date}",
@@ -1086,8 +1092,16 @@ def generate_daily_summary_text(report_date: str) -> str:
                 summary_lines.append("")
                 continue
                 
-            w_reports = reports_by_worker.get(tid, {"status": {}, "daily_fact": []})
+            w_reports = reports_by_worker.get(tid, {"status": {}, "daily_fact": [], "not_working": None})
             
+            # Проверяем, если сегодня человек не работает
+            if w_reports.get("not_working"):
+                reason = w_reports["not_working"]["format_comment"] or "не указана"
+                summary_lines.append(f"👨‍💻 {name}")
+                summary_lines.append(f"   🛌 Не работает сегодня (Причина: {reason})")
+                summary_lines.append("")
+                continue
+                
             # 1. Почасовые статусы
             schedule_slots = SCHEDULES.get(w["schedule"], SCHEDULE_A)
             status_segments = []
@@ -1341,7 +1355,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(update.effective_user.id) and chat_type == "private":
         await update.message.reply_text("Привет! Выберите действие кнопкой ниже.", reply_markup=MAIN_MENU)
     else:
-        await update.message.reply_text("Привет! Отправьте видеоотчет, когда он будет готов.", reply_markup=ReplyKeyboardRemove())
+        # Для зарегистрированных работников показываем меню с кнопкой, для остальных - убираем клавиатуру
+        await update.message.reply_text(
+            "Привет! Отправьте видеоотчет, когда он будет готов.",
+            reply_markup=menu_for_user(update.effective_user.id, chat_type)
+        )
 
 async def get_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"ID чата: {update.effective_chat.id}", reply_markup=menu_for_user(update.effective_user.id, update.effective_chat.type))
@@ -1989,6 +2007,8 @@ def fetch_export_data(dept: str = None, only_facts: bool = False):
         
         if r_type == "daily_fact":
             key = (tid, r_date, "Факт")
+        elif r_type == "not_working":
+            key = (tid, r_date, "not_working")
         else:
             slot = r["slot_time"] or ""
             key = (tid, r_date, slot)
@@ -2091,6 +2111,7 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
     header_fill = PatternFill(start_color="E9E4FC", end_color="E9E4FC", fill_type="solid")
     dept_fill = PatternFill(start_color="D6C9F5", end_color="D6C9F5", fill_type="solid")
     fail_fill = PatternFill(start_color="FCE4E4", end_color="FCE4E4", fill_type="solid")
+    gray_fill = PatternFill(start_color="EAEAEA", end_color="EAEAEA", fill_type="solid")
     
     # Borders
     thin_border_side = Side(border_style="thin", color="D3D3D3")
@@ -2184,28 +2205,35 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
                     cell.alignment = center_align
                     cell.border = grid_border
                     
-                    rep_key = (w["telegram_id"], date, slot)
-                    if rep_key in reports_map:
-                        rep = reports_map[rep_key]
-                        is_ok = bool(rep["is_ok"])
-                        
-                        if is_ok:
-                            cell.value = "☑"
-                            cell.font = ok_font
-                        else:
-                            cell.value = "☐"
-                            cell.font = fail_font
-                            cell.fill = fail_fill
-                            
-                            comment_str = rep["format_comment"] or "В отчете есть замечания"
-                            if comment_str.startswith("не ОК, "):
-                                comment_str = comment_str[len("не ОК, "):]
-                            elif comment_str.startswith("не ОК: "):
-                                comment_str = comment_str[len("не ОК: "):]
-                                
-                            cell.comment = Comment(comment_str, "Прораб-Бот")
-                    else:
+                    not_working_key = (w["telegram_id"], date, "not_working")
+                    if not_working_key in reports_map:
                         cell.value = ""
+                        cell.fill = gray_fill
+                        reason_str = reports_map[not_working_key]["format_comment"] or "Не работает"
+                        cell.comment = Comment(reason_str, "Прораб-Бот")
+                    else:
+                        rep_key = (w["telegram_id"], date, slot)
+                        if rep_key in reports_map:
+                            rep = reports_map[rep_key]
+                            is_ok = bool(rep["is_ok"])
+                            
+                            if is_ok:
+                                cell.value = "☑"
+                                cell.font = ok_font
+                            else:
+                                cell.value = "☐"
+                                cell.font = fail_font
+                                cell.fill = fail_fill
+                                
+                                comment_str = rep["format_comment"] or "В отчете есть замечания"
+                                if comment_str.startswith("не ОК, "):
+                                    comment_str = comment_str[len("не ОК, "):]
+                                elif comment_str.startswith("не ОК: "):
+                                    comment_str = comment_str[len("не ОК: "):]
+                                    
+                                cell.comment = Comment(comment_str, "Прораб-Бот")
+                        else:
+                            cell.value = ""
                         
             # Format and set borders inside merged cell parts
             for sub_idx in range(num_rows):
@@ -2354,6 +2382,7 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
     COLOR_HEADER = {"red": 0.914, "green": 0.894, "blue": 0.988}
     COLOR_DEPT = {"red": 0.839, "green": 0.788, "blue": 0.961}
     COLOR_FAIL = {"red": 0.988, "green": 0.894, "blue": 0.894}
+    COLOR_GRAY = {"red": 0.902, "green": 0.902, "blue": 0.902}
     COLOR_BORDER = {"red": 0.827, "green": 0.827, "blue": 0.827}
     
     requests = []
@@ -2468,54 +2497,88 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                 row_vals.append(slot)
                 
                 for d_idx, date in enumerate(unique_dates, start=2):
-                    rep_key = (w["telegram_id"], date, slot)
-                    sheet_key = (worker_full_name, date, slot)
-                    existing_val = existing_map.get(sheet_key, "")
-                    
-                    if existing_val != "":
-                        # Preserve existing manual or previously written values in the sheet
-                        if existing_val == "TRUE":
-                            row_vals.append(True)
-                        elif existing_val == "FALSE":
-                            row_vals.append(False)
-                        else:
-                            row_vals.append(existing_val)
+                    not_working_key = (w["telegram_id"], date, "not_working")
+                    if not_working_key in reports_map:
+                        row_vals.append("")
+                        reason_str = reports_map[not_working_key]["format_comment"] or "Не работает"
+                        requests.append({
+                            "repeatCell": {
+                                "range": {
+                                    "sheetId": ws_id,
+                                    "startRowIndex": r_idx,
+                                    "endRowIndex": r_idx + 1,
+                                    "startColumnIndex": d_idx,
+                                    "endColumnIndex": d_idx + 1
+                                },
+                                "cell": {
+                                    "userEnteredFormat": {
+                                        "backgroundColor": COLOR_GRAY
+                                    },
+                                    "note": reason_str
+                                },
+                                "fields": "userEnteredFormat.backgroundColor,note"
+                            }
+                        })
+                        requests.append({
+                            "setDataValidation": {
+                                "range": {
+                                    "sheetId": ws_id,
+                                    "startRowIndex": r_idx,
+                                    "endRowIndex": r_idx + 1,
+                                    "startColumnIndex": d_idx,
+                                    "endColumnIndex": d_idx + 1
+                                }
+                            }
+                        })
                     else:
-                        # Cell is currently empty, so fill it with the database report if available
-                        if rep_key in reports_map:
-                            rep = reports_map[rep_key]
-                            is_ok = bool(rep["is_ok"])
-                            if is_ok:
+                        rep_key = (w["telegram_id"], date, slot)
+                        sheet_key = (worker_full_name, date, slot)
+                        existing_val = existing_map.get(sheet_key, "")
+                        
+                        if existing_val != "":
+                            # Preserve existing manual or previously written values in the sheet
+                            if existing_val == "TRUE":
                                 row_vals.append(True)
-                            else:
+                            elif existing_val == "FALSE":
                                 row_vals.append(False)
-                                
-                                comment_str = rep["format_comment"] or "В отчете есть замечания"
-                                if comment_str.startswith("не ОК, "):
-                                    comment_str = comment_str[len("не ОК, "):]
-                                elif comment_str.startswith("не ОК: "):
-                                    comment_str = comment_str[len("не ОК: "):]
-                                    
-                                requests.append({
-                                    "repeatCell": {
-                                        "range": {
-                                            "sheetId": ws_id,
-                                            "startRowIndex": r_idx,
-                                            "endRowIndex": r_idx + 1,
-                                            "startColumnIndex": d_idx, # d_idx is already the correct 0-based column index
-                                            "endColumnIndex": d_idx + 1
-                                        },
-                                        "cell": {
-                                            "userEnteredFormat": {
-                                                "backgroundColor": COLOR_FAIL
-                                            },
-                                            "note": comment_str
-                                        },
-                                        "fields": "userEnteredFormat.backgroundColor,note"
-                                    }
-                                })
+                            else:
+                                row_vals.append(existing_val)
                         else:
-                            row_vals.append("")
+                            # Cell is currently empty, so fill it with the database report if available
+                            if rep_key in reports_map:
+                                rep = reports_map[rep_key]
+                                is_ok = bool(rep["is_ok"])
+                                if is_ok:
+                                    row_vals.append(True)
+                                else:
+                                    row_vals.append(False)
+                                    
+                                    comment_str = rep["format_comment"] or "В отчете есть замечания"
+                                    if comment_str.startswith("не ОК, "):
+                                        comment_str = comment_str[len("не ОК, "):]
+                                    elif comment_str.startswith("не ОК: "):
+                                        comment_str = comment_str[len("не ОК: "):]
+                                        
+                                    requests.append({
+                                        "repeatCell": {
+                                            "range": {
+                                                "sheetId": ws_id,
+                                                "startRowIndex": r_idx,
+                                                "endRowIndex": r_idx + 1,
+                                                "startColumnIndex": d_idx, # d_idx is already the correct 0-based column index
+                                                "endColumnIndex": d_idx + 1
+                                            },
+                                            "cell": {
+                                                "userEnteredFormat": {
+                                                    "backgroundColor": COLOR_FAIL
+                                                },
+                                                "note": comment_str
+                                            },
+                                            "fields": "userEnteredFormat.backgroundColor,note"
+                                        }
+                                    })
+                            else:
+                                row_vals.append("")
                         
                 values.append(row_vals)
                 
@@ -2594,6 +2657,18 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
             ws.update("A1", values)
             
         full_requests = [
+            # Unmerge all cells first to avoid overlapping merge errors
+            {
+                "unmergeCells": {
+                    "range": {
+                        "sheetId": ws_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": total_rows,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": num_cols
+                    }
+                }
+            },
             # Global grid styling
             {
                 "repeatCell": {
@@ -3319,6 +3394,73 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "Ошибка: Вы не зарегистрированы в системе авторизации бота.\n"
                 "Ваш отчет отправлен администраторам как временный."
+            )
+            return
+
+        # Проверка статуса "Не работаю сегодня"
+        if context.user_data.get("awaiting_not_working_reason"):
+            reason = text_content
+            if reason.lower() in ("отмена", "❌ отмена"):
+                context.user_data.pop("awaiting_not_working_reason", None)
+                await update.message.reply_text(
+                    "Отменено.",
+                    reply_markup=menu_for_user(user_id, update.effective_chat.type)
+                )
+                return
+            
+            now = now_local()
+            date_str = now.strftime("%Y-%m-%d")
+            
+            conn = get_db()
+            conn.execute(
+                "DELETE FROM reports WHERE telegram_id = ? AND report_date = ?",
+                (user_id, date_str)
+            )
+            conn.commit()
+            conn.close()
+            
+            save_report(
+                telegram_id=user_id,
+                report_date=date_str,
+                report_type="not_working",
+                slot_time=None,
+                received_at=now.strftime("%H:%M:%S"),
+                is_ok=True,
+                is_late=False,
+                format_comment=reason,
+                required_action="Не работает",
+                raw_text=f"Не работает сегодня. Причина: {reason}"
+            )
+            
+            context.user_data.pop("awaiting_not_working_reason", None)
+            await update.message.reply_text(
+                f"✅ Статус 'Не работаю' успешно сохранен.\nПричина: {reason}",
+                reply_markup=menu_for_user(user_id, update.effective_chat.type)
+            )
+            
+            w_name = f"{worker['last_name']} {worker['first_name']}"
+            dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
+            notify_text = (
+                f"🛌 {w_name} сегодня не работает.\n"
+                f"Причина: {reason}"
+            )
+            try:
+                await context.bot.send_message(chat_id=dest_chat, text=notify_text)
+            except Exception as e:
+                print(f"Ошибка отправки уведомления в группу: {e}")
+                
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(chat_id=admin_id, text=notify_text)
+                except Exception:
+                    pass
+            return
+
+        if text_content in ("🛌 Не работаю сегодня", "Не работаю сегодня") or text_content.lower() == "не работаю сегодня":
+            context.user_data["awaiting_not_working_reason"] = True
+            await update.message.reply_text(
+                "Укажите, пожалуйста, причину, почему вы сегодня не работаете (например: заболел, отпуск, отпросился у прораба):",
+                reply_markup=CANCEL_KEYBOARD
             )
             return
 
