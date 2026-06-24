@@ -116,9 +116,12 @@ SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
     ASK_EXPORT_TYPE,
     ASK_EXPORT_DEPARTMENT,
     ASK_EXPORT_DEPARTMENT_SELECT,
-) = range(25)
+    ASK_EXPORT_FORMAT,
+    ASK_GSHEETS_URL,
+    ASK_GSHEETS_CREDS,
+) = range(28)
 
-ASK_IMPORT_FILE = 25
+ASK_IMPORT_FILE = 28
 
 # Клавиатуры
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -1923,9 +1926,24 @@ def format_time_no_seconds(time_str) -> str:
             return time_str
 
 
-async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_TYPE, dept: str = None, only_facts: bool = False):
-    await update.message.reply_text("⏳ Формирую выгрузку отчетов в формате Excel (.xlsx)...")
-    
+def get_setting(key: str, default: str = None) -> str:
+    conn = get_db()
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value)
+    )
+    conn.commit()
+    conn.close()
+
+
+def fetch_export_data(dept: str = None, only_facts: bool = False):
     conn = get_db()
     
     # 1. Fetch active workers that match dept
@@ -1957,11 +1975,7 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
     conn.close()
     
     if not reports:
-        criteria_msg = "для выгрузки по данному критерию."
-        if only_facts:
-            criteria_msg = "по фактам дня."
-        await update.message.reply_text(f"В базе данных пока нет ни одного отчета {criteria_msg}", reply_markup=MAIN_MENU)
-        return
+        return None
         
     # Find list of unique dates and sort them chronologically
     unique_dates = sorted(list(set(r["report_date"] for r in reports)))
@@ -2035,6 +2049,22 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
             workers_by_dept[dept_name],
             key=lambda item: (item["sort_order"], (item["last_name"] or "").lower(), (item["first_name"] or "").lower())
         )
+        
+    return unique_dates, reports_map, sorted_depts, workers_by_dept
+
+
+async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_TYPE, dept: str = None, only_facts: bool = False):
+    await update.message.reply_text("⏳ Формирую выгрузку отчетов в формате Excel (.xlsx)...")
+    
+    data = fetch_export_data(dept, only_facts)
+    if not data:
+        criteria_msg = "для выгрузки по данному критерию."
+        if only_facts:
+            criteria_msg = "по фактам дня."
+        await update.message.reply_text(f"В базе данных пока нет ни одного отчета {criteria_msg}", reply_markup=MAIN_MENU)
+        return
+        
+    unique_dates, reports_map, sorted_depts, workers_by_dept = data
         
     # Start Excel Generation
     from openpyxl import Workbook
@@ -2211,20 +2241,595 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
+async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAULT_TYPE, dept: str = None, only_facts: bool = False):
+    spreadsheet_id = get_setting("google_spreadsheet_id")
+    service_account_str = get_setting("google_service_account")
+    
+    if not spreadsheet_id or not service_account_str:
+        await update.message.reply_text(
+            "⚠️ **Настройки Google Sheets не найдены!**\n\n"
+            "Пожалуйста, настройте интеграцию с помощью меню *⚙️ Настроить Google Таблицу*.",
+            reply_markup=MAIN_MENU,
+            parse_mode="Markdown"
+        )
+        return
+
+    await update.message.reply_text("⏳ Формирую выгрузку отчетов в вашу Google Таблицу...")
+    
+    data = fetch_export_data(dept, only_facts)
+    if not data:
+        criteria_msg = "для выгрузки по данному критерию."
+        if only_facts:
+            criteria_msg = "по фактам дня."
+        await update.message.reply_text(f"В базе данных пока нет ни одного отчета {criteria_msg}", reply_markup=MAIN_MENU)
+        return
+        
+    unique_dates, reports_map, sorted_depts, workers_by_dept = data
+    
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        
+        creds_dict = json.loads(service_account_str)
+        scopes = [
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive'
+        ]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(spreadsheet_id)
+    except Exception as e:
+        logger.exception("Failed to connect to Google Sheets")
+        await update.message.reply_text(
+            f"❌ **Ошибка подключения к Google Sheets:**\n`{str(e)}`\n\n"
+            "Убедитесь, что ID таблицы и JSON-ключ указаны верно, и сервисный аккаунт добавлен как Редактор вашей таблицы.",
+            reply_markup=MAIN_MENU
+        )
+        return
+
+    try:
+        # Check if "Сводка" exists
+        old_ws = None
+        try:
+            old_ws = spreadsheet.worksheet("Сводка")
+        except gspread.exceptions.WorksheetNotFound:
+            pass
+            
+        temp_title = "Сводка (Новая)"
+        try:
+            temp_ws = spreadsheet.worksheet(temp_title)
+            spreadsheet.del_worksheet(temp_ws)
+        except gspread.exceptions.WorksheetNotFound:
+            pass
+            
+        ws = spreadsheet.add_worksheet(title=temp_title, rows="1000", cols="50")
+        ws_id = ws.id
+    except Exception as e:
+        logger.exception("Failed to manage worksheets")
+        await update.message.reply_text(
+            f"❌ **Ошибка при создании листа в таблице:**\n`{str(e)}`",
+            reply_markup=MAIN_MENU
+        )
+        return
+
+    # Prepare values
+    num_cols = len(unique_dates) + 2
+    values = []
+    
+    header_row = ["Сотрудник", "Время"] + [format_date_no_year(d) for d in unique_dates]
+    values.append(header_row)
+    
+    # Style constants
+    COLOR_HEADER = {"red": 0.914, "green": 0.894, "blue": 0.988}
+    COLOR_DEPT = {"red": 0.839, "green": 0.788, "blue": 0.961}
+    COLOR_FAIL = {"red": 0.988, "green": 0.894, "blue": 0.894}
+    COLOR_BORDER = {"red": 0.827, "green": 0.827, "blue": 0.827}
+    
+    requests = []
+    curr_row = 1
+    
+    for dept_name in sorted_depts:
+        dept_workers = workers_by_dept[dept_name]
+        if not dept_workers:
+            continue
+            
+        dept_row = [dept_name] + [""] * (len(unique_dates) + 1)
+        values.append(dept_row)
+        
+        # Merge dept row
+        requests.append({
+            "mergeCells": {
+                "range": {
+                    "sheetId": ws_id,
+                    "startRowIndex": curr_row,
+                    "endRowIndex": curr_row + 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": num_cols
+                },
+                "mergeType": "MERGE_ALL"
+            }
+        })
+        
+        # Style dept row
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws_id,
+                    "startRowIndex": curr_row,
+                    "endRowIndex": curr_row + 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": num_cols
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": COLOR_DEPT,
+                        "textFormat": {
+                            "fontFamily": "Segoe UI",
+                            "fontSize": 11,
+                            "bold": True
+                        },
+                        "horizontalAlignment": "LEFT"
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
+            }
+        })
+        
+        curr_row += 1
+        
+        for w in dept_workers:
+            schedule_slots = SCHEDULES.get(w["schedule"], SCHEDULE_A)
+            if only_facts:
+                worker_rows = ["Факт"]
+            else:
+                worker_rows = list(schedule_slots)
+                if w["needs_daily_fact"]:
+                    worker_rows.append("Факт")
+                    
+            num_rows = len(worker_rows)
+            if num_rows == 0:
+                continue
+                
+            # Merge name column A
+            if num_rows > 1:
+                requests.append({
+                    "mergeCells": {
+                        "range": {
+                            "sheetId": ws_id,
+                            "startRowIndex": curr_row,
+                            "endRowIndex": curr_row + num_rows,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 1
+                        },
+                        "mergeType": "MERGE_ALL"
+                    }
+                })
+                
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws_id,
+                        "startRowIndex": curr_row,
+                        "endRowIndex": curr_row + num_rows,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 1
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "horizontalAlignment": "LEFT",
+                            "wrapStrategy": "WRAP"
+                        }
+                    },
+                    "fields": "userEnteredFormat(horizontalAlignment,wrapStrategy)"
+                }
+            })
+            
+            for sub_idx, slot in enumerate(worker_rows):
+                r_idx = curr_row + sub_idx
+                row_vals = []
+                
+                if sub_idx == 0:
+                    row_vals.append(f"{w['last_name']} {w['first_name']}")
+                else:
+                    row_vals.append("")
+                    
+                row_vals.append(slot)
+                
+                for d_idx, date in enumerate(unique_dates, start=2):
+                    rep_key = (w["telegram_id"], date, slot)
+                    if rep_key in reports_map:
+                        rep = reports_map[rep_key]
+                        is_ok = bool(rep["is_ok"])
+                        if is_ok:
+                            row_vals.append("☑")
+                        else:
+                            row_vals.append("☐")
+                            
+                            comment_str = rep["format_comment"] or "В отчете есть замечания"
+                            if comment_str.startswith("не ОК, "):
+                                comment_str = comment_str[len("не ОК, "):]
+                            elif comment_str.startswith("не ОК: "):
+                                comment_str = comment_str[len("не ОК: "):]
+                                
+                            requests.append({
+                                "repeatCell": {
+                                    "range": {
+                                        "sheetId": ws_id,
+                                        "startRowIndex": r_idx,
+                                        "endRowIndex": r_idx + 1,
+                                        "startColumnIndex": d_idx + 2, # Offset is 2 since columns are: Employee, Time, dates...
+                                        "endColumnIndex": d_idx + 3
+                                    },
+                                    "cell": {
+                                        "userEnteredFormat": {
+                                            "backgroundColor": COLOR_FAIL
+                                        },
+                                        "note": comment_str
+                                    },
+                                    "fields": "userEnteredFormat.backgroundColor,note"
+                                }
+                            })
+                    else:
+                        row_vals.append("")
+                        
+                values.append(row_vals)
+                
+                # Center time slot column
+                requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": ws_id,
+                            "startRowIndex": r_idx,
+                            "endRowIndex": r_idx + 1,
+                            "startColumnIndex": 1,
+                            "endColumnIndex": 2
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "horizontalAlignment": "CENTER"
+                            }
+                        },
+                        "fields": "userEnteredFormat.horizontalAlignment"
+                    }
+                })
+                
+                # Center date columns
+                requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": ws_id,
+                            "startRowIndex": r_idx,
+                            "endRowIndex": r_idx + 1,
+                            "startColumnIndex": 2,
+                            "endColumnIndex": num_cols
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "horizontalAlignment": "CENTER"
+                            }
+                        },
+                        "fields": "userEnteredFormat.horizontalAlignment"
+                    }
+                })
+                
+            curr_row += num_rows
+
+    total_rows = len(values)
+    
+    try:
+        # Write values
+        try:
+            ws.update(values=values, range_name="A1")
+        except TypeError:
+            ws.update("A1", values)
+            
+        full_requests = [
+            # Global grid styling
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": total_rows,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": num_cols
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "textFormat": {
+                                "fontFamily": "Segoe UI",
+                                "fontSize": 10,
+                                "foregroundColor": {"red": 0.0, "green": 0.0, "blue": 0.0}
+                            },
+                            "verticalAlignment": "MIDDLE",
+                            "borders": {
+                                "top": {"style": "SOLID", "color": COLOR_BORDER},
+                                "bottom": {"style": "SOLID", "color": COLOR_BORDER},
+                                "left": {"style": "SOLID", "color": COLOR_BORDER},
+                                "right": {"style": "SOLID", "color": COLOR_BORDER}
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat(textFormat,verticalAlignment,borders)"
+                }
+            },
+            # Style header
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": num_cols
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": COLOR_HEADER,
+                            "textFormat": {
+                                "fontFamily": "Segoe UI",
+                                "fontSize": 11,
+                                "bold": True
+                            },
+                            "horizontalAlignment": "CENTER"
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
+                }
+            },
+            # Freeze row 1 and columns A/B
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": ws_id,
+                        "gridProperties": {
+                            "frozenRowCount": 1,
+                            "frozenColumnCount": 2,
+                            "showGridLines": True
+                        }
+                    },
+                    "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount,gridProperties.showGridLines"
+                }
+            },
+            # Col widths
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": ws_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 0,
+                        "endIndex": 1
+                    },
+                    "properties": {
+                        "pixelSize": 250
+                    },
+                    "fields": "pixelSize"
+                }
+            },
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": ws_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 1,
+                        "endIndex": 2
+                    },
+                    "properties": {
+                        "pixelSize": 90
+                    },
+                    "fields": "pixelSize"
+                }
+            },
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": ws_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 2,
+                        "endIndex": num_cols
+                    },
+                    "properties": {
+                        "pixelSize": 80
+                    },
+                    "fields": "pixelSize"
+                }
+            }
+        ] + requests
+        
+        spreadsheet.batch_update({"requests": full_requests})
+        
+        # Delete old ws and rename new one
+        if old_ws:
+            try:
+                spreadsheet.del_worksheet(old_ws)
+            except Exception:
+                pass
+        ws.update_title("Сводка")
+    except Exception as e:
+        logger.exception("Failed to update Google Sheets")
+        await update.message.reply_text(
+            f"❌ **Ошибка при заполнении Google Таблицы:**\n`{str(e)}`",
+            reply_markup=MAIN_MENU
+        )
+        return
+
+    prefix = "фактов дня" if only_facts else "отчетов"
+    caption = f"🟢 Общая выгрузка {prefix} в Google Таблицу успешно выполнена!" if dept is None else f"🟢 Выгрузка {prefix} для отдела «{dept}» в Google Таблицу успешно выполнена!"
+    
+    sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+    await update.message.reply_text(
+        f"{caption}\n\n🔗 **Ссылка на таблицу:**\n{sheet_url}",
+        reply_markup=MAIN_MENU,
+        parse_mode="Markdown"
+    )
+
+
 async def export_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update):
         return ConversationHandler.END
         
     kbd = ReplyKeyboardMarkup([
-        ["📊 Общая выгрузка", "🏢 Выгрузка по отделу"],
+        ["📊 Excel (.xlsx)", "🟢 Google Таблица"],
+        ["⚙️ Настроить Google Таблицу"],
         ["❌ Отмена"]
     ], resize_keyboard=True)
     
     await update.message.reply_text(
-        "Выберите тип выгрузки отчетов:",
+        "Выберите формат экспорта отчетов:",
         reply_markup=kbd
     )
-    return ASK_EXPORT_TYPE
+    return ASK_EXPORT_FORMAT
+
+
+async def export_format_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    choice = update.message.text.strip()
+    if choice == "❌ Отмена":
+        await update.message.reply_text("Выгрузка отменена.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+        
+    if choice == "📊 Excel (.xlsx)":
+        context.user_data["export_format"] = "excel"
+        kbd = ReplyKeyboardMarkup([
+            ["📊 Общая выгрузка", "🏢 Выгрузка по отделу"],
+            ["❌ Отмена"]
+        ], resize_keyboard=True)
+        await update.message.reply_text(
+            "Выберите тип выгрузки в Excel:",
+            reply_markup=kbd
+        )
+        return ASK_EXPORT_TYPE
+        
+    if choice == "🟢 Google Таблица":
+        context.user_data["export_format"] = "gsheets"
+        
+        spreadsheet_id = get_setting("google_spreadsheet_id")
+        service_account_str = get_setting("google_service_account")
+        
+        if not spreadsheet_id or not service_account_str:
+            await update.message.reply_text(
+                "⚠️ **Интеграция с Google Таблицами не настроена!**\n\n"
+                "Для работы интеграции:\n"
+                "1. Настройте интеграцию с помощью кнопки *⚙️ Настроить Google Таблицу*.\n"
+                "2. Укажите ID таблицы и JSON-ключ сервисного аккаунта.\n"
+                "3. Дайте права Редактора аккаунту Google.",
+                reply_markup=MAIN_MENU,
+                parse_mode="Markdown"
+            )
+            return ConversationHandler.END
+            
+        kbd = ReplyKeyboardMarkup([
+            ["📊 Общая выгрузка", "🏢 Выгрузка по отделу"],
+            ["❌ Отмена"]
+        ], resize_keyboard=True)
+        await update.message.reply_text(
+            "Выберите тип выгрузки в Google Таблицу:",
+            reply_markup=kbd
+        )
+        return ASK_EXPORT_TYPE
+        
+    if choice == "⚙️ Настроить Google Таблицу":
+        spreadsheet_id = get_setting("google_spreadsheet_id", "Не задан")
+        service_account_str = get_setting("google_service_account")
+        email = "Не задан"
+        if service_account_str:
+            try:
+                email = json.loads(service_account_str).get("client_email", "Не задан")
+            except Exception:
+                pass
+                
+        await update.message.reply_text(
+            f"⚙️ **Текущие настройки Google Таблиц:**\n\n"
+            f"🔗 **ID таблицы:** `{spreadsheet_id}`\n"
+            f"📧 **Сервисный аккаунт:** `{email}`\n\n"
+            f"Пришлите полную ссылку на вашу Google Таблицу или её ID, чтобы настроить или изменить интеграцию.\n\n"
+            f"💡 *Вы можете нажать кнопку ниже для отмены.*",
+            reply_markup=CANCEL_KEYBOARD,
+            parse_mode="Markdown"
+        )
+        return ASK_GSHEETS_URL
+        
+    await update.message.reply_text("Пожалуйста, выберите один из вариантов на клавиатуре.")
+    return ASK_EXPORT_FORMAT
+
+
+async def export_gsheets_url_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "❌ Отмена":
+        await update.message.reply_text("Настройка отменена.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+        
+    import re
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", text)
+    if match:
+        spreadsheet_id = match.group(1)
+    else:
+        spreadsheet_id = text
+        
+    if not re.match(r"^[a-zA-Z0-9-_]{10,}$", spreadsheet_id):
+        await update.message.reply_text(
+            "⚠️ **Некорректный формат!**\n\n"
+            "Пришлите полную ссылку на Google Таблицу (например: `https://docs.google.com/spreadsheets/d/...`) или её ID."
+        )
+        return ASK_GSHEETS_URL
+        
+    context.user_data["temp_spreadsheet_id"] = spreadsheet_id
+    
+    await update.message.reply_text(
+        "🔗 **Ссылка на таблицу принята!**\n\n"
+        "Теперь отправьте файл `service_account.json` вашего сервисного аккаунта Google (или скопируйте и пришлите его текст JSON).\n\n"
+        "💡 *Если вы хотите отменить настройку, нажмите кнопку ниже.*",
+        reply_markup=CANCEL_KEYBOARD,
+        parse_mode="Markdown"
+    )
+    return ASK_GSHEETS_CREDS
+
+
+async def export_gsheets_creds_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.document:
+        doc = update.message.document
+        if not doc.file_name.endswith('.json'):
+            await update.message.reply_text("⚠️ Пожалуйста, загрузите JSON-файл ключа сервисного аккаунта.")
+            return ASK_GSHEETS_CREDS
+        file = await doc.get_file()
+        file_bytes = await file.download_as_bytearray()
+        raw_json = file_bytes.decode('utf-8')
+    else:
+        raw_json = update.message.text.strip()
+        
+    if raw_json == "❌ Отмена":
+        await update.message.reply_text("Настройка отменена.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+        
+    try:
+        creds_dict = json.loads(raw_json)
+        if creds_dict.get("type") != "service_account" or "client_email" not in creds_dict:
+            raise ValueError("Файл не является корректным ключом сервисного аккаунта Google (отсутствует type: service_account или client_email).")
+            
+        set_setting("google_service_account", raw_json)
+        
+        temp_id = context.user_data.get("temp_spreadsheet_id")
+        if temp_id:
+            set_setting("google_spreadsheet_id", temp_id)
+            context.user_data.pop("temp_spreadsheet_id", None)
+            
+        client_email = creds_dict.get("client_email")
+        
+        await update.message.reply_text(
+            f"✅ **Интеграция с Google Таблицами успешно настроена!**\n\n"
+            f"📧 **Важно:** Обязательно предоставьте доступ (права Редактора) следующему сервисному аккаунту:\n\n"
+            f"`{client_email}`\n\n"
+            f"Без этого шага бот не сможет записывать данные в таблицу!",
+            reply_markup=MAIN_MENU,
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+    except Exception as e:
+        logger.exception("Failed to parse service account JSON")
+        await update.message.reply_text(
+            f"❌ **Ошибка при разборе JSON-ключа:**\n`{str(e)}`\n\n"
+            f"Пожалуйста, пришлите корректный JSON-файл ключа сервисного аккаунта."
+        )
+        return ASK_GSHEETS_CREDS
 
 
 async def export_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2233,8 +2838,13 @@ async def export_type_selected(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Выгрузка отменена.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
         
+    fmt = context.user_data.get("export_format", "excel")
+    
     if choice == "📊 Общая выгрузка":
-        await generate_and_send_excel(update, context, dept=None)
+        if fmt == "excel":
+            await generate_and_send_excel(update, context, dept=None)
+        else:
+            await generate_and_send_gsheets(update, context, dept=None)
         return ConversationHandler.END
         
     if choice == "🏢 Выгрузка по отделу":
@@ -2270,7 +2880,11 @@ async def export_department_selected(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text("Выгрузка отменена.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
         
-    await generate_and_send_excel(update, context, dept=choice)
+    fmt = context.user_data.get("export_format", "excel")
+    if fmt == "excel":
+        await generate_and_send_excel(update, context, dept=choice)
+    else:
+        await generate_and_send_gsheets(update, context, dept=choice)
     return ConversationHandler.END
 
 
@@ -2902,8 +3516,11 @@ def main():
     export_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📥 Выгрузить отчеты$"), export_start)],
         states={
+            ASK_EXPORT_FORMAT: [MessageHandler(DIALOG_TEXT, export_format_selected)],
             ASK_EXPORT_TYPE: [MessageHandler(DIALOG_TEXT, export_type_selected)],
             ASK_EXPORT_DEPARTMENT: [MessageHandler(DIALOG_TEXT, export_department_selected)],
+            ASK_GSHEETS_URL: [MessageHandler(DIALOG_TEXT, export_gsheets_url_received)],
+            ASK_GSHEETS_CREDS: [MessageHandler(filters.Document.ALL | filters.TEXT & ~filters.COMMAND, export_gsheets_creds_received)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
     )
