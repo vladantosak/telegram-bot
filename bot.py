@@ -2585,10 +2585,10 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                         "gridProperties": {
                             "frozenRowCount": 1,
                             "frozenColumnCount": 2,
-                            "showGridLines": True
+                            "hideGridlines": False
                         }
                     },
-                    "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount,gridProperties.showGridLines"
+                    "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount,gridProperties.hideGridlines"
                 }
             },
             # Col widths
