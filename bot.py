@@ -2336,7 +2336,7 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
         dept_row = [dept_name] + [""] * (len(unique_dates) + 1)
         values.append(dept_row)
         
-        # Merge dept row
+        # Merge dept row (keep inside frozen columns A and B)
         requests.append({
             "mergeCells": {
                 "range": {
@@ -2344,7 +2344,7 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                     "startRowIndex": curr_row,
                     "endRowIndex": curr_row + 1,
                     "startColumnIndex": 0,
-                    "endColumnIndex": num_cols
+                    "endColumnIndex": 2
                 },
                 "mergeType": "MERGE_ALL"
             }
