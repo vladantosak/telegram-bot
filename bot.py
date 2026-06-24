@@ -433,7 +433,8 @@ def update_worker_field(telegram_id: int, field: str, value):
     
     # Решение проблемы 9: Сброс sort_order в 0 при смене отдела (position)
     if field == "position":
-        conn.execute("UPDATE workers SET position = ?, sort_order = 0 WHERE telegram_id = ?", (value, telegram_id))
+        next_order = get_next_sort_order(value)
+        conn.execute("UPDATE workers SET position = ?, sort_order = ? WHERE telegram_id = ?", (value, next_order, telegram_id))
     else:
         conn.execute(f"UPDATE workers SET {field} = ? WHERE telegram_id = ?", (value, telegram_id))
         
@@ -707,6 +708,23 @@ def numbered_workers_keyboard(rows):
         keyboard.append([f"{i}. {row['last_name']} {row['first_name']}"])
     keyboard.append(["❌ Отмена"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def departments_reply_keyboard() -> ReplyKeyboardMarkup:
+    conn = get_db()
+    rows = conn.execute("SELECT DISTINCT position FROM workers WHERE position IS NOT NULL AND position != ''").fetchall()
+    conn.close()
+    depts = sorted(list({row["position"] for row in rows if row["position"]}))
+    keyboard = [[dept] for dept in depts if dept]
+    keyboard.append(["❌ Отмена"])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_next_sort_order(position: str) -> int:
+    conn = get_db()
+    row = conn.execute("SELECT MAX(sort_order) as max_val FROM workers WHERE lower(position) = lower(?)", (position,)).fetchone()
+    conn.close()
+    if row and row["max_val"] is not None:
+        return row["max_val"] + 1
+    return 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1560,6 +1578,12 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     field, prompt = field_map[action]
     context.user_data["edit_field"] = field
 
+    if field == "position":
+        await update.message.reply_text(
+            "Выберите существующий отдел из списка ниже или введите новое название отдела:",
+            reply_markup=departments_reply_keyboard()
+        )
+        return ASK_EDIT_VALUE
     if field == "schedule":
         await update.message.reply_text("Выберите новый график:", reply_markup=SCHEDULE_KEYBOARD)
         return ASK_EDIT_SCHEDULE
@@ -1718,7 +1742,10 @@ async def add_worker_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def add_worker_firstname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["first_name"] = update.message.text.strip()
-    await update.message.reply_text("Введите должность или отдел сотрудника:", reply_markup=CANCEL_KEYBOARD)
+    await update.message.reply_text(
+        "Выберите существующий отдел из списка ниже или введите новое название отдела:",
+        reply_markup=departments_reply_keyboard()
+    )
     return ASK_POSITION
 
 async def add_worker_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1744,6 +1771,7 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
     raw = update.message.text.strip().lower()
     if raw not in ("да", "нет"): return ASK_NEEDS_DAILY_FACT
 
+    next_order = get_next_sort_order(context.user_data["position"])
     upsert_worker(
         telegram_id=context.user_data["new_worker_id"],
         last_name=context.user_data["last_name"],
@@ -1752,6 +1780,7 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
         group_id=context.user_data["group_id"],
         schedule=context.user_data["schedule"],
         needs_daily_fact=(raw == "да"),
+        sort_order=next_order,
     )
     await fetch_and_save_group_name(context.bot, context.user_data["group_id"])
     await update.message.reply_text("Сотрудник успешно добавлен в базу!", reply_markup=MAIN_MENU)
@@ -1990,6 +2019,12 @@ def fetch_export_data(dept: str = None, only_facts: bool = False):
         {where_clause}
     """
     reports = conn.execute(query, params).fetchall()
+    
+    # Fetch first daily_fact date for each worker to determine when the fact requirement started
+    first_fact_rows = conn.execute(
+        "SELECT telegram_id, MIN(report_date) as first_date FROM reports WHERE report_type = 'daily_fact' GROUP BY telegram_id"
+    ).fetchall()
+    first_fact_dates = {row["telegram_id"]: row["first_date"] for row in first_fact_rows}
     conn.close()
     
     if not reports:
@@ -2070,7 +2105,7 @@ def fetch_export_data(dept: str = None, only_facts: bool = False):
             key=lambda item: (item["sort_order"], (item["last_name"] or "").lower(), (item["first_name"] or "").lower())
         )
         
-    return unique_dates, reports_map, sorted_depts, workers_by_dept
+    return unique_dates, reports_map, sorted_depts, workers_by_dept, first_fact_dates
 
 
 async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_TYPE, dept: str = None, only_facts: bool = False):
@@ -2084,7 +2119,7 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(f"В базе данных пока нет ни одного отчета {criteria_msg}", reply_markup=MAIN_MENU)
         return
         
-    unique_dates, reports_map, sorted_depts, workers_by_dept = data
+    unique_dates, reports_map, sorted_depts, workers_by_dept, first_fact_dates = data
         
     # Start Excel Generation
     from openpyxl import Workbook
@@ -2233,7 +2268,21 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
                                     
                                 cell.comment = Comment(comment_str, "Прораб-Бот")
                         else:
-                            cell.value = ""
+                            is_hyphen = False
+                            if slot == "Факт":
+                                cur_date_str = now_local().strftime("%Y-%m-%d")
+                                tid = w["telegram_id"]
+                                if tid in first_fact_dates:
+                                    if date < first_fact_dates[tid]:
+                                        is_hyphen = True
+                                else:
+                                    if date < cur_date_str:
+                                        is_hyphen = True
+                            
+                            if is_hyphen:
+                                cell.value = "-"
+                            else:
+                                cell.value = ""
                         
             # Format and set borders inside merged cell parts
             for sub_idx in range(num_rows):
@@ -2292,7 +2341,7 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text(f"В базе данных пока нет ни одного отчета {criteria_msg}", reply_markup=MAIN_MENU)
         return
         
-    unique_dates, reports_map, sorted_depts, workers_by_dept = data
+    unique_dates, reports_map, sorted_depts, workers_by_dept, first_fact_dates = data
     
     try:
         import gspread
@@ -2578,7 +2627,32 @@ async def generate_and_send_gsheets(update: Update, context: ContextTypes.DEFAUL
                                         }
                                     })
                             else:
-                                row_vals.append("")
+                                is_hyphen = False
+                                if slot == "Факт":
+                                    cur_date_str = now_local().strftime("%Y-%m-%d")
+                                    tid = w["telegram_id"]
+                                    if tid in first_fact_dates:
+                                        if date < first_fact_dates[tid]:
+                                            is_hyphen = True
+                                    else:
+                                        if date < cur_date_str:
+                                            is_hyphen = True
+                                
+                                if is_hyphen:
+                                    row_vals.append("-")
+                                    requests.append({
+                                        "setDataValidation": {
+                                            "range": {
+                                                "sheetId": ws_id,
+                                                "startRowIndex": r_idx,
+                                                "endRowIndex": r_idx + 1,
+                                                "startColumnIndex": d_idx,
+                                                "endColumnIndex": d_idx + 1
+                                            }
+                                        }
+                                    })
+                                else:
+                                    row_vals.append("")
                         
                 values.append(row_vals)
                 
