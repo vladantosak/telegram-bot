@@ -2531,40 +2531,161 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
 
     ws = None
     existing_map = {}
+    existing_notes_map = {}
+    existing_cell_colors = {}
+    existing_column_colors = {}
+    existing_manual_merges = []
+
+    COLOR_HEADER = {"red": 1.0, "green": 1.0, "blue": 1.0}
+    COLOR_DEPT = {"red": 0.839, "green": 0.788, "blue": 0.961}
+    COLOR_FAIL = {"red": 0.988, "green": 0.894, "blue": 0.894}
+    COLOR_GRAY = {"red": 0.902, "green": 0.902, "blue": 0.902}
+    COLOR_BORDER = {"red": 0.0, "green": 0.0, "blue": 0.0}
+
     try:
         ws = spreadsheet.worksheet("Сводка")
         try:
-            existing_rows = ws.get_all_values()
-            if existing_rows and len(existing_rows) > 1:
-                header_row = existing_rows[0]
-                col_date_map = {}
-                for col_idx in range(2, len(header_row)):
-                    header_val = header_row[col_idx].strip()
-                    for d in unique_dates:
-                        if format_date_no_year(d) == header_val:
-                            col_date_map[col_idx] = d
-                            break
-                
-                current_worker_name = None
-                for row_idx in range(1, len(existing_rows)):
-                    row = existing_rows[row_idx]
-                    if len(row) < 2:
-                        continue
-                    val_a = row[0].strip()
-                    val_b = row[1].strip()
+            ws_id = ws.id
+            meta = spreadsheet.fetch_sheet_metadata(params={
+                "fields": "sheets(properties(title,sheetId),merges,data(rowData(values(userEnteredValue,userEnteredFormat,note,dataValidation))))"
+            })
+            ws_meta = None
+            for s in meta.get("sheets", []):
+                if s.get("properties", {}).get("title") == "Сводка":
+                    ws_meta = s
+                    break
+            
+            if ws_meta:
+                grid_data_list = ws_meta.get("data", [])
+                if grid_data_list:
+                    row_data = grid_data_list[0].get("rowData", [])
                     
-                    if val_b == "":
-                        continue
+                    col_date_map = {}
+                    if len(row_data) > 0:
+                        header_values = row_data[0].get("values", [])
+                        for col_idx in range(2, len(header_values)):
+                            if col_idx >= len(header_values):
+                                break
+                            val_dict = header_values[col_idx]
+                            header_val = ""
+                            if "userEnteredValue" in val_dict:
+                                header_val = str(val_dict["userEnteredValue"].get("stringValue", "")).strip()
+                            for d in unique_dates:
+                                if format_date_no_year(d) == header_val:
+                                    col_date_map[col_idx] = d
+                                    break
                         
-                    if val_a != "":
-                        current_worker_name = val_a
+                        for col_idx, date_str in col_date_map.items():
+                            if col_idx < len(header_values):
+                                header_cell = header_values[col_idx]
+                                bg = header_cell.get("userEnteredFormat", {}).get("backgroundColor")
+                                if bg and bg != {"red": 1.0, "green": 1.0, "blue": 1.0} and bg != {}:
+                                    existing_column_colors[date_str] = bg
+                    
+                    row_mapping = {}
+                    current_worker_name = None
+                    
+                    for row_idx in range(1, len(row_data)):
+                        row_cells = row_data[row_idx].get("values", [])
+                        if len(row_cells) < 2:
+                            continue
                         
-                    if current_worker_name:
-                        for col_idx in range(2, len(row)):
-                            if col_idx in col_date_map and col_idx < len(row):
-                                date_str = col_date_map[col_idx]
-                                cell_val = row[col_idx].strip()
-                                existing_map[(current_worker_name, date_str, val_b)] = cell_val
+                        cell_a = row_cells[0] if len(row_cells) > 0 else {}
+                        cell_b = row_cells[1] if len(row_cells) > 1 else {}
+                        
+                        val_a = ""
+                        if "userEnteredValue" in cell_a:
+                            val_a = str(cell_a["userEnteredValue"].get("stringValue", "")).strip()
+                            
+                        val_b = ""
+                        if "userEnteredValue" in cell_b:
+                            val_b = str(cell_b["userEnteredValue"].get("stringValue", "")).strip()
+                        
+                        if val_a != "":
+                            if val_b == "":
+                                row_mapping[row_idx] = {"type": "dept", "dept": val_a}
+                                current_worker_name = None
+                            else:
+                                current_worker_name = val_a
+                                row_mapping[row_idx] = {"type": "worker", "worker": val_a, "slot": val_b}
+                        else:
+                            if current_worker_name and val_b != "":
+                                row_mapping[row_idx] = {"type": "worker", "worker": current_worker_name, "slot": val_b}
+                    
+                    for row_idx in range(1, len(row_data)):
+                        row_cells = row_data[row_idx].get("values", [])
+                        row_info = row_mapping.get(row_idx)
+                        if not row_info:
+                            continue
+                        
+                        for col_idx in range(2, len(row_cells)):
+                            if col_idx not in col_date_map:
+                                continue
+                            date_str = col_date_map[col_idx]
+                            cell_data = row_cells[col_idx]
+                            
+                            cell_val = ""
+                            if "userEnteredValue" in cell_data:
+                                val_dict = cell_data["userEnteredValue"]
+                                if "stringValue" in val_dict:
+                                    cell_val = val_dict["stringValue"]
+                                elif "boolValue" in val_dict:
+                                    cell_val = "TRUE" if val_dict["boolValue"] else "FALSE"
+                                elif "numberValue" in val_dict:
+                                    cell_val = str(val_dict["numberValue"])
+                            
+                            cell_note = cell_data.get("note", "").strip()
+                            bg_color = cell_data.get("userEnteredFormat", {}).get("backgroundColor")
+                            
+                            if row_info["type"] == "worker":
+                                w_name = row_info["worker"]
+                                slot = row_info["slot"]
+                                
+                                if cell_val != "":
+                                    existing_map[(w_name, date_str, slot)] = cell_val
+                                
+                                if cell_note != "":
+                                    existing_notes_map[(w_name, date_str, slot)] = cell_note
+                                    
+                                if bg_color and bg_color != {"red": 1.0, "green": 1.0, "blue": 1.0} and bg_color != {}:
+                                    existing_cell_colors[(w_name, date_str, slot)] = bg_color
+                            
+                            elif row_info["type"] == "dept":
+                                dept_name = row_info["dept"]
+                                if bg_color and bg_color != COLOR_DEPT and bg_color != {"red": 1.0, "green": 1.0, "blue": 1.0} and bg_color != {}:
+                                    existing_cell_colors[(dept_name, date_str, "dept_header")] = bg_color
+                                    
+                    for m in ws_meta.get("merges", []):
+                        r_start = m.get("startRowIndex", 0)
+                        r_end = m.get("endRowIndex", 0)
+                        c_start = m.get("startColumnIndex", 0)
+                        c_end = m.get("endColumnIndex", 0)
+                        
+                        if c_start >= 2:
+                            info_start = row_mapping.get(r_start)
+                            info_end = row_mapping.get(r_end - 1)
+                            
+                            if c_start in col_date_map and (c_end - 1) in col_date_map:
+                                date_start = col_date_map[c_start]
+                                date_end = col_date_map[c_end - 1]
+                                
+                                if info_start and info_end:
+                                    if info_start["type"] == "worker" and info_end["type"] == "worker" and info_start["worker"] == info_end["worker"]:
+                                        existing_manual_merges.append({
+                                            "type": "worker",
+                                            "worker": info_start["worker"],
+                                            "slot_start": info_start["slot"],
+                                            "slot_end": info_end["slot"],
+                                            "date_start": date_start,
+                                            "date_end": date_end
+                                        })
+                                    elif info_start["type"] == "dept" and info_end["type"] == "dept" and info_start["dept"] == info_end["dept"]:
+                                        existing_manual_merges.append({
+                                            "type": "dept",
+                                            "dept": info_start["dept"],
+                                            "date_start": date_start,
+                                            "date_end": date_end
+                                        })
         except Exception as ex:
             logger.warning(f"Could not parse existing worksheet: {ex}")
     except gspread.exceptions.WorksheetNotFound:
@@ -2581,14 +2702,10 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
     header_row = ["Сотрудник", "Время"] + [format_date_no_year(d) for d in unique_dates]
     values.append(header_row)
     
-    COLOR_HEADER = {"red": 1.0, "green": 1.0, "blue": 1.0}
-    COLOR_DEPT = {"red": 0.839, "green": 0.788, "blue": 0.961}
-    COLOR_FAIL = {"red": 0.988, "green": 0.894, "blue": 0.894}
-    COLOR_GRAY = {"red": 0.902, "green": 0.902, "blue": 0.902}
-    COLOR_BORDER = {"red": 0.0, "green": 0.0, "blue": 0.0}
-    
     requests = []
     curr_row = 1
+    new_dept_rows = {}
+    new_worker_rows = {}
     
     for dept_name in sorted_depts:
         dept_workers = workers_by_dept[dept_name]
@@ -2597,6 +2714,7 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
             
         dept_row = [dept_name] + [""] * (len(unique_dates) + 1)
         values.append(dept_row)
+        new_dept_rows[dept_name] = curr_row
         
         requests.append({
             "mergeCells": {
@@ -2685,9 +2803,10 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
             
             for sub_idx, slot in enumerate(worker_rows):
                 r_idx = curr_row + sub_idx
+                worker_full_name = f"{w['last_name']} {w['first_name']}".strip()
+                new_worker_rows[(worker_full_name, slot)] = r_idx
                 row_vals = []
                 
-                worker_full_name = f"{w['last_name']} {w['first_name']}".strip()
                 if sub_idx == 0:
                     row_vals.append(worker_full_name)
                 else:
@@ -3037,6 +3156,149 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
             }
         }
     ] + requests
+
+    restore_requests = []
+    new_date_cols = {d: idx for idx, d in enumerate(unique_dates, start=2)}
+    
+    # 1. Column colors
+    for date_str, bg in existing_column_colors.items():
+        if date_str in new_date_cols:
+            col_idx = new_date_cols[date_str]
+            restore_requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": total_rows,
+                        "startColumnIndex": col_idx,
+                        "endColumnIndex": col_idx + 1
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": bg
+                        }
+                    },
+                    "fields": "userEnteredFormat.backgroundColor"
+                }
+            })
+            
+    # 2. Cell colors
+    for (w_name, date_str, slot), bg in existing_cell_colors.items():
+        if slot == "dept_header":
+            if w_name in new_dept_rows and date_str in new_date_cols:
+                r_idx = new_dept_rows[w_name]
+                col_idx = new_date_cols[date_str]
+                restore_requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": ws_id,
+                            "startRowIndex": r_idx,
+                            "endRowIndex": r_idx + 1,
+                            "startColumnIndex": col_idx,
+                            "endColumnIndex": col_idx + 1
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": bg
+                            }
+                        },
+                        "fields": "userEnteredFormat.backgroundColor"
+                    }
+                })
+        else:
+            if (w_name, slot) in new_worker_rows and date_str in new_date_cols:
+                r_idx = new_worker_rows[(w_name, slot)]
+                col_idx = new_date_cols[date_str]
+                restore_requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": ws_id,
+                            "startRowIndex": r_idx,
+                            "endRowIndex": r_idx + 1,
+                            "startColumnIndex": col_idx,
+                            "endColumnIndex": col_idx + 1
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": bg
+                            }
+                        },
+                        "fields": "userEnteredFormat.backgroundColor"
+                    }
+                })
+                
+    # 3. Cell notes
+    for (w_name, date_str, slot), note in existing_notes_map.items():
+        if (w_name, slot) in new_worker_rows and date_str in new_date_cols:
+            r_idx = new_worker_rows[(w_name, slot)]
+            col_idx = new_date_cols[date_str]
+            restore_requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws_id,
+                        "startRowIndex": r_idx,
+                        "endRowIndex": r_idx + 1,
+                        "startColumnIndex": col_idx,
+                        "endColumnIndex": col_idx + 1
+                    },
+                    "cell": {
+                        "note": note
+                    },
+                    "fields": "note"
+                }
+            })
+            
+    # 4. Merges
+    for m in existing_manual_merges:
+        if m["type"] == "worker":
+            w_name = m["worker"]
+            s_start = m["slot_start"]
+            s_end = m["slot_end"]
+            d_start = m["date_start"]
+            d_end = m["date_end"]
+            
+            if (w_name, s_start) in new_worker_rows and (w_name, s_end) in new_worker_rows and d_start in new_date_cols and d_end in new_date_cols:
+                r_start = new_worker_rows[(w_name, s_start)]
+                r_end = new_worker_rows[(w_name, s_end)] + 1
+                c_start = new_date_cols[d_start]
+                c_end = new_date_cols[d_end] + 1
+                
+                restore_requests.append({
+                    "mergeCells": {
+                        "range": {
+                            "sheetId": ws_id,
+                            "startRowIndex": r_start,
+                            "endRowIndex": r_end,
+                            "startColumnIndex": c_start,
+                            "endColumnIndex": c_end
+                        },
+                        "mergeType": "MERGE_ALL"
+                    }
+                })
+        elif m["type"] == "dept":
+            dept_name = m["dept"]
+            d_start = m["date_start"]
+            d_end = m["date_end"]
+            
+            if dept_name in new_dept_rows and d_start in new_date_cols and d_end in new_date_cols:
+                r_idx = new_dept_rows[dept_name]
+                c_start = new_date_cols[d_start]
+                c_end = new_date_cols[d_end] + 1
+                
+                restore_requests.append({
+                    "mergeCells": {
+                        "range": {
+                            "sheetId": ws_id,
+                            "startRowIndex": r_idx,
+                            "endRowIndex": r_idx + 1,
+                            "startColumnIndex": c_start,
+                            "endColumnIndex": c_end
+                        },
+                        "mergeType": "MERGE_ALL"
+                    }
+                })
+
+    full_requests = full_requests + restore_requests
     
     spreadsheet.batch_update({"requests": full_requests})
     
