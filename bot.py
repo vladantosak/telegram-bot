@@ -2860,10 +2860,17 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
 
     total_rows = len(values)
     
+    # Получаем исходные размеры листа для полной очистки перед форматированием
+    orig_rows = 1000
+    orig_cols = 50
     try:
-        ws.resize(rows=total_rows, cols=num_cols)
-    except Exception as resize_ex:
-        logger.warning(f"Failed to resize worksheet: {resize_ex}")
+        orig_rows = ws.row_count
+        orig_cols = ws.col_count
+    except Exception:
+        pass
+        
+    max_rows = max(orig_rows, total_rows)
+    max_cols = max(orig_cols, num_cols)
 
     try:
         ws.update(values=values, range_name="A1")
@@ -2872,14 +2879,54 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
         
     full_requests = [
         {
+            "setDataValidation": {
+                "range": {
+                    "sheetId": ws_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": max_rows,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": max_cols
+                }
+            }
+        },
+        {
             "unmergeCells": {
                 "range": {
                     "sheetId": ws_id,
                     "startRowIndex": 0,
-                    "endRowIndex": total_rows,
+                    "endRowIndex": max_rows,
                     "startColumnIndex": 0,
-                    "endColumnIndex": num_cols
+                    "endColumnIndex": max_cols
                 }
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": max_rows,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": max_cols
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0},
+                        "textFormat": {
+                            "fontFamily": "Segoe UI",
+                            "fontSize": 10,
+                            "foregroundColor": {"red": 0.0, "green": 0.0, "blue": 0.0},
+                            "bold": False,
+                            "italic": False,
+                            "underline": False
+                        },
+                        "verticalAlignment": "MIDDLE",
+                        "horizontalAlignment": "LEFT",
+                        "borders": {}
+                    },
+                    "note": ""
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment,horizontalAlignment,borders),note"
             }
         },
         {
@@ -2992,6 +3039,11 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
     ] + requests
     
     spreadsheet.batch_update({"requests": full_requests})
+    
+    try:
+        ws.resize(rows=total_rows, cols=num_cols)
+    except Exception as resize_ex:
+        logger.warning(f"Failed to resize worksheet: {resize_ex}")
     
     for sheet in spreadsheet.worksheets():
         if sheet.title in ("Лист1", "Sheet1") and sheet.id != ws_id:
