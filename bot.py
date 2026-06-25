@@ -116,7 +116,8 @@ SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
     ASK_GSHEETS_URL,
     ASK_GSHEETS_CREDS,
     ASK_IMPORT_FILE,
-) = range(28)
+    ASK_MOVE_POSITION_ORDER,
+) = range(29)
 
 # Клавиатуры
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -1674,10 +1675,33 @@ async def edit_value_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value = update.message.text.strip()
     worker = context.user_data.get("edit_worker")
     field = context.user_data.get("edit_field")
-    update_worker_field(worker["telegram_id"], field, value)
-    await update.message.reply_text("Данные обновлены.", reply_markup=MAIN_MENU)
-    context.user_data.clear()
-    return ConversationHandler.END
+    
+    if field == "position":
+        update_worker_field(worker["telegram_id"], "position", value)
+        
+        new_dept = value
+        new_dept_workers = get_workers_by_position(new_dept)
+        num_workers = len(new_dept_workers)
+        
+        context.user_data["move_new_dept"] = new_dept
+        context.user_data["move_new_dept_workers"] = [dict(w) for w in new_dept_workers]
+        context.user_data["move_worker_id"] = worker["telegram_id"]
+        context.user_data["move_worker_name"] = f"{worker['last_name']} {worker['first_name']}"
+        
+        kbd = ReplyKeyboardMarkup([["Оставить в конце"], ["❌ Отмена"]], resize_keyboard=True)
+        await update.message.reply_text(
+            f"✅ Сотрудник {worker['last_name']} {worker['first_name']} успешно переведен в отдел «{new_dept}».\n"
+            f"Сейчас он находится в конце списка (под номером {num_workers}).\n\n"
+            f"Вы можете изменить его порядковый номер в новом отделе.\n"
+            f"Введите порядковый номер (число от 1 до {num_workers}) или нажмите кнопку «Оставить в конце»:",
+            reply_markup=kbd
+        )
+        return ASK_MOVE_POSITION_ORDER
+    else:
+        update_worker_field(worker["telegram_id"], field, value)
+        await update.message.reply_text("Данные обновлены.", reply_markup=MAIN_MENU)
+        context.user_data.clear()
+        return ConversationHandler.END
 
 async def edit_group_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
@@ -1778,6 +1802,82 @@ async def edit_sort_order_finish(update: Update, context: ContextTypes.DEFAULT_T
         )
     else:
         await update.message.reply_text("Сотрудник не найден в текущем списке отдела.", reply_markup=MAIN_MENU)
+        
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def edit_move_position_order_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    new_dept = context.user_data.get("move_new_dept")
+    new_dept_workers = context.user_data.get("move_new_dept_workers", [])
+    worker_id = context.user_data.get("move_worker_id")
+    worker_name = context.user_data.get("move_worker_name")
+    
+    if not new_dept or not worker_id:
+        await update.message.reply_text("Ошибка сессии. Изменения применились без сортировки.", reply_markup=MAIN_MENU)
+        context.user_data.clear()
+        return ConversationHandler.END
+        
+    if raw == "❌ Отмена" or raw.lower() == "отмена":
+        await update.message.reply_text(
+            f"Сотрудник {worker_name} оставлен в конце списка отдела «{new_dept}».",
+            reply_markup=MAIN_MENU
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+        
+    if raw == "Оставить в конце" or raw.lower() == "оставить в конце":
+        await update.message.reply_text(
+            f"Сотрудник {worker_name} сохранен на последней позиции в отделе «{new_dept}».",
+            reply_markup=MAIN_MENU
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+        
+    if not raw.isdigit():
+        await update.message.reply_text(
+            f"Пожалуйста, введите целое положительное число (от 1 до {len(new_dept_workers)}) "
+            f"или нажмите кнопку «Оставить в конце»:"
+        )
+        return ASK_MOVE_POSITION_ORDER
+        
+    target_num = int(raw)
+    num_workers = len(new_dept_workers)
+    if target_num < 1 or target_num > num_workers:
+        await update.message.reply_text(
+            f"Недопустимый порядковый номер. Пожалуйста, введите число от 1 до {num_workers}:"
+        )
+        return ASK_MOVE_POSITION_ORDER
+        
+    target_idx = target_num - 1
+    
+    worker_to_move = None
+    other_workers = []
+    for w in new_dept_workers:
+        if w["telegram_id"] == worker_id:
+            worker_to_move = w
+        else:
+            other_workers.append(w)
+            
+    if worker_to_move is not None:
+        other_workers.insert(target_idx, worker_to_move)
+        
+        conn = get_db()
+        for i, w in enumerate(other_workers):
+            conn.execute("UPDATE workers SET sort_order = ? WHERE telegram_id = ?", (i, w["telegram_id"]))
+        conn.commit()
+        conn.close()
+        
+        await update.message.reply_text(
+            f"✅ Порядковый номер сотрудника {worker_name} в отделе «{new_dept}» успешно изменен на {target_num}.",
+            reply_markup=MAIN_MENU
+        )
+    else:
+        await update.message.reply_text(
+            f"Сотрудник сохранен в отделе «{new_dept}» в конце списка.",
+            reply_markup=MAIN_MENU
+        )
         
     context.user_data.clear()
     return ConversationHandler.END
@@ -2239,13 +2339,13 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
     fail_font = Font(name=font_family, size=12, bold=False, color="000000")
     
     # Fills
-    header_fill = PatternFill(start_color="E9E4FC", end_color="E9E4FC", fill_type="solid")
+    header_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
     dept_fill = PatternFill(start_color="D6C9F5", end_color="D6C9F5", fill_type="solid")
     fail_fill = PatternFill(start_color="FCE4E4", end_color="FCE4E4", fill_type="solid")
     gray_fill = PatternFill(start_color="EAEAEA", end_color="EAEAEA", fill_type="solid")
     
     # Borders
-    thin_border_side = Side(border_style="thin", color="D3D3D3")
+    thin_border_side = Side(border_style="thin", color="000000")
     grid_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
     
     # Alignments
@@ -2481,11 +2581,11 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
     header_row = ["Сотрудник", "Время"] + [format_date_no_year(d) for d in unique_dates]
     values.append(header_row)
     
-    COLOR_HEADER = {"red": 0.914, "green": 0.894, "blue": 0.988}
+    COLOR_HEADER = {"red": 1.0, "green": 1.0, "blue": 1.0}
     COLOR_DEPT = {"red": 0.839, "green": 0.788, "blue": 0.961}
     COLOR_FAIL = {"red": 0.988, "green": 0.894, "blue": 0.894}
     COLOR_GRAY = {"red": 0.902, "green": 0.902, "blue": 0.902}
-    COLOR_BORDER = {"red": 0.827, "green": 0.827, "blue": 0.827}
+    COLOR_BORDER = {"red": 0.0, "green": 0.0, "blue": 0.0}
     
     requests = []
     curr_row = 1
@@ -3876,6 +3976,7 @@ def main():
             ASK_EDIT_DAILY_FACT: [MessageHandler(DIALOG_TEXT, edit_daily_fact_finish)],
             ASK_EDIT_STATUS_WORK: [MessageHandler(DIALOG_TEXT, edit_status_work_finish)],
             ASK_EDIT_SORT_ORDER: [MessageHandler(DIALOG_TEXT, edit_sort_order_finish)],
+            ASK_MOVE_POSITION_ORDER: [MessageHandler(DIALOG_TEXT, edit_move_position_order_finish)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
     )
