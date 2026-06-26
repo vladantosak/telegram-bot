@@ -125,15 +125,18 @@ SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
     ASK_GSHEETS_CREDS,
     ASK_IMPORT_FILE,
     ASK_MOVE_POSITION_ORDER,
-) = range(29)
+    ASK_SUMMARY_DATE,
+    ASK_EDIT_SCHEDULE_DEPT,
+    ASK_DEPT_SCHEDULE_VAL,
+) = range(32)
 
 # Клавиатуры
 MAIN_MENU = ReplyKeyboardMarkup(
     [
-        ["📋 Сотрудники", "📊 Сводка сейчас"],
+        ["📋 Сотрудники", "📊 Сводка сейчас", "📅 Сводка за дату"],
         ["➕ Добавить сотрудника", "➖ Удалить сотрудника"],
-        ["🏢 Сотрудники отдела", "⏰ Время сводки"],
-        ["🆔 ID чата", "📣 Напомнить всем"],
+        ["🏢 Сотрудники отдела", "🔄 График отдела"],
+        ["⏰ Время сводки", "🆔 ID чата", "📣 Напомнить всем"],
         ["📥 Выгрузить отчеты", "📥 Импорт сотрудников"],
     ],
     resize_keyboard=True,
@@ -719,6 +722,8 @@ def reschedule_summary_jobs(application: Application):
     # Удаление существующих задач сводки
     for job in job_queue.get_jobs_by_name("daily_summary"):
         job.schedule_removal()
+    for job in job_queue.get_jobs_by_name("weekly_monthly_summary"):
+        job.schedule_removal()
 
     times = get_scheduled_times()
     for t_str in times:
@@ -734,6 +739,19 @@ def reschedule_summary_jobs(application: Application):
             logger.info(f"Запланирована сводка на {t_str}")
         except Exception as e:
             logger.error(f"Критическая ошибка при планировании сводки на {t_str}: {e}")
+
+    # Планируем еженедельный и ежемесячный отчет на 09:00 ежедневно
+    try:
+        time_obj_wm = dt_module.time(hour=9, minute=0, tzinfo=LOCAL_TZ)
+        job_queue.run_daily(
+            weekly_monthly_summary_callback,
+            time=time_obj_wm,
+            days=(0, 1, 2, 3, 4, 5, 6),
+            name="weekly_monthly_summary"
+        )
+        logger.info("Запланирована ежедневная проверка на 09:00 для еженедельных/ежемесячных автоотчетов")
+    except Exception as e:
+        logger.error(f"Ошибка при планировании еженедельного/ежемесячного отчета: {e}")
 
 async def scheduled_summary_callback(context: ContextTypes.DEFAULT_TYPE):
     now = now_local()
@@ -753,6 +771,18 @@ async def scheduled_summary_callback(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=admin_id, text=part)
         except Exception:
             pass
+
+async def weekly_monthly_summary_callback(context: ContextTypes.DEFAULT_TYPE):
+    now = now_local()
+    # Если сегодня понедельник (weekday == 0), отправляем еженедельный отчет
+    if now.weekday() == 0:
+        logger.info("Отправка еженедельного отчета (понедельник)...")
+        await send_weekly_summary(context.bot)
+        
+    # Если сегодня первое число месяца, отправляем ежемесячный отчет
+    if now.day == 1:
+        logger.info("Отправка ежемесячного отчета (первое число месяца)...")
+        await send_monthly_summary(context.bot)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1148,6 +1178,270 @@ async def check_status_async(text: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Статистика и автоотчеты (Еженедельные / Ежемесячные / Систематические нарушители)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def calculate_worker_stats(worker, start_date_str: str, end_date_str: str, conn) -> dict:
+    """
+    Рассчитывает статистику сдачи отчетов сотрудником в диапазоне дат [start_date, end_date] (включительно).
+    Исключает дни, когда у сотрудника был выходной (report_type = 'not_working').
+    Учитывает дату первого отчета сотрудника как начало его работы, чтобы не считать пропуски до начала работы.
+    """
+    # Определяем дату самого первого отчета сотрудника
+    join_row = conn.execute(
+        "SELECT MIN(report_date) as start_date FROM reports WHERE telegram_id = ?",
+        (worker["telegram_id"],)
+    ).fetchone()
+    
+    adjusted_start_date_str = start_date_str
+    if join_row and join_row["start_date"]:
+        if join_row["start_date"] > start_date_str:
+            adjusted_start_date_str = join_row["start_date"]
+            
+    # Получаем все отчеты за период
+    reports = conn.execute(
+        "SELECT * FROM reports WHERE telegram_id = ? AND report_date >= ? AND report_date <= ?",
+        (worker["telegram_id"], adjusted_start_date_str, end_date_str)
+    ).fetchall()
+    
+    not_working_dates = set()
+    submitted_statuses = set()
+    submitted_facts = set()
+    total_lates = 0
+    total_remarks = 0
+    
+    for r in reports:
+        r_dict = dict(r)
+        rep_date = r_dict["report_date"]
+        rep_type = r_dict["report_type"]
+        
+        if rep_type == "not_working":
+            not_working_dates.add(rep_date)
+        elif rep_type == "status":
+            slot = r_dict["slot_time"]
+            submitted_statuses.add((rep_date, slot))
+            if r_dict["is_late"]:
+                total_lates += 1
+            if not r_dict["is_ok"]:
+                total_remarks += 1
+        elif rep_type == "daily_fact":
+            submitted_facts.add(rep_date)
+            if r_dict["is_late"]:
+                total_lates += 1
+            if not r_dict["is_ok"]:
+                total_remarks += 1
+
+    start_dt = datetime.strptime(adjusted_start_date_str, "%Y-%m-%d").date()
+    end_dt = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+    
+    expected_status_count = 0
+    expected_fact_count = 0
+    
+    current_date_it = start_dt
+    now = now_local()
+    now_date_str = now.strftime("%Y-%m-%d")
+    current_mins = now.hour * 60 + now.minute
+    
+    while current_date_it <= end_dt:
+        date_it_str = current_date_it.strftime("%Y-%m-%d")
+        if date_it_str not in not_working_dates:
+            slots = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
+            if date_it_str == now_date_str:
+                # Если сегодня, считаем только прошедшие временные слоты
+                for slot in slots:
+                    hour, minute = map(int, slot.split(":"))
+                    slot_mins = hour * 60 + minute
+                    if current_mins > slot_mins + LATE_THRESHOLD_MIN or (date_it_str, slot) in submitted_statuses:
+                        expected_status_count += 1
+                if worker["needs_daily_fact"]:
+                    if date_it_str in submitted_facts:
+                        expected_fact_count += 1
+                    else:
+                        last_slot = slots[-1]
+                        hour, minute = map(int, last_slot.split(":"))
+                        slot_mins = hour * 60 + minute
+                        if current_mins > slot_mins + 60:
+                            expected_fact_count += 1
+            else:
+                expected_status_count += len(slots)
+                if worker["needs_daily_fact"]:
+                    expected_fact_count += 1
+        current_date_it += dt_module.timedelta(days=1)
+        
+    total_expected = expected_status_count + expected_fact_count
+    total_submitted = len(submitted_statuses) + len(submitted_facts)
+    missed_count = max(0, total_expected - total_submitted)
+    
+    percent_submitted = 100.0
+    if total_expected > 0:
+        percent_submitted = (total_submitted / total_expected) * 100.0
+        
+    return {
+        "expected": total_expected,
+        "submitted": total_submitted,
+        "lates": total_lates,
+        "remarks": total_remarks,
+        "percent": percent_submitted,
+        "missed": missed_count,
+    }
+
+def get_violators_threshold() -> int:
+    conn = get_db()
+    row = conn.execute("SELECT value FROM settings WHERE key = 'violators_threshold'").fetchone()
+    conn.close()
+    if row:
+        try:
+            return int(row["value"])
+        except Exception:
+            return 3
+    return 3
+
+def save_violators_threshold(val: int):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('violators_threshold', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (str(val),)
+    )
+    conn.commit()
+    conn.close()
+
+async def send_weekly_summary(bot):
+    now = now_local()
+    # Период: с прошлого понедельника по вчерашнее воскресенье
+    end_dt = now - dt_module.timedelta(days=1)
+    start_dt = now - dt_module.timedelta(days=7)
+    
+    start_str = start_dt.strftime("%Y-%m-%d")
+    end_str = end_dt.strftime("%Y-%m-%d")
+    
+    conn = get_db()
+    workers = conn.execute("SELECT * FROM workers ORDER BY position, sort_order, last_name, first_name").fetchall()
+    
+    summary_lines = [
+        f"📈 *Еженедельный автоматический отчет* за период с {start_dt.strftime('%d.%m.%Y')} по {end_dt.strftime('%d.%m.%Y')}:\n"
+    ]
+    
+    workers_by_dept = {}
+    for w in workers:
+        lastname_lower = (w["last_name"] or "").lower()
+        firstname_lower = (w["first_name"] or "").lower()
+        dept_lower = (w["position"] or "").lower()
+        if any(x in lastname_lower or x in firstname_lower or x in dept_lower for x in ("отмена", "test", "тест")):
+            continue
+        if not w["is_active"]:
+            continue
+        dept = w["position"]
+        if dept not in workers_by_dept:
+            workers_by_dept[dept] = []
+        workers_by_dept[dept].append(w)
+        
+    for dept, dept_workers in workers_by_dept.items():
+        if not dept_workers:
+            continue
+        summary_lines.append(f"🏢 *Отдел: {dept}*")
+        summary_lines.append("──────────────────────────")
+        for w in dept_workers:
+            stats = calculate_worker_stats(w, start_str, end_str, conn)
+            name = f"{w['last_name']} {w['first_name']}"
+            summary_lines.append(
+                f"👨‍💻 *{name}*:\n"
+                f"   • Сдано отчетов: {stats['percent']:.1f}% ({stats['submitted']} из {stats['expected']})\n"
+                f"   • Опозданий: {stats['lates']}\n"
+                f"   • Замечаний: {stats['remarks']}\n"
+            )
+        summary_lines.append("")
+        
+    conn.close()
+    
+    full_text = "\n".join(summary_lines)
+    
+    if SUMMARY_CHAT_ID:
+        try:
+            for part in split_message(full_text):
+                await bot.send_message(chat_id=SUMMARY_CHAT_ID, text=part, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке еженедельной сводки в {SUMMARY_CHAT_ID}: {e}")
+            
+    for admin_id in ADMIN_IDS:
+        try:
+            for part in split_message(full_text):
+                await bot.send_message(chat_id=admin_id, text=part, parse_mode="Markdown")
+        except Exception:
+            pass
+
+async def send_monthly_summary(bot):
+    now = now_local()
+    # Период: весь предыдущий календарный месяц
+    first_day_this_month = now.replace(day=1)
+    last_day_prev_month = first_day_this_month - dt_module.timedelta(days=1)
+    start_day_prev_month = last_day_prev_month.replace(day=1)
+    
+    start_str = start_day_prev_month.strftime("%Y-%m-%d")
+    end_str = last_day_prev_month.strftime("%Y-%m-%d")
+    
+    conn = get_db()
+    workers = conn.execute("SELECT * FROM workers ORDER BY position, sort_order, last_name, first_name").fetchall()
+    
+    months_ru = {
+        1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель", 5: "Май", 6: "Июнь",
+        7: "Июль", 8: "Август", 9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
+    }
+    month_name = months_ru.get(start_day_prev_month.month, start_day_prev_month.strftime("%B"))
+    
+    summary_lines = [
+        f"📅 *Ежемесячный автоматический отчет за {month_name} {start_day_prev_month.year}* ({start_day_prev_month.strftime('%d.%m.%Y')} - {last_day_prev_month.strftime('%d.%m.%Y')}):\n"
+    ]
+    
+    workers_by_dept = {}
+    for w in workers:
+        lastname_lower = (w["last_name"] or "").lower()
+        firstname_lower = (w["first_name"] or "").lower()
+        dept_lower = (w["position"] or "").lower()
+        if any(x in lastname_lower or x in firstname_lower or x in dept_lower for x in ("отмена", "test", "тест")):
+            continue
+        if not w["is_active"]:
+            continue
+        dept = w["position"]
+        if dept not in workers_by_dept:
+            workers_by_dept[dept] = []
+        workers_by_dept[dept].append(w)
+        
+    for dept, dept_workers in workers_by_dept.items():
+        if not dept_workers:
+            continue
+        summary_lines.append(f"🏢 *Отдел: {dept}*")
+        summary_lines.append("──────────────────────────")
+        for w in dept_workers:
+            stats = calculate_worker_stats(w, start_str, end_str, conn)
+            name = f"{w['last_name']} {w['first_name']}"
+            summary_lines.append(
+                f"👨‍💻 *{name}*:\n"
+                f"   • Сдано отчетов: {stats['percent']:.1f}% ({stats['submitted']} из {stats['expected']})\n"
+                f"   • Опозданий: {stats['lates']}\n"
+                f"   • Замечаний: {stats['remarks']}\n"
+            )
+        summary_lines.append("")
+        
+    conn.close()
+    
+    full_text = "\n".join(summary_lines)
+    
+    if SUMMARY_CHAT_ID:
+        try:
+            for part in split_message(full_text):
+                await bot.send_message(chat_id=SUMMARY_CHAT_ID, text=part, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке ежемесячной сводки в {SUMMARY_CHAT_ID}: {e}")
+            
+    for admin_id in ADMIN_IDS:
+        try:
+            for part in split_message(full_text):
+                await bot.send_message(chat_id=admin_id, text=part, parse_mode="Markdown")
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Решение проблемы 4 (Детализированная сводка, различающая статус и факт дня)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1268,6 +1562,50 @@ def generate_daily_summary_text(report_date: str) -> str:
                     summary_lines.append(f"     {issue}")
             summary_lines.append("")
         summary_lines.append("")
+
+    # ── Секция: Систематические нарушители (за последние 7 дней от даты сводки) ──
+    violations_lines = []
+    threshold = get_violators_threshold()
+    
+    try:
+        end_dt = datetime.strptime(report_date, "%Y-%m-%d").date()
+        start_dt = end_dt - dt_module.timedelta(days=6)
+        start_date_7 = start_dt.strftime("%Y-%m-%d")
+        
+        violators = []
+        conn = get_db()
+        for w in workers:
+            lastname_lower = (w["last_name"] or "").lower()
+            firstname_lower = (w["first_name"] or "").lower()
+            dept_lower = (w["position"] or "").lower()
+            if any(x in lastname_lower or x in firstname_lower or x in dept_lower for x in ("отмена", "test", "тест")):
+                continue
+            if not w["is_active"]:
+                continue
+                
+            stats = calculate_worker_stats(w, start_date_7, report_date, conn)
+            total_violations = stats["missed"] + stats["remarks"]
+            if total_violations > threshold:
+                violators.append((w, stats, total_violations))
+        conn.close()
+        
+        if violators:
+            violations_lines.append("⚠️ *Систематические нарушители (за последние 7 дней):*")
+            violations_lines.append("──────────────────────────")
+            violators.sort(key=lambda x: x[2], reverse=True)
+            for w, stats, total in violators:
+                w_name = f"{w['last_name']} {w['first_name']}"
+                violations_lines.append(
+                    f"👤 *{w_name}* ({w['position']}):\n"
+                    f"   • Всего нарушений: *{total}* (Пропущено: {stats['missed']}, Замечаний: {stats['remarks']})\n"
+                    f"   • Дисциплина: {stats['percent']:.1f}%\n"
+                )
+            violations_lines.append("")
+    except Exception as e:
+        logger.error(f"Ошибка при расчете систематических нарушителей: {e}")
+
+    if violations_lines:
+        summary_lines.extend(violations_lines)
 
     return "\n".join(summary_lines)
 
@@ -1485,6 +1823,232 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"ID чата: {update.effective_chat.id}", reply_markup=menu_for_user(update.effective_user.id, update.effective_chat.type))
+
+
+# ── Нарушители: Управление порогом ──────────────────────────────────────────
+async def set_threshold_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+    
+    args = context.args
+    if not args:
+        current = get_violators_threshold()
+        await update.message.reply_text(
+            f"ℹ️ Текущий порог для систематических нарушителей: *{current}* пропусков/замечаний за 7 дней.\n\n"
+            f"Чтобы изменить порог, отправьте: `/threshold <число>` (например, `/threshold 4`).",
+            parse_mode="Markdown"
+        )
+        return
+        
+    try:
+        val = int(args[0])
+        if val < 1:
+            await update.message.reply_text("❌ Порог должен быть положительным числом.")
+            return
+        save_violators_threshold(val)
+        await update.message.reply_text(f"✅ Порог систематических нарушителей успешно изменен на *{val}*.", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат числа. Пример: `/threshold 4`.")
+
+
+# ── Поиск сотрудника по имени ────────────────────────────────────────────────
+async def find_worker_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update):
+        return ConversationHandler.END
+        
+    query = ""
+    if context.args:
+        query = " ".join(context.args).strip()
+    elif update.message.text and update.message.text.startswith("/find"):
+        parts = update.message.text.split(None, 1)
+        if len(parts) > 1:
+            query = parts[1].strip()
+            
+    if not query:
+        await update.message.reply_text(
+            "📝 Пожалуйста, укажите имя или фамилию для поиска. Например: `/find Иванов`",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+
+    conn = get_db()
+    query_pattern = f"%{query}%"
+    rows = conn.execute(
+        "SELECT * FROM workers WHERE last_name LIKE ? OR first_name LIKE ? ORDER BY position, sort_order, last_name, first_name",
+        (query_pattern, query_pattern)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text(f"❌ Сотрудники по запросу «{query}» не найдены.")
+        return ConversationHandler.END
+
+    valid_rows = []
+    for r in rows:
+        lastname_lower = (r["last_name"] or "").lower()
+        firstname_lower = (r["first_name"] or "").lower()
+        dept_lower = (r["position"] or "").lower()
+        if any(x in lastname_lower or x in firstname_lower or x in dept_lower for x in ("отмена", "test", "тест")):
+            continue
+        valid_rows.append(r)
+
+    if not valid_rows:
+        await update.message.reply_text(f"❌ Сотрудники по запросу «{query}» не найдены.")
+        return ConversationHandler.END
+
+    if len(valid_rows) == 1:
+        worker = valid_rows[0]
+        dept_rows = get_workers_by_position(worker["position"])
+        idx = 0
+        for i, r in enumerate(dept_rows):
+            if r["telegram_id"] == worker["telegram_id"]:
+                idx = i
+                break
+                
+        context.user_data["list_rows"] = dept_rows
+        context.user_data["edit_worker"] = worker
+        context.user_data["edit_worker_idx"] = idx
+
+        schedule_str = ", ".join(SCHEDULES.get(worker["schedule"], SCHEDULE_A))
+        fact = "да" if worker["needs_daily_fact"] else "нет"
+        gname = await get_group_name_async(context.bot, worker["group_id"])
+        active_str = "Активен" if worker["is_active"] else "В отпуске / на больничном"
+        
+        info = (
+            f"🔍 Найден сотрудник:\n\n"
+            f"👤 {worker['last_name']} {worker['first_name']}\n"
+            f"Отдел: {worker['position']}\n"
+            f"График: {worker['schedule']} ({schedule_str})\n"
+            f"Группа: {gname}\n"
+            f"Факт дня: {fact}\n"
+            f"Статус работы: {active_str}\n\n"
+            f"Что хотите сделать?"
+        )
+
+        kbd = ReplyKeyboardMarkup(
+            [
+                ["📅 История за неделю", "✏️ Номер в списке"],
+                ["✏️ Изменить фамилию", "✏️ Изменить имя"],
+                ["✏️ Изменить отдел", "✏️ Изменить график"],
+                ["✏️ Изменить группу", "✏️ Факт дня"],
+                ["✏️ Статус работы", "🔼 Вверх в списке"],
+                ["🔽 Вниз в списке", "❌ Отмена"]
+            ],
+            resize_keyboard=True,
+        )
+        await update.message.reply_text(info, reply_markup=kbd)
+        return ASK_EDIT_FIELD
+    else:
+        context.user_data["list_rows"] = valid_rows
+        
+        lines = [f"🔍 Найдено {len(valid_rows)} сотрудников по вашему запросу:\n"]
+        for i, r in enumerate(valid_rows, 1):
+            schedule_str = ", ".join(SCHEDULES.get(r["schedule"], SCHEDULE_A))
+            fact = "да" if r["needs_daily_fact"] else "нет"
+            lines.append(f"{i}. {r['last_name']} {r['first_name']} (Отдел: {r['position']})\n   График: {r['schedule']} | Факт дня: {fact}")
+            
+        lines.append("\n👉 Выберите сотрудника по номеру из списка:")
+        await update.message.reply_text("\n".join(lines), reply_markup=numbered_workers_keyboard(valid_rows))
+        return ASK_LIST_WORKER
+
+
+# ── Сводка за дату ───────────────────────────────────────────────────────────
+async def summary_date_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return ConversationHandler.END
+    await update.message.reply_text(
+        "📅 Пожалуйста, введите интересующую вас дату в формате *ДД.ММ.ГГГГ* (например, `26.06.2026`):",
+        parse_mode="Markdown",
+        reply_markup=CANCEL_KEYBOARD
+    )
+    return ASK_SUMMARY_DATE
+
+async def summary_date_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return ConversationHandler.END
+    raw = update.message.text.strip()
+    
+    parsed_date = None
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            parsed_date = datetime.strptime(raw, fmt)
+            break
+        except ValueError:
+            continue
+            
+    if parsed_date is None:
+        await update.message.reply_text(
+            "❌ Неверный формат даты. Пожалуйста, введите дату в формате *ДД.ММ.ГГГГ* (например, `26.06.2026`):",
+            parse_mode="Markdown"
+        )
+        return ASK_SUMMARY_DATE
+        
+    date_str = parsed_date.strftime("%Y-%m-%d")
+    await update.message.reply_text(f"⏳ Формирую сводку за {parsed_date.strftime('%d.%m.%Y')}...")
+    summary_text = generate_daily_summary_text(date_str)
+    
+    parts = split_message(summary_text)
+    for part in parts[:-1]:
+        await update.message.reply_text(part)
+    if parts:
+        await update.message.reply_text(parts[-1], reply_markup=MAIN_MENU)
+        
+    return ConversationHandler.END
+
+
+# ── Массовое изменение графика отдела ─────────────────────────────────────────
+async def dept_schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return ConversationHandler.END
+    await update.message.reply_text(
+        "🏢 Выберите отдел, в котором хотите изменить график всех сотрудников:",
+        reply_markup=departments_reply_keyboard(context)
+    )
+    return ASK_EDIT_SCHEDULE_DEPT
+
+async def dept_schedule_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return ConversationHandler.END
+    dept = update.message.text.strip()
+    
+    conn = get_db()
+    rows = conn.execute("SELECT COUNT(*) as cnt FROM workers WHERE lower(position) = lower(?)", (dept,)).fetchone()
+    conn.close()
+    
+    if not rows or rows["cnt"] == 0:
+        await update.message.reply_text("❌ Отдел не найден. Попробуйте еще раз или выберите из меню.")
+        return ASK_EDIT_SCHEDULE_DEPT
+        
+    context.user_data["dept_to_change_schedule"] = dept
+    await update.message.reply_text(
+        f"⚙️ Выберите новый график для сотрудников отдела *{dept}* (всего {rows['cnt']} чел.):",
+        parse_mode="Markdown",
+        reply_markup=SCHEDULE_KEYBOARD
+    )
+    return ASK_DEPT_SCHEDULE_VAL
+
+async def dept_schedule_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return ConversationHandler.END
+    sched_val = update.message.text.strip().upper()
+    dept = context.user_data.get("dept_to_change_schedule")
+    
+    if sched_val not in ("A", "B"):
+        await update.message.reply_text("❌ Пожалуйста, выберите A или B:", reply_markup=SCHEDULE_KEYBOARD)
+        return ASK_DEPT_SCHEDULE_VAL
+        
+    conn = get_db()
+    conn.execute(
+        "UPDATE workers SET schedule = ? WHERE lower(position) = lower(?) AND is_active = 1",
+        (sched_val, dept)
+    )
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(
+        f"✅ График всех активных сотрудников отдела *{dept}* успешно изменен на *{sched_val}*!",
+        parse_mode="Markdown",
+        reply_markup=MAIN_MENU
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -2019,6 +2583,16 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
     )
     delete_pending_unregistered_user(context.user_data["new_worker_id"])
     await fetch_and_save_group_name(context.bot, context.user_data["group_id"])
+    
+    # Отправляем уведомление о новом сотруднике в группу
+    target_group_id = context.user_data["group_id"] or DEFAULT_GROUP_ID
+    try:
+        notify_msg = f"👤 {context.user_data['last_name']} {context.user_data['first_name']} добавлен в систему, ID: {context.user_data['new_worker_id']}"
+        await context.bot.send_message(chat_id=target_group_id, text=notify_msg)
+        logger.info(f"Отправлено групповое уведомление о добавлении нового сотрудника в чат {target_group_id}")
+    except Exception as e:
+        logger.warning(f"Не удалось отправить уведомление о новом сотруднике в группу {target_group_id}: {e}")
+
     await update.message.reply_text("Сотрудник успешно добавлен в базу!", reply_markup=MAIN_MENU)
     context.user_data.clear()
     return ConversationHandler.END
@@ -4616,6 +5190,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("myreports", myreports))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("threshold", set_threshold_command))
     application.add_handler(MessageHandler(filters.Regex("^🆔 ID чата$"), get_chat_id))
     application.add_handler(MessageHandler(filters.Regex("^📊 Сводка сейчас$"), send_summary_now))
     application.add_handler(MessageHandler(filters.Regex("^📣 Напомнить всем$"), remind_all_missing))
@@ -4625,7 +5200,10 @@ def main():
 
     # Диалоговые обработчики (ConversationHandlers)
     list_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^📋 Сотрудники$"), list_workers)],
+        entry_points=[
+            MessageHandler(filters.Regex("^📋 Сотрудники$"), list_workers),
+            CommandHandler("find", find_worker_command)
+        ],
         states={
             ASK_LIST_DEPARTMENT: [MessageHandler(DIALOG_TEXT, list_workers_department)],
             ASK_LIST_WORKER: [MessageHandler(DIALOG_TEXT, list_workers_select)],
@@ -4711,6 +5289,31 @@ def main():
         conversation_timeout=300,
     )
 
+    summary_date_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^📅 Сводка за дату$"), summary_date_start),
+            CommandHandler("summary_date", summary_date_start)
+        ],
+        states={
+            ASK_SUMMARY_DATE: [MessageHandler(DIALOG_TEXT, summary_date_finish)],
+        },
+        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        conversation_timeout=300,
+    )
+
+    dept_schedule_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^🔄 График отдела$"), dept_schedule_start),
+            CommandHandler("dept_schedule", dept_schedule_start)
+        ],
+        states={
+            ASK_EDIT_SCHEDULE_DEPT: [MessageHandler(DIALOG_TEXT, dept_schedule_value)],
+            ASK_DEPT_SCHEDULE_VAL: [MessageHandler(DIALOG_TEXT, dept_schedule_finish)],
+        },
+        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        conversation_timeout=300,
+    )
+
     # Регистрация диалогов
     application.add_handler(list_handler)
     application.add_handler(add_handler)
@@ -4719,6 +5322,8 @@ def main():
     application.add_handler(summary_scheduler_handler)
     application.add_handler(export_handler)
     application.add_handler(import_handler)
+    application.add_handler(summary_date_handler)
+    application.add_handler(dept_schedule_handler)
 
     # Хэндлер для приема аудио/видео/текстовых отчетов сотрудников (регистрируется в самом конце)
     application.add_handler(MessageHandler(
