@@ -1,6 +1,6 @@
 {
-  "name": "",
-  "description": "",
+  "name": "Прораб-Бот",
+  "description": "Telegram-бот контроля дисциплины отчётов на стройплощадке с веб-панелью администратора",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
