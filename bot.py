@@ -167,9 +167,9 @@ class ThreadConnectionContainer:
             pass
 
 def _close_all_connections_at_exit():
-    for conn in list(_all_connections):
+    for container in list(_all_connections):
         try:
-            conn.close()
+            container.connection.close()
         except Exception:
             pass
 
@@ -203,8 +203,8 @@ def get_db():
             conn.execute("PRAGMA journal_mode=WAL")
         except Exception:
             pass
-        _all_connections.add(conn)
         container = ThreadConnectionContainer(conn)
+        _all_connections.add(container)
         _local_db.container = container
     return SQLiteConnectionProxy(container.connection)
 
