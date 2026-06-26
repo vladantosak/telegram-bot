@@ -3457,9 +3457,29 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
         ws_anal.cell(row=1, column=3, value="Объект").font = anal_header_font
         ws_anal.cell(row=1, column=3).alignment = center_align
         ws_anal.cell(row=1, column=3).border = grid_border
+
+        ws_anal.cell(row=1, column=4, value="Ожидалось (всего)").font = anal_header_font
+        ws_anal.cell(row=1, column=4).alignment = center_align
+        ws_anal.cell(row=1, column=4).border = grid_border
+
+        ws_anal.cell(row=1, column=5, value="Сдано (всего)").font = anal_header_font
+        ws_anal.cell(row=1, column=5).alignment = center_align
+        ws_anal.cell(row=1, column=5).border = grid_border
+
+        ws_anal.cell(row=1, column=6, value="Опозданий (всего)").font = anal_header_font
+        ws_anal.cell(row=1, column=6).alignment = center_align
+        ws_anal.cell(row=1, column=6).border = grid_border
+
+        ws_anal.cell(row=1, column=7, value="Замечаний (всего)").font = anal_header_font
+        ws_anal.cell(row=1, column=7).alignment = center_align
+        ws_anal.cell(row=1, column=7).border = grid_border
+
+        ws_anal.cell(row=1, column=8, value="Успешность (общая)").font = anal_header_font
+        ws_anal.cell(row=1, column=8).alignment = center_align
+        ws_anal.cell(row=1, column=8).border = grid_border
         
         # Week headers and map them to columns
-        col_idx = 4
+        col_idx = 9
         week_columns = {} # (year, week): col_idx
         for (year, week) in sorted_weeks:
             # Get monday and sunday
@@ -3500,6 +3520,54 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
                 ws_anal.cell(row=row_idx, column=3, value=worker.get('object_id', 'Основной')).font = anal_cell_font
                 ws_anal.cell(row=row_idx, column=3).border = grid_border
                 
+                # Calculate overall stats
+                overall_expected = 0
+                overall_submitted = 0
+                overall_lates = 0
+                overall_remarks = 0
+                overall_percent = 100.0
+                if unique_dates:
+                    try:
+                        overall_stats = calculate_worker_stats(worker, unique_dates[0], unique_dates[-1], conn_anal)
+                        overall_expected = overall_stats["expected"]
+                        overall_submitted = overall_stats["submitted"]
+                        overall_lates = overall_stats["lates"]
+                        overall_remarks = overall_stats["remarks"]
+                        overall_percent = overall_stats["percent"]
+                    except Exception as e:
+                        logger.error(f"Error calculating overall stats for worker {worker['telegram_id']}: {e}")
+                
+                ws_anal.cell(row=row_idx, column=4, value=overall_expected).font = anal_cell_font
+                ws_anal.cell(row=row_idx, column=4).border = grid_border
+                ws_anal.cell(row=row_idx, column=4).alignment = center_align
+
+                ws_anal.cell(row=row_idx, column=5, value=overall_submitted).font = anal_cell_font
+                ws_anal.cell(row=row_idx, column=5).border = grid_border
+                ws_anal.cell(row=row_idx, column=5).alignment = center_align
+
+                ws_anal.cell(row=row_idx, column=6, value=overall_lates).font = anal_cell_font
+                ws_anal.cell(row=row_idx, column=6).border = grid_border
+                ws_anal.cell(row=row_idx, column=6).alignment = center_align
+
+                ws_anal.cell(row=row_idx, column=7, value=overall_remarks).font = anal_cell_font
+                ws_anal.cell(row=row_idx, column=7).border = grid_border
+                ws_anal.cell(row=row_idx, column=7).alignment = center_align
+
+                c_overall = ws_anal.cell(row=row_idx, column=8, value=overall_percent / 100.0 if overall_expected > 0 else 1.0)
+                c_overall.font = anal_cell_font
+                c_overall.border = grid_border
+                c_overall.alignment = center_align
+                c_overall.number_format = '0.0%'
+                if overall_expected > 0:
+                    if overall_percent >= 90:
+                        c_overall.fill = green_fill
+                    elif overall_percent >= 70:
+                        c_overall.fill = yellow_fill
+                    else:
+                        c_overall.fill = red_fill
+                else:
+                    c_overall.fill = gray_light_fill
+
                 # Calculate for each week
                 for (year, week), col_c in week_columns.items():
                     # calculate start and end dates
@@ -4365,7 +4433,416 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
                     }
                 })
 
-    full_requests = full_requests + restore_requests
+    ws_anal = None
+    try:
+        ws_anal = spreadsheet.worksheet("Аналитика")
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+        
+    if not ws_anal:
+        try:
+            ws_anal = spreadsheet.add_worksheet(title="Аналитика", rows="1000", cols="50")
+        except Exception:
+            ws_anal = None
+            
+    anal_formatting_requests = []
+    anal_requests = []
+    values_anal = []
+    total_anal_rows = 0
+    num_anal_cols = 0
+    
+    if ws_anal:
+        import datetime as dt_mod
+        week_keys = set()
+        for d_str in unique_dates:
+            try:
+                dt_val = dt_mod.datetime.strptime(d_str, "%Y-%m-%d").date()
+                year, week, weekday = dt_val.isocalendar()
+                week_keys.add((year, week))
+            except Exception:
+                continue
+                
+        sorted_weeks = sorted(list(week_keys))
+        
+        anal_header = [
+            "Сотрудник", "Отдел", "Объект", 
+            "Ожидалось (всего)", "Сдано (всего)", "Опозданий (всего)", "Замечаний (всего)", "Успешность (общая)"
+        ]
+        for (year, week) in sorted_weeks:
+            d = dt_mod.date(year, 1, 4)
+            d = d + dt_mod.timedelta(weeks=week - 1)
+            mon = d - dt_mod.timedelta(days=d.weekday())
+            sun = mon + dt_mod.timedelta(days=6)
+            mon_str = mon.strftime("%d.%m")
+            sun_str = sun.strftime("%d.%m")
+            anal_header.append(f"Нед. {week:02d} ({mon_str}-{sun_str})")
+            
+        values_anal.append(anal_header)
+        
+        conn_anal = get_db()
+        anal_curr_row = 1
+        
+        COLOR_SUCCESS_GREEN = {"red": 0.886, "green": 0.941, "blue": 0.851}
+        COLOR_SUCCESS_YELLOW = {"red": 1.0, "green": 0.949, "blue": 0.8}
+        COLOR_FAIL_RED = {"red": 0.988, "green": 0.894, "blue": 0.894}
+        COLOR_LIGHT_GRAY = {"red": 0.949, "green": 0.949, "blue": 0.949}
+        
+        for dept_name in sorted_depts:
+            for worker in workers_by_dept[dept_name]:
+                row_vals = [
+                    f"{worker['last_name']} {worker['first_name']}",
+                    worker["position"],
+                    worker.get("object_id", "Основной")
+                ]
+                
+                overall_expected = 0
+                overall_submitted = 0
+                overall_lates = 0
+                overall_remarks = 0
+                overall_percent = 100.0
+                if unique_dates:
+                    try:
+                        overall_stats = calculate_worker_stats(worker, unique_dates[0], unique_dates[-1], conn_anal)
+                        overall_expected = overall_stats["expected"]
+                        overall_submitted = overall_stats["submitted"]
+                        overall_lates = overall_stats["lates"]
+                        overall_remarks = overall_stats["remarks"]
+                        overall_percent = overall_stats["percent"]
+                    except Exception as e:
+                        logger.error(f"Error calculating overall stats for worker {worker['telegram_id']}: {e}")
+                
+                row_vals.extend([
+                    overall_expected,
+                    overall_submitted,
+                    overall_lates,
+                    overall_remarks,
+                    overall_percent / 100.0 if overall_expected > 0 else 1.0
+                ])
+                
+                target_fill = COLOR_LIGHT_GRAY
+                if overall_expected > 0:
+                    if overall_percent >= 90:
+                        target_fill = COLOR_SUCCESS_GREEN
+                    elif overall_percent >= 70:
+                        target_fill = COLOR_SUCCESS_YELLOW
+                    else:
+                        target_fill = COLOR_FAIL_RED
+                        
+                anal_requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": ws_anal.id,
+                            "startRowIndex": anal_curr_row,
+                            "endRowIndex": anal_curr_row + 1,
+                            "startColumnIndex": 7,
+                            "endColumnIndex": 8
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": target_fill,
+                                "numberFormat": {
+                                    "type": "PERCENT",
+                                    "pattern": "0.0%"
+                                },
+                                "horizontalAlignment": "CENTER"
+                            }
+                        },
+                        "fields": "userEnteredFormat(backgroundColor,numberFormat,horizontalAlignment)"
+                    }
+                })
+                
+                col_offset = 8
+                for (year, week) in sorted_weeks:
+                    d = dt_mod.date(year, 1, 4)
+                    d = d + dt_mod.timedelta(weeks=week - 1)
+                    mon = d - dt_mod.timedelta(days=d.weekday())
+                    sun = mon + dt_mod.timedelta(days=6)
+                    
+                    mon_str = mon.strftime("%Y-%m-%d")
+                    sun_str = sun.strftime("%Y-%m-%d")
+                    
+                    try:
+                        stats = calculate_worker_stats(worker, mon_str, sun_str, conn_anal)
+                        if stats["expected"] > 0:
+                            percent_val = stats["percent"] / 100.0
+                            row_vals.append(percent_val)
+                            
+                            week_fill = COLOR_LIGHT_GRAY
+                            if stats["percent"] >= 90:
+                                week_fill = COLOR_SUCCESS_GREEN
+                            elif stats["percent"] >= 70:
+                                week_fill = COLOR_SUCCESS_YELLOW
+                            else:
+                                week_fill = COLOR_FAIL_RED
+                        else:
+                            row_vals.append("-")
+                            week_fill = COLOR_LIGHT_GRAY
+                    except Exception as e:
+                        logger.error(f"Error weekly stats in gsheets for worker {worker['telegram_id']} in week {year}-W{week}: {e}")
+                        row_vals.append("Ошибка")
+                        week_fill = COLOR_LIGHT_GRAY
+                        
+                    anal_requests.append({
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": ws_anal.id,
+                                "startRowIndex": anal_curr_row,
+                                "endRowIndex": anal_curr_row + 1,
+                                "startColumnIndex": col_offset,
+                                "endColumnIndex": col_offset + 1
+                            },
+                            "cell": {
+                                "userEnteredFormat": {
+                                    "backgroundColor": week_fill,
+                                    "horizontalAlignment": "CENTER"
+                                }
+                            },
+                            "fields": "userEnteredFormat(backgroundColor,horizontalAlignment)"
+                        }
+                    })
+                    
+                    if isinstance(row_vals[-1], float):
+                        anal_requests.append({
+                            "repeatCell": {
+                                "range": {
+                                    "sheetId": ws_anal.id,
+                                    "startRowIndex": anal_curr_row,
+                                    "endRowIndex": anal_curr_row + 1,
+                                    "startColumnIndex": col_offset,
+                                    "endColumnIndex": col_offset + 1
+                                },
+                                "cell": {
+                                    "userEnteredFormat": {
+                                        "numberFormat": {
+                                            "type": "PERCENT",
+                                            "pattern": "0.0%"
+                                        }
+                                    }
+                                },
+                                "fields": "userEnteredFormat.numberFormat"
+                            }
+                        })
+                    
+                    col_offset += 1
+                    
+                values_anal.append(row_vals)
+                anal_curr_row += 1
+                
+        conn_anal.close()
+        
+        try:
+            ws_anal.update(values=values_anal, range_name="A1")
+        except TypeError:
+            ws_anal.update("A1", values_anal)
+            
+        total_anal_rows = len(values_anal)
+        num_anal_cols = len(anal_header)
+        
+        orig_anal_rows = 1000
+        orig_anal_cols = 50
+        try:
+            orig_anal_rows = ws_anal.row_count
+            orig_anal_cols = ws_anal.col_count
+        except Exception:
+            pass
+            
+        max_anal_rows = max(orig_anal_rows, total_anal_rows)
+        max_anal_cols = max(orig_anal_cols, num_anal_cols)
+        
+        anal_formatting_requests = [
+            {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": ws_anal.id,
+                        "startRowIndex": 0,
+                        "endRowIndex": max_anal_rows,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": max_anal_cols
+                    }
+                }
+            },
+            {
+                "unmergeCells": {
+                    "range": {
+                        "sheetId": ws_anal.id,
+                        "startRowIndex": 0,
+                        "endRowIndex": max_anal_rows,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": max_anal_cols
+                    }
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws_anal.id,
+                        "startRowIndex": 0,
+                        "endRowIndex": max_anal_rows,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": max_anal_cols
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0},
+                            "textFormat": {
+                                "fontFamily": "Segoe UI",
+                                "fontSize": 10,
+                                "foregroundColor": {"red": 0.0, "green": 0.0, "blue": 0.0},
+                                "bold": False,
+                                "italic": False,
+                                "underline": False
+                            },
+                            "verticalAlignment": "MIDDLE",
+                            "horizontalAlignment": "LEFT",
+                            "borders": {}
+                        },
+                        "note": ""
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment,horizontalAlignment,borders),note"
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws_anal.id,
+                        "startRowIndex": 0,
+                        "endRowIndex": total_anal_rows,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": num_anal_cols
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "textFormat": {
+                                "fontFamily": "Segoe UI",
+                                "fontSize": 10,
+                                "foregroundColor": {"red": 0.0, "green": 0.0, "blue": 0.0}
+                            },
+                            "verticalAlignment": "MIDDLE",
+                            "borders": {
+                                "top": {"style": "SOLID", "color": COLOR_BORDER},
+                                "bottom": {"style": "SOLID", "color": COLOR_BORDER},
+                                "left": {"style": "SOLID", "color": COLOR_BORDER},
+                                "right": {"style": "SOLID", "color": COLOR_BORDER}
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat(textFormat,verticalAlignment,borders)"
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws_anal.id,
+                        "startRowIndex": 0,
+                        "endRowIndex": 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": num_anal_cols
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": {"red": 0.95, "green": 0.95, "blue": 0.95},
+                            "textFormat": {
+                                "fontFamily": "Segoe UI",
+                                "fontSize": 11,
+                                "bold": True
+                            },
+                            "horizontalAlignment": "CENTER"
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
+                }
+            },
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": ws_anal.id,
+                        "gridProperties": {
+                            "frozenRowCount": 1,
+                            "frozenColumnCount": 3,
+                            "hideGridlines": False
+                        },
+                        "index": 1,
+                        "title": "Аналитика"
+                    },
+                    "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount,gridProperties.hideGridlines,index,title"
+                }
+            },
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": ws_anal.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 0,
+                        "endIndex": 1
+                    },
+                    "properties": {
+                        "pixelSize": 250
+                    },
+                    "fields": "pixelSize"
+                }
+            },
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": ws_anal.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 1,
+                        "endIndex": 3
+                    },
+                    "properties": {
+                        "pixelSize": 150
+                    },
+                    "fields": "pixelSize"
+                }
+            },
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": ws_anal.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 3,
+                        "endIndex": 8
+                    },
+                    "properties": {
+                        "pixelSize": 120
+                    },
+                    "fields": "pixelSize"
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws_anal.id,
+                        "startRowIndex": 1,
+                        "endRowIndex": total_anal_rows,
+                        "startColumnIndex": 3,
+                        "endColumnIndex": 8
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "horizontalAlignment": "CENTER"
+                        }
+                    },
+                    "fields": "userEnteredFormat.horizontalAlignment"
+                }
+            },
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": ws_anal.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 8,
+                        "endIndex": num_anal_cols
+                    },
+                    "properties": {
+                        "pixelSize": 130
+                    },
+                    "fields": "pixelSize"
+                }
+            }
+        ]
+
+    full_requests = full_requests + restore_requests + anal_formatting_requests + anal_requests
     
     spreadsheet.batch_update({"requests": full_requests})
     
@@ -4373,9 +4850,15 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
         ws.resize(rows=total_rows, cols=num_cols)
     except Exception as resize_ex:
         logger.warning(f"Failed to resize worksheet: {resize_ex}")
+        
+    if ws_anal and total_anal_rows > 0:
+        try:
+            ws_anal.resize(rows=total_anal_rows, cols=num_anal_cols)
+        except Exception as resize_ex:
+            logger.warning(f"Failed to resize Analytics worksheet: {resize_ex}")
     
     for sheet in spreadsheet.worksheets():
-        if sheet.title in ("Лист1", "Sheet1") and sheet.id != ws_id:
+        if sheet.title in ("Лист1", "Sheet1") and sheet.id != ws_id and (not ws_anal or sheet.id != ws_anal.id):
             try:
                 spreadsheet.del_worksheet(sheet)
             except Exception:
