@@ -11,6 +11,14 @@ import datetime as dt_module
 from zoneinfo import ZoneInfo
 from openpyxl import load_workbook
 import hashlib
+import re
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except ImportError:
+    gspread = None
+    Credentials = None
 
 from groq import Groq
 from telegram import (
@@ -143,8 +151,29 @@ DIALOG_TEXT = filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{CANCEL_TEXT}$
 # ══════════════════════════════════════════════════════════════════════════════
 
 import threading
+import atexit
+import weakref
 
 _local_db = threading.local()
+_all_connections = weakref.WeakSet()
+
+class ThreadConnectionContainer:
+    def __init__(self, conn):
+        self.connection = conn
+    def __del__(self):
+        try:
+            self.connection.close()
+        except Exception:
+            pass
+
+def _close_all_connections_at_exit():
+    for conn in list(_all_connections):
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+atexit.register(_close_all_connections_at_exit)
 
 class SQLiteConnectionProxy:
     def __init__(self, conn):
@@ -166,16 +195,18 @@ class SQLiteConnectionProxy:
         return self._conn.cursor(*args, **kwargs)
 
 def get_db():
-    conn = getattr(_local_db, "connection", None)
-    if conn is None:
+    container = getattr(_local_db, "container", None)
+    if container is None:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA journal_mode=WAL")
         except Exception:
             pass
-        _local_db.connection = conn
-    return SQLiteConnectionProxy(conn)
+        _all_connections.add(conn)
+        container = ThreadConnectionContainer(conn)
+        _local_db.container = container
+    return SQLiteConnectionProxy(container.connection)
 
 def init_db():
     conn = get_db()
@@ -281,6 +312,9 @@ def init_db():
     conn.execute(
         "DELETE FROM workers WHERE last_name LIKE '%Отмена%' OR first_name LIKE '%Отмена%' OR position LIKE '%Отмена%'"
     )
+    
+    # Очистка старых напоминаний старше 7 дней
+    conn.execute("DELETE FROM sent_reminders WHERE report_date < date('now', '-7 days')")
 
     conn.commit()
     conn.close()
@@ -489,17 +523,6 @@ def read_excel(file_path: str):
         
     return workers
 
-def add_worker_excel(worker):
-    upsert_worker(
-        telegram_id=worker["telegram_id"],
-        last_name=worker["last_name"],
-        first_name=worker["first_name"],
-        position=worker["position"],
-        group_id=worker["group_id"],
-        schedule=worker["schedule"],
-        needs_daily_fact=worker["needs_daily_fact"],
-    )
-
 def update_worker_field(telegram_id: int, field: str, value):
     allowed = {"last_name", "first_name", "position", "group_id", "schedule", "needs_daily_fact", "sort_order", "is_active"}
     if field not in allowed:
@@ -614,12 +637,6 @@ def update_report_text_and_ai(report_id: int, is_ok: bool, format_comment: str, 
     conn.commit()
     conn.close()
 
-def get_reports_for_date(report_date: str):
-    conn = get_db()
-    rows = conn.execute("SELECT * FROM reports WHERE report_date = ?", (report_date,)).fetchall()
-    conn.close()
-    return rows
-
 def get_worker_history_last_week(telegram_id: int) -> str:
     """Решение проблемы 6: Логирование истории отчетов сотрудника за неделю."""
     conn = get_db()
@@ -683,7 +700,7 @@ def save_scheduled_times(times: list[str]):
 def reschedule_summary_jobs(application: Application):
     job_queue = application.job_queue
     if not job_queue:
-        print("JobQueue недоступен.")
+        logger.warning("JobQueue недоступен.")
         return
 
     # Удаление существующих задач сводки
@@ -701,9 +718,9 @@ def reschedule_summary_jobs(application: Application):
                 days=(0, 1, 2, 3, 4, 5, 6),
                 name="daily_summary"
             )
-            print(f"Запланирована сводка на {t_str}")
+            logger.info(f"Запланирована сводка на {t_str}")
         except Exception as e:
-            print(f"Критическая ошибка при планировании сводки на {t_str}: {e}")
+            logger.error(f"Критическая ошибка при планировании сводки на {t_str}: {e}")
 
 async def scheduled_summary_callback(context: ContextTypes.DEFAULT_TYPE):
     now = now_local()
@@ -715,7 +732,7 @@ async def scheduled_summary_callback(context: ContextTypes.DEFAULT_TYPE):
             for part in split_message(summary_text):
                 await context.bot.send_message(chat_id=SUMMARY_CHAT_ID, text=part)
         except Exception as e:
-            print(f"Ошибка при отправке автоматической сводки в {SUMMARY_CHAT_ID}: {e}")
+            logger.error(f"Ошибка при отправке автоматической сводки в {SUMMARY_CHAT_ID}: {e}")
             
     for admin_id in ADMIN_IDS:
         try:
@@ -770,11 +787,17 @@ def numbered_workers_keyboard(rows):
     keyboard.append(["❌ Отмена"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-def departments_reply_keyboard() -> ReplyKeyboardMarkup:
-    conn = get_db()
-    rows = conn.execute("SELECT DISTINCT position FROM workers WHERE position IS NOT NULL AND position != ''").fetchall()
-    conn.close()
-    depts = sorted(list({row["position"] for row in rows if row["position"]}))
+def departments_reply_keyboard(context: ContextTypes.DEFAULT_TYPE | None = None) -> ReplyKeyboardMarkup:
+    if context is not None and "depts_cache" in context.user_data:
+        depts = context.user_data["depts_cache"]
+    else:
+        conn = get_db()
+        rows = conn.execute("SELECT DISTINCT position FROM workers WHERE position IS NOT NULL AND position != ''").fetchall()
+        conn.close()
+        depts = sorted(list({row["position"] for row in rows if row["position"]}))
+        if context is not None:
+            context.user_data["depts_cache"] = depts
+            
     keyboard = [[dept] for dept in depts if dept]
     keyboard.append(["❌ Отмена"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -1075,7 +1098,7 @@ def clean_report(text: str) -> str:
         )
         return response.choices[0].message.content.strip().strip('"').strip("'")
     except Exception as e:
-        print(f"Ошибка при очистке отчета: {e}")
+        logger.error(f"Ошибка при очистке отчета: {e}")
         return text
 
 def check_status(text: str) -> dict:
@@ -1347,7 +1370,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             await query.edit_message_text(text=new_text, reply_markup=kbd)
         except Exception as e:
-            print(f"Ошибка обновления интерактивной кнопки: {e}")
+            logger.error(f"Ошибка обновления интерактивной кнопки: {e}")
 
     elif data.startswith("edit_comment_"):
         report_id = int(data.split("_")[-1])
@@ -1374,7 +1397,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
             context.user_data["editing_comment_prompt_message_id"] = prompt_msg.message_id
         except Exception as e:
-            print(f"Ошибка отправки ForceReply: {e}")
+            logger.error(f"Ошибка отправки ForceReply: {e}")
 
     elif data.startswith("toggle_type_"):
         report_id = int(data.split("_")[-1])
@@ -1429,7 +1452,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             await query.edit_message_text(text=new_text, reply_markup=kbd)
         except Exception as e:
-            print(f"Ошибка обновления типа отчета в сообщении: {e}")
+            logger.error(f"Ошибка обновления типа отчета в сообщении: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1498,7 +1521,15 @@ async def import_workers_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         success_count = 0
         for w in workers:
             try:
-                add_worker_excel(w)
+                upsert_worker(
+                    telegram_id=w["telegram_id"],
+                    last_name=w["last_name"],
+                    first_name=w["first_name"],
+                    position=w["position"],
+                    group_id=w["group_id"],
+                    schedule=w["schedule"],
+                    needs_daily_fact=w["needs_daily_fact"]
+                )
                 success_count += 1
             except Exception as ex:
                 logging.error(f"Error importing worker {w}: {ex}")
@@ -1649,7 +1680,7 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     if field == "position":
         await update.message.reply_text(
             "Выберите существующий отдел из списка ниже или введите новое название отдела:",
-            reply_markup=departments_reply_keyboard()
+            reply_markup=departments_reply_keyboard(context)
         )
         return ASK_EDIT_VALUE
     if field == "schedule":
@@ -1810,7 +1841,6 @@ async def edit_sort_order_finish(update: Update, context: ContextTypes.DEFAULT_T
 async def edit_move_position_order_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
     new_dept = context.user_data.get("move_new_dept")
-    new_dept_workers = context.user_data.get("move_new_dept_workers", [])
     worker_id = context.user_data.get("move_worker_id")
     worker_name = context.user_data.get("move_worker_name")
     
@@ -1818,6 +1848,8 @@ async def edit_move_position_order_finish(update: Update, context: ContextTypes.
         await update.message.reply_text("Ошибка сессии. Изменения применились без сортировки.", reply_markup=MAIN_MENU)
         context.user_data.clear()
         return ConversationHandler.END
+        
+    new_dept_workers = [dict(w) for w in get_workers_by_position(new_dept)]
         
     if raw == "❌ Отмена" or raw.lower() == "отмена":
         await update.message.reply_text(
@@ -1934,7 +1966,7 @@ async def add_worker_firstname(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["first_name"] = update.message.text.strip()
     await update.message.reply_text(
         "Выберите существующий отдел из списка ниже или введите новое название отдела:",
-        reply_markup=departments_reply_keyboard()
+        reply_markup=departments_reply_keyboard(context)
     )
     return ASK_POSITION
 
@@ -2076,27 +2108,28 @@ async def send_summary_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for part in split_message(summary_text):
                 await context.bot.send_message(chat_id=SUMMARY_CHAT_ID, text=part)
         except Exception as e:
-            print(f"Не удалось отправить сводку в чат {SUMMARY_CHAT_ID}: {e}")
+            logger.error(f"Не удалось отправить сводку в чат {SUMMARY_CHAT_ID}: {e}")
 
 
 async def myreports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conn = get_db()
-    worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (user_id,)).fetchone()
-    if not worker:
-        await update.message.reply_text("Вы не зарегистрированы в системе. Обратитесь к администратору.")
+    try:
+        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (user_id,)).fetchone()
+        if not worker:
+            await update.message.reply_text("Вы не зарегистрированы в системе. Обратитесь к администратору.")
+            return
+    
+        # Извлекаем отчеты за последние 7 дней для этого сотрудника
+        now = now_local()
+        seven_days_ago = (now - dt_module.timedelta(days=7)).strftime("%Y-%m-%d")
+        reports = conn.execute(
+            "SELECT * FROM reports WHERE telegram_id = ? AND report_date >= ? ORDER BY report_date DESC, received_at DESC",
+            (user_id, seven_days_ago)
+        ).fetchall()
+    finally:
         conn.close()
-        return
-
-    # Извлекаем отчеты за последние 7 дней для этого сотрудника
-    now = now_local()
-    seven_days_ago = (now - dt_module.timedelta(days=7)).strftime("%Y-%m-%d")
-    reports = conn.execute(
-        "SELECT * FROM reports WHERE telegram_id = ? AND report_date >= ? ORDER BY report_date DESC, received_at DESC",
-        (user_id, seven_days_ago)
-    ).fetchall()
-    conn.close()
-
+    
     if not reports:
         await update.message.reply_text("У вас нет отчетов за последние 7 дней.")
         return
@@ -2188,40 +2221,41 @@ def set_setting(key: str, value: str):
 
 def fetch_export_data(dept: str = None, only_facts: bool = False):
     conn = get_db()
-    
-    # 1. Fetch active workers that match dept
-    if dept is not None:
-        workers = conn.execute("SELECT * FROM workers WHERE lower(position) = lower(?)", (dept,)).fetchall()
-    else:
-        workers = conn.execute("SELECT * FROM workers").fetchall()
+    try:
+        # 1. Fetch active workers that match dept
+        if dept is not None:
+            workers = conn.execute("SELECT * FROM workers WHERE lower(position) = lower(?)", (dept,)).fetchall()
+        else:
+            workers = conn.execute("SELECT * FROM workers").fetchall()
+            
+        conditions = []
+        params = []
         
-    conditions = []
-    params = []
-    
-    if dept is not None:
-        conditions.append("lower(w.position) = lower(?)")
-        params.append(dept)
+        if dept is not None:
+            conditions.append("lower(w.position) = lower(?)")
+            params.append(dept)
+            
+        if only_facts:
+            conditions.append("r.report_type = 'daily_fact'")
+            
+        where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
         
-    if only_facts:
-        conditions.append("r.report_type = 'daily_fact'")
+        # We fetch relevant reports
+        query = f"""
+            SELECT r.id, r.telegram_id, r.report_date, r.report_type, r.slot_time, r.is_ok, r.format_comment, r.received_at
+            FROM reports r
+            LEFT JOIN workers w ON r.telegram_id = w.telegram_id
+            {where_clause}
+        """
+        reports = conn.execute(query, params).fetchall()
         
-    where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
-    
-    # We fetch relevant reports
-    query = f"""
-        SELECT r.id, r.telegram_id, r.report_date, r.report_type, r.slot_time, r.is_ok, r.format_comment, r.received_at
-        FROM reports r
-        LEFT JOIN workers w ON r.telegram_id = w.telegram_id
-        {where_clause}
-    """
-    reports = conn.execute(query, params).fetchall()
-    
-    # Fetch first daily_fact date for each worker to determine when the fact requirement started
-    first_fact_rows = conn.execute(
-        "SELECT telegram_id, MIN(report_date) as first_date FROM reports WHERE report_type = 'daily_fact' GROUP BY telegram_id"
-    ).fetchall()
-    first_fact_dates = {row["telegram_id"]: row["first_date"] for row in first_fact_rows}
-    conn.close()
+        # Fetch first daily_fact date for each worker to determine when the fact requirement started
+        first_fact_rows = conn.execute(
+            "SELECT telegram_id, MIN(report_date) as first_date FROM reports WHERE report_type = 'daily_fact' GROUP BY telegram_id"
+        ).fetchall()
+        first_fact_dates = {row["telegram_id"]: row["first_date"] for row in first_fact_rows}
+    finally:
+        conn.close()
     
     if not reports:
         return None
@@ -2515,8 +2549,8 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
 
 
 def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, only_facts: bool, data, cur_date_str: str):
-    import gspread
-    from google.oauth2.service_account import Credentials
+    if gspread is None or Credentials is None:
+        raise ImportError("Библиотеки gspread или google-auth не установлены.")
     
     unique_dates, reports_map, sorted_depts, workers_by_dept, first_fact_dates = data
     
@@ -3463,7 +3497,6 @@ async def export_gsheets_url_received(update: Update, context: ContextTypes.DEFA
         await update.message.reply_text("Настройка отменена.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
         
-    import re
     match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", text)
     if match:
         spreadsheet_id = match.group(1)
@@ -3624,7 +3657,7 @@ async def check_missing_reports_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 continue
                 
-            if current_mins >= slot_mins + 30 and current_mins <= slot_mins + 90:
+            if current_mins >= slot_mins + 25 and current_mins <= slot_mins + 55:
                 if (tid, slot) not in submitted_worker_slots and (tid, slot) not in sent_worker_slots:
                     conn.execute(
                         "INSERT OR IGNORE INTO sent_reminders (telegram_id, report_date, slot_time) VALUES (?, ?, ?)",
@@ -3690,7 +3723,8 @@ async def remind_all_missing(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 # Напоминание сотруднику
                 await context.bot.send_message(
                     chat_id=tid,
-                    text=f"⏰ Срочное напоминание! Вы пропустили отправку отчетов за слоты (сегменты): **{slots_str}**.\n\nПожалуйста, немедленно отправьте отчет в бот!"
+                    text=f"⏰ Срочное напоминание! Вы пропустили отправку отчетов за слоты (сегменты): **{slots_str}**.\n\nПожалуйста, немедленно отправьте отчет в бот!",
+                    parse_mode="Markdown"
                 )
                 reminded_count += 1
                 
@@ -3884,7 +3918,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=kbd
                 )
             except Exception as e:
-                print(f"Ошибка при обновлении сообщения после редактирования комментария: {e}")
+                logger.error(f"Ошибка при обновлении сообщения после редактирования комментария: {e}")
         return
 
     if is_admin(user_id):
@@ -3964,7 +3998,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             )
                             admin_copied_msg_id = admin_copied.message_id
                         except Exception as copy_err:
-                            print(f"Ошибка копирования медиа незарегистрированного пользователя администратору {admin_id}: {copy_err}")
+                            logger.error(f"Ошибка копирования медиа незарегистрированного пользователя администратору {admin_id}: {copy_err}")
                     
                     if admin_copied_msg_id:
                         await context.bot.send_message(
@@ -4050,7 +4084,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await context.bot.send_message(chat_id=dest_chat, text=notify_text)
                 except Exception as e:
-                    print(f"Ошибка отправки уведомления в группу: {e}")
+                    logger.error(f"Ошибка отправки уведомления в группу: {e}")
                     
                 for admin_id in ADMIN_IDS:
                     try:
@@ -4068,6 +4102,22 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         if text_content in ("🛌 Не работаю сегодня", "Не работаю сегодня") or text_content.lower() == "не работаю сегодня":
+            now = now_local()
+            date_str = now.strftime("%Y-%m-%d")
+            conn = get_db()
+            existing_not_working = conn.execute(
+                "SELECT * FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = 'not_working'",
+                (user_id, date_str)
+            ).fetchone()
+            conn.close()
+            
+            if existing_not_working:
+                await update.message.reply_text(
+                    "У вас уже установлен статус «Не работаю сегодня» на сегодня.",
+                    reply_markup=menu_for_user(user_id, update.effective_chat.type)
+                )
+                return
+                
             context.user_data["awaiting_not_working_reason"] = True
             await update.message.reply_text(
                 "Укажите, пожалуйста, причину, почему вы сегодня не работаете (например: заболел, отпуск, отпросился у прораба):",
@@ -4177,7 +4227,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 copied_msg_id = copied_msg.message_id
             except Exception as e:
-                print(f"Ошибка копирования медиа в чат {dest_chat}: {e}")
+                logger.error(f"Ошибка копирования медиа в чат {dest_chat}: {e}")
 
         try:
             if copied_msg_id:
@@ -4195,7 +4245,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         except Exception as e:
             # Предохранитель: если отправка в группу сломалась, дублируем всем админам
-            print(f"Ошибка отправки оценки в чат {dest_chat}: {e}")
+            logger.error(f"Ошибка отправки оценки в чат {dest_chat}: {e}")
             for admin_id in ADMIN_IDS:
                 try:
                     admin_copied_msg_id = None
@@ -4232,7 +4282,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 os.remove(tmp_path)
             except Exception as rm_e:
-                print(f"Ошибка удаления файла {tmp_path}: {rm_e}")
+                logger.warning(f"Ошибка удаления файла {tmp_path}: {rm_e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4246,9 +4296,9 @@ async def post_init(application: Application):
         chat = await application.bot.get_chat(DEFAULT_GROUP_ID)
         name = chat.title or str(DEFAULT_GROUP_ID)
         save_group_name(DEFAULT_GROUP_ID, name)
-        print(f"Группа по умолчанию кэширована: {name}")
+        logger.info(f"Группа по умолчанию кэширована: {name}")
     except Exception as e:
-        print(f"Не удалось получить название DEFAULT_GROUP_ID {DEFAULT_GROUP_ID}: {e}")
+        logger.error(f"Не удалось получить название DEFAULT_GROUP_ID {DEFAULT_GROUP_ID}: {e}")
 
     # Решение проблемы 12: Восстановление автосводок из БД при старте / перезапуске
     reschedule_summary_jobs(application)
@@ -4261,7 +4311,7 @@ async def post_init(application: Application):
 def main():
     init_db()
     if not TOKEN:
-        print("Критическая ошибка: не задан TELEGRAM_TOKEN")
+        logger.error("Критическая ошибка: не задан TELEGRAM_TOKEN")
         return
 
     # Запуск бота с подключением к функции post_init для восстановления кеша и сводок
@@ -4293,6 +4343,7 @@ def main():
             ASK_MOVE_POSITION_ORDER: [MessageHandler(DIALOG_TEXT, edit_move_position_order_finish)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        conversation_timeout=300,
     )
 
     add_handler = ConversationHandler(
@@ -4307,6 +4358,7 @@ def main():
             ASK_NEEDS_DAILY_FACT: [MessageHandler(DIALOG_TEXT, add_worker_needs_daily_fact)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        conversation_timeout=300,
     )
 
     delete_handler = ConversationHandler(
@@ -4317,6 +4369,7 @@ def main():
             ASK_CONFIRM_DELETE: [MessageHandler(DIALOG_TEXT, delete_worker_confirm)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        conversation_timeout=300,
     )
 
     view_dept_handler = ConversationHandler(
@@ -4325,6 +4378,7 @@ def main():
             ASK_DEPARTMENT: [MessageHandler(DIALOG_TEXT, department_workers_show)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        conversation_timeout=300,
     )
 
     # Решение проблемы 12: хэндлер для настройки времени сводки
@@ -4336,6 +4390,7 @@ def main():
             ASK_ORDER_DEPARTMENT: [MessageHandler(DIALOG_TEXT, summary_time_del_finish)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        conversation_timeout=300,
     )
 
     export_handler = ConversationHandler(
@@ -4348,6 +4403,7 @@ def main():
             ASK_GSHEETS_CREDS: [MessageHandler(filters.Document.ALL | filters.TEXT & ~filters.COMMAND, export_gsheets_creds_received)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        conversation_timeout=300,
     )
 
     import_handler = ConversationHandler(
@@ -4356,6 +4412,7 @@ def main():
             ASK_IMPORT_FILE: [MessageHandler(filters.Document.ALL, import_workers_file)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        conversation_timeout=300,
     )
 
     # Регистрация диалогов
@@ -4373,7 +4430,7 @@ def main():
         handle_report
     ))
 
-    print("Бот успешно инициализирован и запущен...")
+    logger.info("Бот успешно инициализирован и запущен...")
     application.run_polling()
 
 if __name__ == "__main__":
