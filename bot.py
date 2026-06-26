@@ -289,6 +289,18 @@ def init_db():
         """
     )
 
+    # Таблица для зафиксированных отправленных предварительных напоминаний (за 10 минут)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sent_pre_reminders (
+            telegram_id INTEGER,
+            report_date TEXT,
+            slot_time TEXT,
+            PRIMARY KEY (telegram_id, report_date, slot_time)
+        )
+        """
+    )
+
     # Таблица для сохранения данных незарегистрированных сотрудников
     conn.execute(
         """
@@ -315,6 +327,7 @@ def init_db():
     
     # Очистка старых напоминаний старше 7 дней
     conn.execute("DELETE FROM sent_reminders WHERE report_date < date('now', '-7 days')")
+    conn.execute("DELETE FROM sent_pre_reminders WHERE report_date < date('now', '-7 days')")
 
     conn.commit()
     conn.close()
@@ -2119,29 +2132,130 @@ async def myreports(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not worker:
             await update.message.reply_text("Вы не зарегистрированы в системе. Обратитесь к администратору.")
             return
-    
-        # Извлекаем отчеты за последние 7 дней для этого сотрудника
+            
         now = now_local()
+        thirty_days_ago = (now - dt_module.timedelta(days=30)).strftime("%Y-%m-%d")
         seven_days_ago = (now - dt_module.timedelta(days=7)).strftime("%Y-%m-%d")
-        reports = conn.execute(
+        
+        # Извлекаем отчеты за последние 30 дней для этого сотрудника
+        reports_30 = conn.execute(
             "SELECT * FROM reports WHERE telegram_id = ? AND report_date >= ? ORDER BY report_date DESC, received_at DESC",
-            (user_id, seven_days_ago)
+            (user_id, thirty_days_ago)
         ).fetchall()
+        
+        # Получаем дату первого отчета
+        join_row = conn.execute(
+            "SELECT MIN(report_date) as start_date FROM reports WHERE telegram_id = ?",
+            (user_id,)
+        ).fetchone()
     finally:
         conn.close()
+
+    # Сначала считаем статистику за 30 дней
+    not_working_dates = set()
+    submitted_statuses = set()
+    submitted_facts = set()
+    total_lates = 0
+    total_remarks = 0
     
-    if not reports:
-        await update.message.reply_text("У вас нет отчетов за последние 7 дней.")
+    reports_7 = []
+    
+    for r in reports_30:
+        r_dict = dict(r)
+        rep_date = r_dict["report_date"]
+        rep_type = r_dict["report_type"]
+        
+        if rep_date >= seven_days_ago:
+            reports_7.append(r)
+            
+        if rep_type == "not_working":
+            not_working_dates.add(rep_date)
+        elif rep_type == "status":
+            slot = r_dict["slot_time"]
+            submitted_statuses.add((rep_date, slot))
+            if r_dict["is_late"]:
+                total_lates += 1
+            if not r_dict["is_ok"]:
+                total_remarks += 1
+        elif rep_type == "daily_fact":
+            submitted_facts.add(rep_date)
+            if r_dict["is_late"]:
+                total_lates += 1
+            if not r_dict["is_ok"]:
+                total_remarks += 1
+
+    start_date_str = thirty_days_ago
+    if join_row and join_row["start_date"]:
+        if join_row["start_date"] > thirty_days_ago:
+            start_date_str = join_row["start_date"]
+            
+    # Расчет ожидаемых отчетов
+    start_dt = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+    end_dt = now.date()
+    
+    expected_status_count = 0
+    expected_fact_count = 0
+    
+    current_date_it = start_dt
+    while current_date_it <= end_dt:
+        date_it_str = current_date_it.strftime("%Y-%m-%d")
+        if date_it_str not in not_working_dates:
+            slots = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
+            if date_it_str == now.strftime("%Y-%m-%d"):
+                current_mins = now.hour * 60 + now.minute
+                for slot in slots:
+                    hour, minute = map(int, slot.split(":"))
+                    slot_mins = hour * 60 + minute
+                    if current_mins > slot_mins + LATE_THRESHOLD_MIN or (date_it_str, slot) in submitted_statuses:
+                        expected_status_count += 1
+                if worker["needs_daily_fact"]:
+                    if date_it_str in submitted_facts:
+                        expected_fact_count += 1
+                    else:
+                        last_slot = slots[-1]
+                        hour, minute = map(int, last_slot.split(":"))
+                        slot_mins = hour * 60 + minute
+                        if current_mins > slot_mins + 60:
+                            expected_fact_count += 1
+            else:
+                expected_status_count += len(slots)
+                if worker["needs_daily_fact"]:
+                    expected_fact_count += 1
+        current_date_it += dt_module.timedelta(days=1)
+        
+    total_expected = expected_status_count + expected_fact_count
+    total_submitted = len(submitted_statuses) + len(submitted_facts)
+    
+    percent_submitted = 100.0
+    if total_expected > 0:
+        percent_submitted = (total_submitted / total_expected) * 100.0
+        
+    stats_header = (
+        f"📊 *Ваша дисциплина за последние 30 дней:*\n"
+        f"📈 *Сдано отчетов:* {percent_submitted:.1f}% ({total_submitted} из {total_expected})\n"
+        f"⏰ *Опозданий:* {total_lates}\n"
+        f"⚠️ *Замечаний:* {total_remarks}\n"
+        f"──────────────────────────\n"
+    )
+
+    if not reports_7:
+        await update.message.reply_text(
+            stats_header + "\nУ вас нет отчетов за последние 7 дней для детальной истории.",
+            parse_mode="Markdown"
+        )
         return
 
-    lines = [f"📋 Ваши отчеты за последние 7 дней ({worker['last_name']} {worker['first_name']}):\n"]
+    lines = [
+        stats_header,
+        f"📋 *Ваши отчеты за последние 7 дней ({worker['last_name']} {worker['first_name']}):*\n"
+    ]
     current_date = None
-    for r in reports:
+    for r in reports_7:
         r_dict = dict(r)
         rep_date = r_dict["report_date"]
         if rep_date != current_date:
             current_date = rep_date
-            lines.append(f"\n📅 {current_date}:")
+            lines.append(f"\n📅 *{current_date}:*")
         
         slot_time = r_dict["slot_time"]
         rep_type_str = f"Статус {slot_time}" if r_dict["report_type"] == "status" else "Факт дня (Итог)"
@@ -2156,7 +2270,124 @@ async def myreports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     full_text = "\n".join(lines)
     for part in split_message(full_text):
-        await update.message.reply_text(part)
+        await update.message.reply_text(part, parse_mode="Markdown")
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    conn = get_db()
+    try:
+        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (user_id,)).fetchone()
+        if not worker:
+            await update.message.reply_text("Вы не зарегистрированы в системе. Обратитесь к администратору.")
+            return
+        
+        now = now_local()
+        date_str = now.strftime("%Y-%m-%d")
+        
+        reports = conn.execute(
+            "SELECT * FROM reports WHERE telegram_id = ? AND report_date = ?",
+            (user_id, date_str)
+        ).fetchall()
+    finally:
+        conn.close()
+
+    status_reps = {}
+    fact_reps = []
+    not_working = None
+    
+    for r in reports:
+        r_dict = dict(r)
+        if r_dict["report_type"] == "status":
+            slot = r_dict["slot_time"]
+            status_reps[slot] = r_dict
+        elif r_dict["report_type"] == "daily_fact":
+            fact_reps.append(r_dict)
+        elif r_dict["report_type"] == "not_working":
+            not_working = r_dict
+
+    name = f"{worker['last_name']} {worker['first_name']}"
+    lines = [
+        f"📊 *Ваш статус на сегодня ({now.strftime('%d.%m.%Y')})*",
+        f"👤 *Сотрудник:* {name}",
+        f"💼 *Отдел/Должность:* {worker['position']}",
+        f"📅 *График:* {worker['schedule']}",
+        ""
+    ]
+    
+    if not worker["is_active"]:
+        lines.append("🏝 Вы отмечены как неактивный (в отпуске / на больничном).")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+        
+    if not_working:
+        reason = not_working["format_comment"] or "не указана"
+        lines.append(f"🛌 *Сегодня выходной:* Вы отметили, что не работаете сегодня (Причина: {reason}).")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    # Check status slots
+    schedule_slots = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
+    status_segments = []
+    issues_list = []
+    
+    submitted_count = 0
+    expected_count = len(schedule_slots)
+    
+    for slot in schedule_slots:
+        rep = status_reps.get(slot)
+        if rep:
+            submitted_count += 1
+            status_icon = "✅" if rep["is_ok"] else "⚠️"
+            late_icon = " ⏰" if rep["is_late"] else ""
+            status_segments.append(f"• *{slot}*: {status_icon} Сдан{late_icon}")
+            if not rep["is_ok"]:
+                comment = rep["format_comment"] or "Есть замечание"
+                if comment.startswith("не ОК, "):
+                    comment = comment[len("не ОК, "):]
+                elif comment.startswith("не ОК: "):
+                    comment = comment[len("не ОК: "):]
+                issues_list.append(f"  └ ⚠️ {slot} — {comment}")
+        else:
+            # Check if slot time has passed
+            sh, sm = map(int, slot.split(":"))
+            current_mins = now.hour * 60 + now.minute
+            slot_mins = sh * 60 + sm
+            if current_mins > slot_mins + LATE_THRESHOLD_MIN:
+                status_segments.append(f"• *{slot}*: ❌ Пропущен")
+            else:
+                status_segments.append(f"• *{slot}*: ⏳ Ожидается")
+                
+    lines.append(f"⏱ *Отчёты за слоты ({submitted_count}/{expected_count}):*")
+    lines.extend(status_segments)
+    lines.append("")
+    
+    # Check daily_fact
+    if worker["needs_daily_fact"]:
+        if fact_reps:
+            f_rep = fact_reps[-1]
+            if f_rep["is_ok"]:
+                fact_str = "✅ Сдан"
+            else:
+                comment = f_rep["format_comment"] or "Есть замечание"
+                if comment.startswith("не ОК, "):
+                    comment = comment[len("не ОК, "):]
+                elif comment.startswith("не ОК: "):
+                    comment = comment[len("не ОК: "):]
+                fact_str = f"⚠️ Замечание ({comment})"
+        else:
+            fact_str = "❌ Не отправлен"
+    else:
+        fact_str = "⚪ Не требуется"
+        
+    lines.append(f"📋 *Итог дня (Факт дня):* {fact_str}")
+    
+    if issues_list:
+        lines.append("")
+        lines.append("⚠️ *Замечания по сегодняшним отчетам:*")
+        lines.extend(issues_list)
+        
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 def format_date_no_year(date_str) -> str:
@@ -3640,14 +3871,30 @@ async def check_missing_reports_job(context: ContextTypes.DEFAULT_TYPE):
     ).fetchall()
     submitted_worker_slots = {(r["telegram_id"], r["slot_time"]) for r in reports}
     
+    # Исключаем сотрудников, у которых сегодня выходной/не работают
+    not_working_reports = conn.execute(
+        "SELECT telegram_id FROM reports WHERE report_date = ? AND report_type = 'not_working'",
+        (date_str,)
+    ).fetchall()
+    not_working_worker_ids = {r["telegram_id"] for r in not_working_reports}
+    
     sent = conn.execute(
         "SELECT telegram_id, slot_time FROM sent_reminders WHERE report_date = ?",
         (date_str,)
     ).fetchall()
     sent_worker_slots = {(s["telegram_id"], s["slot_time"]) for s in sent}
+
+    sent_pre = conn.execute(
+        "SELECT telegram_id, slot_time FROM sent_pre_reminders WHERE report_date = ?",
+        (date_str,)
+    ).fetchall()
+    sent_pre_worker_slots = {(s["telegram_id"], s["slot_time"]) for s in sent_pre}
     
     for w in workers:
         tid = w["telegram_id"]
+        if tid in not_working_worker_ids:
+            continue
+            
         sched_slots = SCHEDULES.get(w["schedule"], SCHEDULE_A)
         
         for slot in sched_slots:
@@ -3657,6 +3904,25 @@ async def check_missing_reports_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 continue
                 
+            # 1. Предварительное напоминание (за 10 минут до слота)
+            if current_mins >= slot_mins - 12 and current_mins <= slot_mins - 6:
+                if (tid, slot) not in submitted_worker_slots and (tid, slot) not in sent_pre_worker_slots:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO sent_pre_reminders (telegram_id, report_date, slot_time) VALUES (?, ?, ?)",
+                        (tid, date_str, slot)
+                    )
+                    conn.commit()
+                    
+                    try:
+                        await context.bot.send_message(
+                            chat_id=tid,
+                            text=f"🔔 *Внимание!* Через 10 минут нужно отправить отчёт за *{slot}*.",
+                            parse_mode="Markdown"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Ошибка личного предварительного уведомления {tid} за слот {slot}: {e}")
+
+            # 2. Опоздание / Забытый отчет (через 30 минут после слота)
             if current_mins >= slot_mins + 25 and current_mins <= slot_mins + 55:
                 if (tid, slot) not in submitted_worker_slots and (tid, slot) not in sent_worker_slots:
                     conn.execute(
@@ -4186,16 +4452,45 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         w_name = f"{worker['last_name']} {worker['first_name']}"
         
         # Информирование сотрудника
+        time_str = now.strftime("%H:%M")
+        if ai_res["report_type"] == "status" and nearest_slot:
+            sh, sm = map(int, nearest_slot.split(":"))
+            slot_mins = sh * 60 + sm
+            current_mins = now.hour * 60 + now.minute
+            diff_mins = current_mins - slot_mins
+            if diff_mins > 0:
+                if diff_mins > LATE_THRESHOLD_MIN:
+                    late_str = f" (опоздание {diff_mins} мин)"
+                else:
+                    late_str = f" (вовремя, +{diff_mins} мин)"
+            else:
+                late_str = f" (раньше на {abs(diff_mins)} мин)"
+            info_suffix = f" за слот *{nearest_slot}* принят в *{time_str}*{late_str}"
+        else:
+            info_suffix = f" (Итог дня) принят в *{time_str}*"
+
         if ai_res["is_ok"]:
             if is_addon:
-                await update.message.reply_text("🔄 Дополнение к отчёту успешно проверено ИИ и принято без замечаний! Спасибо.")
+                await update.message.reply_text(
+                    f"🔄 Дополнение к отчёту{info_suffix}. Успешно проверено ИИ и принято без замечаний! Спасибо.",
+                    parse_mode="Markdown"
+                )
             else:
-                await update.message.reply_text("✅ Отчёт успешно проверен ИИ и принят без замечаний! Спасибо.")
+                await update.message.reply_text(
+                    f"✅ Отчёт{info_suffix} успешно проверен ИИ и принят без замечаний! Спасибо.",
+                    parse_mode="Markdown"
+                )
         else:
             if is_addon:
-                await update.message.reply_text(f"⚠️ Оценка дополненного отчета: {ai_res['employee_message']}")
+                await update.message.reply_text(
+                    f"⚠️ Дополнение к отчёту{info_suffix}.\nОценка дополненного отчета: {ai_res['employee_message']}",
+                    parse_mode="Markdown"
+                )
             else:
-                await update.message.reply_text(f"⚠️ Оценка отчета: {ai_res['employee_message']}")
+                await update.message.reply_text(
+                    f"⚠️ Отчёт{info_suffix}.\nОценка отчета: {ai_res['employee_message']}",
+                    parse_mode="Markdown"
+                )
 
         # Решение проблемы 7: Кнопка «Исправить оценку» во всех отчетах для администраторов или в группе
         dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
@@ -4303,10 +4598,10 @@ async def post_init(application: Application):
     # Решение проблемы 12: Восстановление автосводок из БД при старте / перезапуске
     reschedule_summary_jobs(application)
 
-    # Периодическая фоновая проверка забытых/пропущенных отчетов (через 30 минут после слотов)
+    # Периодическая фоновая проверка забытых/пропущенных отчетов (каждые 5 минут)
     job_queue = application.job_queue
     if job_queue:
-        job_queue.run_repeating(check_missing_reports_job, interval=1800, first=10)
+        job_queue.run_repeating(check_missing_reports_job, interval=300, first=10)
 
 def main():
     init_db()
@@ -4320,6 +4615,7 @@ def main():
     # Точечные команды и кнопки меню (срабатывают моментально)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("myreports", myreports))
+    application.add_handler(CommandHandler("status", status))
     application.add_handler(MessageHandler(filters.Regex("^🆔 ID чата$"), get_chat_id))
     application.add_handler(MessageHandler(filters.Regex("^📊 Сводка сейчас$"), send_summary_now))
     application.add_handler(MessageHandler(filters.Regex("^📣 Напомнить всем$"), remind_all_missing))
