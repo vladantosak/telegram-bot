@@ -235,9 +235,19 @@ def init_db():
         ("needs_daily_fact", "INTEGER NOT NULL DEFAULT 1"),
         ("sort_order", "INTEGER NOT NULL DEFAULT 0"),
         ("is_active", "INTEGER NOT NULL DEFAULT 1"),
+        ("object_id", "TEXT NOT NULL DEFAULT 'Основной'"),
     ]:
         if col not in cols:
             conn.execute(f"ALTER TABLE workers ADD COLUMN {col} {definition}")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS objects (
+            object_id TEXT PRIMARY KEY,
+            group_id INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
 
     conn.execute(
         """
@@ -382,12 +392,12 @@ def get_workers_by_position(position: str):
     conn.close()
     return rows
 
-def upsert_worker(telegram_id: int, last_name: str, first_name: str, position: str, group_id: int, schedule: str, needs_daily_fact: bool, sort_order: int = 0, is_active: int = 1):
+def upsert_worker(telegram_id: int, last_name: str, first_name: str, position: str, group_id: int, schedule: str, needs_daily_fact: bool, sort_order: int = 0, is_active: int = 1, object_id: str = 'Основной'):
     conn = get_db()
     conn.execute(
         """
-        INSERT INTO workers (telegram_id, last_name, first_name, position, group_id, schedule, needs_daily_fact, sort_order, is_active)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO workers (telegram_id, last_name, first_name, position, group_id, schedule, needs_daily_fact, sort_order, is_active, object_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(telegram_id) DO UPDATE SET
             last_name=excluded.last_name,
             first_name=excluded.first_name,
@@ -396,12 +406,44 @@ def upsert_worker(telegram_id: int, last_name: str, first_name: str, position: s
             schedule=excluded.schedule,
             needs_daily_fact=excluded.needs_daily_fact,
             sort_order=excluded.sort_order,
-            is_active=excluded.is_active
+            is_active=excluded.is_active,
+            object_id=excluded.object_id
         """,
-        (telegram_id, last_name, first_name, position, group_id, schedule, int(needs_daily_fact), sort_order, is_active),
+        (telegram_id, last_name, first_name, position, group_id, schedule, int(needs_daily_fact), sort_order, is_active, object_id),
     )
     conn.commit()
     conn.close()
+
+def get_object_group(object_id: str) -> int:
+    conn = get_db()
+    row = conn.execute("SELECT group_id FROM objects WHERE object_id = ?", (object_id,)).fetchone()
+    conn.close()
+    if row:
+        return row["group_id"]
+    return 0
+
+def save_object_group(object_id: str, group_id: int):
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO objects (object_id, group_id) VALUES (?, ?)
+        ON CONFLICT(object_id) DO UPDATE SET group_id=excluded.group_id
+        """,
+        (object_id, group_id)
+    )
+    conn.commit()
+    conn.close()
+
+def get_worker_target_group(worker) -> int:
+    try:
+        w_dict = dict(worker)
+    except (TypeError, ValueError):
+        return DEFAULT_GROUP_ID
+    if "object_id" in w_dict and w_dict["object_id"]:
+        obj_group = get_object_group(w_dict["object_id"])
+        if obj_group and obj_group != 0:
+            return obj_group
+    return w_dict.get("group_id") or DEFAULT_GROUP_ID
 
 def read_excel(file_path: str):
     wb = load_workbook(file_path, data_only=True)
@@ -466,8 +508,10 @@ def read_excel(file_path: str):
         
         # We also check if user has name/position/brigade/object columns which we map gracefully:
         # object column could be mapped to position/department if not specified
+        object_id = "Основной"
         if idx_object != -1 and idx_object < len(row_values) and row_values[idx_object] is not None:
             obj_val = str(row_values[idx_object]).strip()
+            object_id = obj_val
             if pos_val is None:
                 pos_val = obj_val
             else:
@@ -534,13 +578,14 @@ def read_excel(file_path: str):
             "position": position,
             "group_id": group_id,
             "schedule": schedule,
-            "needs_daily_fact": needs_daily_fact
+            "needs_daily_fact": needs_daily_fact,
+            "object_id": object_id
         })
         
     return workers
 
 def update_worker_field(telegram_id: int, field: str, value):
-    allowed = {"last_name", "first_name", "position", "group_id", "schedule", "needs_daily_fact", "sort_order", "is_active"}
+    allowed = {"last_name", "first_name", "position", "group_id", "schedule", "needs_daily_fact", "sort_order", "is_active", "object_id"}
     if field not in allowed:
         raise ValueError(f"Недопустимое поле: {field}")
     conn = get_db()
@@ -752,6 +797,23 @@ def reschedule_summary_jobs(application: Application):
         logger.info("Запланирована ежедневная проверка на 09:00 для еженедельных/ежемесячных автоотчетов")
     except Exception as e:
         logger.error(f"Ошибка при планировании еженедельного/ежемесячного отчета: {e}")
+
+    # Удаление существующих задач резервного копирования
+    for job in job_queue.get_jobs_by_name("daily_backup"):
+        job.schedule_removal()
+        
+    # Планируем бэкап на 03:00 ночи ежедневно
+    try:
+        time_obj_backup = dt_module.time(hour=3, minute=0, tzinfo=LOCAL_TZ)
+        job_queue.run_daily(
+            daily_backup_callback,
+            time=time_obj_backup,
+            days=(0, 1, 2, 3, 4, 5, 6),
+            name="daily_backup"
+        )
+        logger.info("Запланировано ежедневное резервное копирование на 03:00")
+    except Exception as e:
+        logger.error(f"Ошибка при планировании бэкапа: {e}")
 
 async def scheduled_summary_callback(context: ContextTypes.DEFAULT_TYPE):
     now = now_local()
@@ -1489,7 +1551,34 @@ def generate_daily_summary_text(report_date: str) -> str:
     for dept, dept_workers in workers_by_dept.items():
         if not dept_workers:
             continue
-        summary_lines.append(f"🏢 Отдел: {dept}")
+            
+        # Рассчитываем статистику отдела за сегодня
+        dept_expected = 0
+        dept_submitted = 0
+        for w in dept_workers:
+            if not w["is_active"]:
+                continue
+            w_reports = reports_by_worker.get(w["telegram_id"], {"status": {}, "daily_fact": [], "not_working": None})
+            if w_reports.get("not_working"):
+                continue
+                
+            schedule_slots = SCHEDULES.get(w["schedule"], SCHEDULE_A)
+            dept_expected += len(schedule_slots)
+            
+            for slot in schedule_slots:
+                if slot in w_reports["status"]:
+                    dept_submitted += 1
+                    
+            if w["needs_daily_fact"]:
+                dept_expected += 1
+                if w_reports["daily_fact"]:
+                    dept_submitted += 1
+                    
+        dept_percent = (dept_submitted / dept_expected * 100) if dept_expected > 0 else 100.0
+        
+        summary_lines.append(f"🏢 *Отдел: {dept}*")
+        if dept_expected > 0:
+            summary_lines.append(f"📈 *Отдел выполнил {dept_submitted}/{dept_expected} отчетов ({dept_percent:.1f}%)*")
         summary_lines.append("──────────────────────────")
         for w in dept_workers:
             tid = w["telegram_id"]
@@ -1914,10 +2003,12 @@ async def find_worker_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         fact = "да" if worker["needs_daily_fact"] else "нет"
         gname = await get_group_name_async(context.bot, worker["group_id"])
         active_str = "Активен" if worker["is_active"] else "В отпуске / на больничном"
+        object_name = worker.get("object_id", "Основной")
         
         info = (
             f"🔍 Найден сотрудник:\n\n"
             f"👤 {worker['last_name']} {worker['first_name']}\n"
+            f"Объект: {object_name}\n"
             f"Отдел: {worker['position']}\n"
             f"График: {worker['schedule']} ({schedule_str})\n"
             f"Группа: {gname}\n"
@@ -1931,9 +2022,10 @@ async def find_worker_command(update: Update, context: ContextTypes.DEFAULT_TYPE
                 ["📅 История за неделю", "✏️ Номер в списке"],
                 ["✏️ Изменить фамилию", "✏️ Изменить имя"],
                 ["✏️ Изменить отдел", "✏️ Изменить график"],
-                ["✏️ Изменить группу", "✏️ Факт дня"],
-                ["✏️ Статус работы", "🔼 Вверх в списке"],
-                ["🔽 Вниз в списке", "❌ Отмена"]
+                ["✏️ Изменить группу", "✏️ Изменить объект"],
+                ["✏️ Факт дня", "✏️ Статус работы"],
+                ["🔼 Вверх в списке", "🔽 Вниз в списке"],
+                ["❌ Отмена"]
             ],
             resize_keyboard=True,
         )
@@ -2105,7 +2197,8 @@ async def import_workers_file(update: Update, context: ContextTypes.DEFAULT_TYPE
                     position=w["position"],
                     group_id=w["group_id"],
                     schedule=w["schedule"],
-                    needs_daily_fact=w["needs_daily_fact"]
+                    needs_daily_fact=w["needs_daily_fact"],
+                    object_id=w.get("object_id", "Основной")
                 )
                 success_count += 1
             except Exception as ex:
@@ -2186,7 +2279,8 @@ async def list_workers_select(update: Update, context: ContextTypes.DEFAULT_TYPE
     fact = "да" if worker["needs_daily_fact"] else "нет"
     gname = await get_group_name_async(context.bot, worker["group_id"])
     active_str = "Активен" if worker["is_active"] else "В отпуске / на больничном"
-    info = f"👤 {worker['last_name']} {worker['first_name']}\nОтдел: {worker['position']}\nГрафик: {worker['schedule']} ({schedule_str})\nГруппа: {gname}\nФакт дня: {fact}\nСтатус работы: {active_str}\n\nЧто хотите сделать?"
+    object_name = worker.get("object_id", "Основной")
+    info = f"👤 {worker['last_name']} {worker['first_name']}\nОбъект: {object_name}\nОтдел: {worker['position']}\nГрафик: {worker['schedule']} ({schedule_str})\nГруппа: {gname}\nФакт дня: {fact}\nСтатус работы: {active_str}\n\nЧто хотите сделать?"
 
     # Добавление кнопки Истории еженедельных оценок (проблема 6)
     kbd = ReplyKeyboardMarkup(
@@ -2194,9 +2288,10 @@ async def list_workers_select(update: Update, context: ContextTypes.DEFAULT_TYPE
             ["📅 История за неделю", "✏️ Номер в списке"],
             ["✏️ Изменить фамилию", "✏️ Изменить имя"],
             ["✏️ Изменить отдел", "✏️ Изменить график"],
-            ["✏️ Изменить группу", "✏️ Факт дня"],
-            ["✏️ Статус работы", "🔼 Вверх в списке"],
-            ["🔽 Вниз в списке", "❌ Отмена"]
+            ["✏️ Изменить группу", "✏️ Изменить объект"],
+            ["✏️ Факт дня", "✏️ Статус работы"],
+            ["🔼 Вверх в списке", "🔽 Вниз в списке"],
+            ["❌ Отмена"]
         ],
         resize_keyboard=True,
     )
@@ -2242,6 +2337,7 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         "✏️ Изменить имя": ("first_name", "Введите новое имя:"),
         "✏️ Изменить отдел": ("position", "Введите новое название отдела:"),
         "✏️ Изменить группу": ("group_id", "Введите новый ID группы Telegram (0 = по умолчанию):"),
+        "✏️ Изменить объект": ("object_id", "Введите название объекта для сотрудника (например: Основной, Северный):"),
         "✏️ Изменить график": ("schedule", None),
         "✏️ Факт дня": ("needs_daily_fact", None),
         "✏️ Статус работы": ("is_active", None),
@@ -3326,6 +3422,138 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
                     ws.cell(row=r_idx, column=c_idx).border = grid_border
                     
             curr_row += num_rows
+
+    # ── Создание второго листа: Аналитика ──
+    try:
+        ws_anal = wb.create_sheet(title="Аналитика")
+        ws_anal.views.sheetView[0].showGridLines = True
+        
+        # Styles for Analytics
+        anal_header_font = Font(name=font_family, size=11, bold=True, color="000000")
+        anal_cell_font = Font(name=font_family, size=11, color="000000")
+        
+        # Determine the weeks present in unique_dates
+        import datetime as dt_mod
+        week_keys = set()
+        for d_str in unique_dates:
+            try:
+                dt_val = dt_mod.datetime.strptime(d_str, "%Y-%m-%d").date()
+                year, week, weekday = dt_val.isocalendar()
+                week_keys.add((year, week))
+            except Exception:
+                continue
+                
+        sorted_weeks = sorted(list(week_keys))
+        
+        # Headers
+        ws_anal.cell(row=1, column=1, value="Сотрудник").font = anal_header_font
+        ws_anal.cell(row=1, column=1).alignment = center_align
+        ws_anal.cell(row=1, column=1).border = grid_border
+        
+        ws_anal.cell(row=1, column=2, value="Отдел").font = anal_header_font
+        ws_anal.cell(row=1, column=2).alignment = center_align
+        ws_anal.cell(row=1, column=2).border = grid_border
+        
+        ws_anal.cell(row=1, column=3, value="Объект").font = anal_header_font
+        ws_anal.cell(row=1, column=3).alignment = center_align
+        ws_anal.cell(row=1, column=3).border = grid_border
+        
+        # Week headers and map them to columns
+        col_idx = 4
+        week_columns = {} # (year, week): col_idx
+        for (year, week) in sorted_weeks:
+            # Get monday and sunday
+            d = dt_mod.date(year, 1, 4)
+            d = d + dt_mod.timedelta(weeks=week - 1)
+            mon = d - dt_mod.timedelta(days=d.weekday())
+            sun = mon + dt_mod.timedelta(days=6)
+            
+            mon_str = mon.strftime("%d.%m")
+            sun_str = sun.strftime("%d.%m")
+            header_val = f"Нед. {week:02d} ({mon_str}-{sun_str})"
+            
+            cell = ws_anal.cell(row=1, column=col_idx, value=header_val)
+            cell.font = anal_header_font
+            cell.alignment = center_align
+            cell.border = grid_border
+            
+            week_columns[(year, week)] = col_idx
+            col_idx += 1
+            
+        # Add worker rows
+        conn_anal = get_db()
+        row_idx = 2
+        
+        green_fill = PatternFill(start_color="E2F0D9", end_color="E2F0D9", fill_type="solid")
+        yellow_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+        red_fill = PatternFill(start_color="FCE4E4", end_color="FCE4E4", fill_type="solid")
+        gray_light_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+        
+        for dept_name in sorted_depts:
+            for worker in workers_by_dept[dept_name]:
+                ws_anal.cell(row=row_idx, column=1, value=f"{worker['last_name']} {worker['first_name']}").font = anal_cell_font
+                ws_anal.cell(row=row_idx, column=1).border = grid_border
+                
+                ws_anal.cell(row=row_idx, column=2, value=worker['position']).font = anal_cell_font
+                ws_anal.cell(row=row_idx, column=2).border = grid_border
+                
+                ws_anal.cell(row=row_idx, column=3, value=worker.get('object_id', 'Основной')).font = anal_cell_font
+                ws_anal.cell(row=row_idx, column=3).border = grid_border
+                
+                # Calculate for each week
+                for (year, week), col_c in week_columns.items():
+                    # calculate start and end dates
+                    d = dt_mod.date(year, 1, 4)
+                    d = d + dt_mod.timedelta(weeks=week - 1)
+                    mon = d - dt_mod.timedelta(days=d.weekday())
+                    sun = mon + dt_mod.timedelta(days=6)
+                    
+                    mon_str = mon.strftime("%Y-%m-%d")
+                    sun_str = sun.strftime("%Y-%m-%d")
+                    
+                    cell = ws_anal.cell(row=row_idx, column=col_c)
+                    cell.border = grid_border
+                    cell.font = anal_cell_font
+                    cell.alignment = center_align
+                    
+                    try:
+                        stats = calculate_worker_stats(worker, mon_str, sun_str, conn_anal)
+                        if stats["expected"] > 0:
+                            percent_val = stats["percent"] / 100.0
+                            cell.value = percent_val
+                            cell.number_format = '0.0%'
+                            
+                            # Heatmap color scale
+                            if stats["percent"] >= 90:
+                                cell.fill = green_fill
+                            elif stats["percent"] >= 70:
+                                cell.fill = yellow_fill
+                            else:
+                                cell.fill = red_fill
+                        else:
+                            cell.value = "-"
+                            cell.fill = gray_light_fill
+                    except Exception as e:
+                        logger.error(f"Error calculating weekly stats for worker {worker['telegram_id']} in week {year}-W{week}: {e}")
+                        cell.value = "Ошибка"
+                        
+                row_idx += 1
+                
+        conn_anal.close()
+        
+        # Auto-adjust column widths for Analytics sheet
+        for col in ws_anal.columns:
+            max_len = 0
+            for cell in col:
+                val_str = str(cell.value or '')
+                if cell.number_format == '0.0%' and isinstance(cell.value, float):
+                    val_str = f"{cell.value * 100:.1f}%"
+                max_len = max(max_len, len(val_str))
+            col_letter = o_utils.get_column_letter(col[0].column)
+            ws_anal.column_dimensions[col_letter].width = max(max_len + 4, 12)
+            
+    except Exception as ex:
+        logger.error(f"Не удалось сформировать лист Аналитика в Excel: {ex}")
             
     # Save Workbook to dynamic ByteIO
     from io import BytesIO
@@ -5154,6 +5382,150 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Ошибка удаления файла {tmp_path}: {rm_e}")
 
 
+# ── Новые функции для Прораб-Бот ──
+
+async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id) and get_worker(user_id) is None:
+        await update.message.reply_text("Эта команда доступна только сотрудникам и администраторам.")
+        return
+        
+    await update.message.reply_text("⏳ Расчитываю рейтинг лучших сотрудников за последние 30 дней...")
+    
+    now = now_local()
+    start_dt = now - dt_module.timedelta(days=29)
+    start_str = start_dt.strftime("%Y-%m-%d")
+    end_str = now.strftime("%Y-%m-%d")
+    
+    conn = get_db()
+    try:
+        workers = conn.execute("SELECT * FROM workers WHERE is_active = 1").fetchall()
+        leaderboard = []
+        
+        for w in workers:
+            lastname_lower = (w["last_name"] or "").lower()
+            firstname_lower = (w["first_name"] or "").lower()
+            dept_lower = (w["position"] or "").lower()
+            if any(x in lastname_lower or x in firstname_lower or x in dept_lower for x in ("отмена", "test", "тест")):
+                continue
+                
+            stats = calculate_worker_stats(w, start_str, end_str, conn)
+            if stats["expected"] > 0:
+                leaderboard.append((w, stats))
+        
+        # Сортировка по проценту, количеству сданных, отсутствию опозданий
+        leaderboard.sort(key=lambda x: (x[1]["percent"], x[1]["submitted"], -x[1]["lates"]), reverse=True)
+        
+        top_5 = leaderboard[:5]
+        if not top_5:
+            await update.message.reply_text("Нет данных по сотрудникам за последний месяц.")
+            return
+            
+        lines = [
+            f"🏆 *Топ-5 лучших сотрудников по дисциплине* за последние 30 дней:\n"
+            f"({start_dt.strftime('%d.%m.%Y')} - {now.strftime('%d.%m.%Y')})\n"
+        ]
+        
+        medal_icons = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        for idx, (w, stats) in enumerate(top_5):
+            name = f"{w['last_name']} {w['first_name']}"
+            icon = medal_icons[idx]
+            lines.append(
+                f"{icon} *{name}* ({w['position']})\n"
+                f"   • Выполнение: *{stats['percent']:.1f}%*\n"
+                f"   • Сдано отчетов: {stats['submitted']} из {stats['expected']}\n"
+                f"   • Опозданий: {stats['lates']} | Замечаний: {stats['remarks']}\n"
+            )
+        
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Ошибка при расчете команды /top: {e}")
+        await update.message.reply_text("❌ Произошла ошибка при расчете рейтинга.")
+    finally:
+        conn.close()
+
+async def set_object_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+        
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "📝 *Установка группы для объекта*:\n\n"
+            "Вы можете вызвать эту команду в группе:\n"
+            "`/set_object_group НазваниеОбъекта`\n"
+            "или указав ID группы:\n"
+            "`/set_object_group НазваниеОбъекта -100xxxxxxxxx`",
+            parse_mode="Markdown"
+        )
+        return
+        
+    obj_name = args[0]
+    if len(args) > 1:
+        try:
+            group_id = int(args[1])
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат ID группы. Это должно быть целое число.")
+            return
+    else:
+        group_id = update.effective_chat.id
+        if update.effective_chat.type == "private":
+            await update.message.reply_text("❌ В личном чате необходимо указать ID группы вручную: `/set_object_group ИмяОбъекта ID`.")
+            return
+            
+    save_object_group(obj_name, group_id)
+    await update.message.reply_text(
+        f"✅ Объект «*{obj_name}*» успешно привязан к группе с ID `{group_id}`!",
+        parse_mode="Markdown"
+    )
+
+async def daily_backup_callback(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Запуск ежедневного резервного копирования базы данных...")
+    now = now_local()
+    date_str = now.strftime("%Y_%m_%d")
+    backup_filename = f"backup_{date_str}.sql"
+    backup_path = os.path.join(os.getcwd(), backup_filename)
+    
+    try:
+        import sqlite3
+        conn = sqlite3.connect(DB_PATH)
+        with open(backup_path, "w", encoding="utf-8") as f:
+            for line in conn.iterdump():
+                f.write(f"{line}\n")
+        conn.close()
+        logger.info(f"Дамп базы данных успешно сохранен в {backup_path}")
+        
+        for admin_id in ADMIN_IDS:
+            try:
+                with open(backup_path, "rb") as backup_file:
+                    await context.bot.send_document(
+                        chat_id=admin_id,
+                        document=backup_file,
+                        filename=backup_filename,
+                        caption=f"💾 Автоматическая резервная копия базы данных за {now.strftime('%d.%m.%Y %H:%M')}"
+                    )
+                logger.info(f"Бэкап успешно отправлен администратору {admin_id}")
+            except Exception as ex:
+                logger.error(f"Не удалось отправить бэкап администратору {admin_id}: {ex}")
+                
+    except Exception as e:
+        logger.error(f"Критическая ошибка при создании бэкапа базы данных: {e}")
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=f"❌ Ошибка автоматического резервного копирования базы данных: {e}")
+            except Exception:
+                pass
+    finally:
+        if os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+                logger.info(f"Временный файл бэкапа {backup_path} удален")
+            except Exception:
+                pass
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Инициализация и запуск приложения
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5191,6 +5563,8 @@ def main():
     application.add_handler(CommandHandler("myreports", myreports))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("threshold", set_threshold_command))
+    application.add_handler(CommandHandler("top", top_command))
+    application.add_handler(CommandHandler("set_object_group", set_object_group_command))
     application.add_handler(MessageHandler(filters.Regex("^🆔 ID чата$"), get_chat_id))
     application.add_handler(MessageHandler(filters.Regex("^📊 Сводка сейчас$"), send_summary_now))
     application.add_handler(MessageHandler(filters.Regex("^📣 Напомнить всем$"), remind_all_missing))
