@@ -128,7 +128,10 @@ SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
     ASK_SUMMARY_DATE,
     ASK_EDIT_SCHEDULE_DEPT,
     ASK_DEPT_SCHEDULE_VAL,
-) = range(32)
+    ASK_VACATION_START,
+    ASK_VACATION_END,
+    ASK_VACATION_REASON,
+) = range(35)
 
 # Клавиатуры
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -153,63 +156,46 @@ DIALOG_TEXT = filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{CANCEL_TEXT}$
 # База данных
 # ══════════════════════════════════════════════════════════════════════════════
 
-import threading
-import atexit
-import weakref
+import sqlite3
+import asyncio
 
-_local_db = threading.local()
-_all_connections = weakref.WeakSet()
+# Глобальные асинхронные блокировки пользователей для предотвращения race condition в отчетах
+user_locks = {}
 
-class ThreadConnectionContainer:
-    def __init__(self, conn):
-        self.connection = conn
-    def __del__(self):
-        try:
-            self.connection.close()
-        except Exception:
-            pass
+def get_user_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in user_locks:
+        user_locks[user_id] = asyncio.Lock()
+    return user_locks[user_id]
 
-def _close_all_connections_at_exit():
-    for container in list(_all_connections):
-        try:
-            container.connection.close()
-        except Exception:
-            pass
-
-atexit.register(_close_all_connections_at_exit)
-
-class SQLiteConnectionProxy:
-    def __init__(self, conn):
-        self._conn = conn
-    def __getattr__(self, name):
-        return getattr(self._conn, name)
-    def close(self):
-        # No-op to pool/reuse connection per thread
+def is_quiet_mode_enabled() -> bool:
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT value FROM settings WHERE key = 'quiet_mode_enabled'").fetchone()
+        conn.close()
+        if row:
+            return row["value"] == "1"
+    except Exception:
         pass
-    def commit(self):
-        self._conn.commit()
-    def rollback(self):
-        self._conn.rollback()
-    def execute(self, *args, **kwargs):
-        return self._conn.execute(*args, **kwargs)
-    def executemany(self, *args, **kwargs):
-        return self._conn.executemany(*args, **kwargs)
-    def cursor(self, *args, **kwargs):
-        return self._conn.cursor(*args, **kwargs)
+    return False
+
+def set_quiet_mode(enabled: bool):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('quiet_mode_enabled', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        ("1" if enabled else "0",)
+    )
+    conn.commit()
+    conn.close()
 
 def get_db():
-    container = getattr(_local_db, "container", None)
-    if container is None:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-        except Exception:
-            pass
-        container = ThreadConnectionContainer(conn)
-        _all_connections.add(container)
-        _local_db.container = container
-    return SQLiteConnectionProxy(container.connection)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+    except Exception:
+        pass
+    return conn
 
 def init_db():
     conn = get_db()
@@ -876,7 +862,7 @@ def menu_for_user(user_id: int, chat_type: str = "private"):
     if is_admin(user_id) and chat_type == "private":
         return MAIN_MENU
     elif chat_type == "private" and get_worker(user_id) is not None:
-        return ReplyKeyboardMarkup([["🛌 Не работаю сегодня"]], resize_keyboard=True)
+        return ReplyKeyboardMarkup([["🛌 Не работаю сегодня", "📅 Запланировать отсутствие"]], resize_keyboard=True)
     return ReplyKeyboardRemove()
 
 def positions_keyboard(rows):
@@ -1188,9 +1174,19 @@ CLEAN_REPORT_PROMPT = """
 {text}
 """
 
+_ai_status_cache = {}
+_ai_clean_cache = {}
+
+def get_md5(text: str) -> str:
+    return hashlib.md5(text.strip().encode("utf-8")).hexdigest()
+
 def clean_report(text: str) -> str:
     if groq_client is None:
         return text
+    h = get_md5(text)
+    if h in _ai_clean_cache:
+        logger.info("clean_report: cache hit!")
+        return _ai_clean_cache[h]
     try:
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -1201,7 +1197,9 @@ def clean_report(text: str) -> str:
             max_tokens=400,
             temperature=0,
         )
-        return response.choices[0].message.content.strip().strip('"').strip("'")
+        res = response.choices[0].message.content.strip().strip('"').strip("'")
+        _ai_clean_cache[h] = res
+        return res
     except Exception as e:
         logger.error(f"Ошибка при очистке отчета: {e}")
         return text
@@ -1209,6 +1207,10 @@ def clean_report(text: str) -> str:
 def check_status(text: str) -> dict:
     if groq_client is None:
         return normalize_ai_result({"report_type": "status", "is_ok": False, "issue": "GROQ_API_KEY не задан"}, text)
+    h = get_md5(text)
+    if h in _ai_status_cache:
+        logger.info("check_status: cache hit!")
+        return _ai_status_cache[h]
     try:
         response = groq_client.chat.completions.create(
             # Решение проблемы 10: смена модели на llama-3.3-70b-versatile
@@ -1222,7 +1224,9 @@ def check_status(text: str) -> dict:
             response_format={"type": "json_object"},
         )
         raw = response.choices[0].message.content.strip()
-        return normalize_ai_result(json.loads(raw), text)
+        res = normalize_ai_result(json.loads(raw), text)
+        _ai_status_cache[h] = res
+        return res
     except Exception as e:
         return normalize_ai_result({"report_type": "status", "is_ok": False, "issue": f"Ошибка ИИ: {e}"}, text)
 
@@ -1235,8 +1239,11 @@ async def clean_report_async(text: str) -> str:
     return await asyncio.to_thread(clean_report, text)
 
 
-async def check_status_async(text: str) -> dict:
-    return await asyncio.to_thread(check_status, text)
+async def check_status_async(text: str, report_type_override: str | None = None) -> dict:
+    res = await asyncio.to_thread(check_status, text)
+    if report_type_override:
+        res["report_type"] = report_type_override
+    return res
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5225,15 +5232,16 @@ async def check_missing_reports_job(context: ContextTypes.DEFAULT_TYPE):
                     except Exception as e:
                         logger.warning(f"Ошибка личного уведомления о пропуске слота {tid}: {e}")
                     
-                    group_id = w["group_id"] or DEFAULT_GROUP_ID
-                    try:
-                        await context.bot.send_message(
-                            chat_id=group_id,
-                            text=f"⚠️ *{w['last_name']} {w['first_name']}* не предоставил вовремя отчет за статус *{slot}*.",
-                            parse_mode="Markdown"
-                        )
-                    except Exception as e:
-                        logger.warning(f"Ошибка отправки предупреждения нарушителя в группу {group_id}: {e}")
+                    if not is_quiet_mode_enabled():
+                        group_id = w["group_id"] or DEFAULT_GROUP_ID
+                        try:
+                            await context.bot.send_message(
+                                chat_id=group_id,
+                                text=f"⚠️ *{w['last_name']} {w['first_name']}* не предоставил вовремя отчет за статус *{slot}*.",
+                                parse_mode="Markdown"
+                            )
+                        except Exception as e:
+                            logger.warning(f"Ошибка отправки предупреждения нарушителя в группу {group_id}: {e}")
                         
     conn.close()
 
@@ -5280,11 +5288,12 @@ async def remind_all_missing(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 reminded_count += 1
                 
                 # Сообщение в чат бригады
-                group_id = w["group_id"] or DEFAULT_GROUP_ID
-                await context.bot.send_message(
-                    chat_id=group_id,
-                    text=f"⚠️ {w['last_name']} {w['first_name']} пропустил отправку отчетов за слоты: {slots_str}. Напоминание направлено в ЛС."
-                )
+                if not is_quiet_mode_enabled():
+                    group_id = w["group_id"] or DEFAULT_GROUP_ID
+                    await context.bot.send_message(
+                        chat_id=group_id,
+                        text=f"⚠️ {w['last_name']} {w['first_name']} пропустил отправку отчетов за слоты: {slots_str}. Напоминание направлено в ЛС."
+                    )
             except Exception as e:
                 logger.warning(f"Ошибка ручной отправки напоминаний для {tid}: {e}")
                 
@@ -5388,6 +5397,168 @@ async def summary_time_del_finish(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text(f"✅ Время сводки {raw} успешно удалено из расписания!", reply_markup=MAIN_MENU)
     return ConversationHandler.END
 
+async def conversation_timeout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keys_to_clear = [
+        "awaiting_not_working_confirm", "not_working_reason", "awaiting_not_working_reason",
+        "vacation_start_date", "vacation_end_date",
+        "depts_cache", "editing_comment_report_id", "editing_comment_chat_id", 
+        "editing_comment_message_id", "editing_comment_original_text", "editing_comment_prompt_message_id",
+        "add_worker_telegram_id", "add_worker_last_name", "add_worker_first_name", 
+        "add_worker_position", "add_worker_group_id", "add_worker_schedule", "add_worker_needs_daily_fact",
+        "del_worker_position", "del_worker_list", "del_worker_idx",
+        "edit_worker_id", "edit_worker_field",
+        "export_type", "export_dept", "export_format"
+    ]
+    for key in keys_to_clear:
+        context.user_data.pop(key, None)
+        
+    logger.info("Conversation timed out. user_data cleared.")
+    if update and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⏳ Время ожидания ответа истекло. Диалог автоматически завершен.",
+                reply_markup=menu_for_user(update.effective_user.id if update.effective_user else 0)
+            )
+        except Exception:
+            pass
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Оформление отпуска / больничного (Диапазон дат)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def vacation_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    worker = get_worker(user_id)
+    if not worker:
+        await update.message.reply_text("Вы не зарегистрированы в системе. Оформление отпуска невозможно.")
+        return ConversationHandler.END
+    
+    await update.message.reply_text(
+        "📅 *Оформление отпуска / больничного (массовая установка 'Не работаю')*\n\n"
+        "Пожалуйста, введите дату начала отсутствия в формате *ДД.ММ.ГГГГ* (например, 26.06.2026):",
+        parse_mode="Markdown",
+        reply_markup=CANCEL_KEYBOARD
+    )
+    return ASK_VACATION_START
+
+async def vacation_start_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "❌ Отмена":
+        await update.message.reply_text("Оформление отменено.", reply_markup=menu_for_user(update.effective_user.id))
+        return ConversationHandler.END
+    
+    try:
+        start_date = datetime.strptime(text, "%d.%m.%Y").date()
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат даты. Пожалуйста, используйте формат ДД.ММ.ГГГГ (например, 26.06.2026):")
+        return ASK_VACATION_START
+    
+    context.user_data["vacation_start_date"] = start_date.strftime("%Y-%m-%d")
+    await update.message.reply_text(
+        "Введите дату окончания отсутствия в формате *ДД.ММ.ГГГГ* (например, 05.07.2026):",
+        parse_mode="Markdown",
+        reply_markup=CANCEL_KEYBOARD
+    )
+    return ASK_VACATION_END
+
+async def vacation_end_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "❌ Отмена":
+        await update.message.reply_text("Оформление отменено.", reply_markup=menu_for_user(update.effective_user.id))
+        return ConversationHandler.END
+    
+    try:
+        end_date = datetime.strptime(text, "%d.%m.%Y").date()
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат даты. Пожалуйста, используйте формат ДД.ММ.ГГГГ (например, 05.07.2026):")
+        return ASK_VACATION_END
+    
+    start_date_str = context.user_data["vacation_start_date"]
+    start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+    
+    if end_date < start_date:
+        await update.message.reply_text("❌ Дата окончания не может быть раньше даты начала отпуска. Пожалуйста, введите дату окончания заново:")
+        return ASK_VACATION_END
+    
+    context.user_data["vacation_end_date"] = end_date.strftime("%Y-%m-%d")
+    await update.message.reply_text(
+        "Укажите причину отсутствия (например: Отпуск, Больничный, Семейные обстоятельства):",
+        reply_markup=CANCEL_KEYBOARD
+    )
+    return ASK_VACATION_REASON
+
+async def vacation_reason_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "❌ Отмена":
+        await update.message.reply_text("Оформление отменено.", reply_markup=menu_for_user(update.effective_user.id))
+        return ConversationHandler.END
+    
+    user_id = update.effective_user.id
+    worker = get_worker(user_id)
+    if not worker:
+        await update.message.reply_text("Сотрудник не найден.")
+        return ConversationHandler.END
+    
+    start_date_str = context.user_data.pop("vacation_start_date")
+    end_date_str = context.user_data.pop("vacation_end_date")
+    reason = text
+    
+    start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+    end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+    
+    conn = get_db()
+    curr = start_date
+    dates_added = []
+    
+    while curr <= end_date:
+        curr_str = curr.strftime("%Y-%m-%d")
+        
+        # Удаляем существующие отчеты за этот день
+        conn.execute(
+            "DELETE FROM reports WHERE telegram_id = ? AND report_date = ?",
+            (user_id, curr_str)
+        )
+        # Вставляем отчет о нерабочем дне
+        conn.execute(
+            """
+            INSERT INTO reports (telegram_id, report_date, report_type, slot_time, received_at, is_ok, is_late, format_comment, required_action, raw_text)
+            VALUES (?, ?, 'not_working', NULL, ?, 1, 0, ?, 'Не работает', ?)
+            """,
+            (user_id, curr_str, "00:00:00", reason, f"Не работает сегодня (запланировано). Причина: {reason}")
+        )
+        dates_added.append(curr.strftime("%d.%m.%Y"))
+        curr += dt_module.timedelta(days=1)
+        
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(
+        f"✅ Отпуск успешно оформлен на период с {start_date.strftime('%d.%m.%Y')} по {end_date.strftime('%d.%m.%Y')} ({len(dates_added)} дн.).\n"
+        f"Причина: {reason}",
+        reply_markup=menu_for_user(user_id)
+    )
+    
+    # Уведомление в группу
+    w_name = f"{worker['last_name']} {worker['first_name']}"
+    dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
+    notify_text = (
+        f"📅 {w_name} запланировал отсутствие:\n"
+        f"Период: {start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}\n"
+        f"Причина: {reason}"
+    )
+    try:
+        await context.bot.send_message(chat_id=dest_chat, text=notify_text)
+    except Exception as e:
+        logger.error(f"Ошибка отправки уведомления об отпуске в группу: {e}")
+        
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=notify_text)
+        except Exception:
+            pass
+            
+    return ConversationHandler.END
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Прием отчетов от сотрудников (Голос / Видео / Текст)
@@ -5474,6 +5645,9 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_admin(user_id):
         return
+
+    lock = get_user_lock(user_id)
+    await lock.acquire()
 
     worker = get_worker(user_id)
     
@@ -5676,12 +5850,23 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Анализ промптом Llama для определения типа отчета
-        ai_res_pre = await check_status_async(text_content)
-        report_type = ai_res_pre["report_type"]
         now = now_local()
         date_str = now.strftime("%Y-%m-%d")
         sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
+        
+        # Автоматическое определение: если отчет прислан после последнего слота + порог, то это daily_fact
+        last_slot_time_str = sched_list[-1]
+        last_hour, last_minute = map(int, last_slot_time_str.split(":"))
+        last_slot_time = now.replace(hour=last_hour, minute=last_minute, second=0, microsecond=0)
+        last_slot_limit = last_slot_time + dt_module.timedelta(minutes=LATE_THRESHOLD_MIN)
+        
+        report_type_override = None
+        if now > last_slot_limit:
+            report_type_override = "daily_fact"
+
+        # Анализ промптом Llama для определения типа отчета
+        ai_res_pre = await check_status_async(text_content, report_type_override=report_type_override)
+        report_type = ai_res_pre["report_type"]
         nearest_slot, is_late = find_nearest_slot(sched_list, now)
 
         # Проверяем, существует ли отчет у этого сотрудника за этот слот (status) или день (daily_fact)
@@ -5705,7 +5890,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Склеиваем предыдущий текст и новое дополнение
             text_content = f"{existing_raw}\n[Дополнение]: {text_content}" if existing_raw else text_content
             # Прогоняем КЛАССИФИКАЦИЮ и АНАЛИЗ заново для объединенного контента
-            ai_res = await check_status_async(text_content)
+            ai_res = await check_status_async(text_content, report_type_override=report_type_override)
             cleaned_text = await clean_report_async(text_content)
             report_id = existing_report["id"]
             
@@ -5857,6 +6042,10 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
     
     finally:
+        try:
+            lock.release()
+        except Exception:
+            pass
         # Решение проблемы 2: безусловная чистка временного файла
         if tmp_path and os.path.exists(tmp_path):
             try:
@@ -5964,6 +6153,138 @@ async def set_object_group_command(update: Update, context: ContextTypes.DEFAULT
         parse_mode="Markdown"
     )
 
+async def cmd_quiet_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+        
+    current_status = is_quiet_mode_enabled()
+    new_status = not current_status
+    set_quiet_mode(new_status)
+    
+    if new_status:
+        await update.message.reply_text(
+            "🔇 *Тихий режим для группы ВКЛЮЧЕН*.\n\n"
+            "Индивидуальные напоминания о пропусках отчетов больше не будут отправляться в группы. "
+            "Нарушители будут получать уведомления только в личные сообщения.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            "🔊 *Тихий режим для группы ВЫКЛЮЧЕН*.\n\n"
+            "Напоминания о пропущенных отчетах будут дублироваться в группы бригад/объектов.",
+            parse_mode="Markdown"
+        )
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+        
+    now = now_local()
+    # По умолчанию с начала текущего месяца до сегодняшнего дня
+    start_date = dt_module.date(now.year, now.month, 1)
+    end_date = now.date()
+    
+    args = context.args
+    if len(args) >= 2:
+        try:
+            try:
+                start_date = datetime.strptime(args[0], "%d.%m.%Y").date()
+            except ValueError:
+                start_date = datetime.strptime(args[0], "%Y-%m-%d").date()
+                
+            try:
+                end_date = datetime.strptime(args[1], "%d.%m.%Y").date()
+            except ValueError:
+                end_date = datetime.strptime(args[1], "%Y-%m-%d").date()
+        except Exception:
+            await update.message.reply_text(
+                "❌ Неверный формат дат.\n"
+                "Используйте: `/stats ДД.ММ.ГГГГ ДД.ММ.ГГГГ` или `/stats` для статистики за текущий месяц.",
+                parse_mode="Markdown"
+            )
+            return
+
+    start_date_str = start_date.strftime("%Y-%m-%d")
+    end_date_str = end_date.strftime("%Y-%m-%d")
+    
+    await update.message.reply_text(f"⏳ Рассчитываю статистику за период {start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}...")
+    
+    conn = get_db()
+    workers = conn.execute("SELECT * FROM workers ORDER BY position, last_name, first_name").fetchall()
+    
+    if not workers:
+        conn.close()
+        await update.message.reply_text("Сотрудники в базе данных не найдены.")
+        return
+        
+    workers_by_dept = {}
+    for w in workers:
+        dept = w["position"] or "Не указано"
+        workers_by_dept.setdefault(dept, []).append(w)
+        
+    lines = [f"📊 *Сводная статистика сдачи отчетов*"]
+    lines.append(f"📅 Период: *{start_date.strftime('%d.%m.%Y')}* — *{end_date.strftime('%d.%m.%Y')}*\n")
+    
+    total_expected = 0
+    total_submitted = 0
+    total_lates = 0
+    total_remarks = 0
+    
+    for dept, dept_workers in sorted(workers_by_dept.items()):
+        lines.append(f"🏢 *Отдел: {dept}*")
+        for w in dept_workers:
+            stats = calculate_worker_stats(w, start_date_str, end_date_str, conn)
+            exp = stats["expected"]
+            sub = stats["submitted"]
+            lates = stats["lates"]
+            remarks = stats["remarks"]
+            pct = stats["percent"]
+            
+            total_expected += exp
+            total_submitted += sub
+            total_lates += lates
+            total_remarks += remarks
+            
+            w_name = f"{w['last_name']} {w['first_name']}"
+            
+            if exp == 0:
+                emoji = "⚪️"
+                pct_str = "нет слотов"
+            else:
+                pct_str = f"{pct}%"
+                if pct >= 90: emoji = "🟢"
+                elif pct >= 70: emoji = "🟡"
+                else: emoji = "🔴"
+                
+            lines.append(
+                f"  {emoji} {w_name}:\n"
+                f"    Ожидалось: {exp} | Сдано: {sub}\n"
+                f"    Опозданий: {lates} | Замечаний: {remarks}\n"
+                f"    Успешность: *{pct_str}*\n"
+            )
+            
+    conn.close()
+    
+    lines.append("───────────────────")
+    if total_expected > 0:
+        total_pct = round((total_submitted / total_expected) * 100)
+    else:
+        total_pct = 100
+    lines.append(
+        f"📈 *Итого по всем сотрудникам*:\n"
+        f"  Ожидалось отчетов: {total_expected}\n"
+        f"  Сдано всего: {total_submitted}\n"
+        f"  Всего опозданий: {total_lates}\n"
+        f"  Всего замечаний: {total_remarks}\n"
+        f"  Средняя успешность: *{total_pct}%*"
+    )
+    
+    full_text = "\n".join(lines)
+    for part in split_message(full_text):
+        await update.message.reply_text(part, parse_mode="Markdown")
+
 async def daily_backup_callback(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Запуск ежедневного резервного копирования базы данных...")
     now = now_local()
@@ -6048,6 +6369,8 @@ def main():
     application.add_handler(CommandHandler("threshold", set_threshold_command))
     application.add_handler(CommandHandler("top", top_command))
     application.add_handler(CommandHandler("set_object_group", set_object_group_command))
+    application.add_handler(CommandHandler("stats", cmd_stats))
+    application.add_handler(CommandHandler("quiet_mode", cmd_quiet_mode))
     application.add_handler(MessageHandler(filters.Regex("^🆔 ID чата$"), get_chat_id))
     application.add_handler(MessageHandler(filters.Regex("^📊 Сводка сейчас$"), send_summary_now))
     application.add_handler(MessageHandler(filters.Regex("^📣 Напомнить всем$"), remind_all_missing))
@@ -6058,8 +6381,8 @@ def main():
     # Диалоговые обработчики (ConversationHandlers)
     list_handler = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.Regex("^📋 Сотрудники$"), list_workers),
-            CommandHandler("find", find_worker_command)
+            CommandHandler("find", find_worker_command),
+            MessageHandler(filters.Regex("^📋 Сотрудники$"), list_workers)
         ],
         states={
             ASK_LIST_DEPARTMENT: [MessageHandler(DIALOG_TEXT, list_workers_department)],
@@ -6072,6 +6395,7 @@ def main():
             ASK_EDIT_STATUS_WORK: [MessageHandler(DIALOG_TEXT, edit_status_work_finish)],
             ASK_EDIT_SORT_ORDER: [MessageHandler(DIALOG_TEXT, edit_sort_order_finish)],
             ASK_MOVE_POSITION_ORDER: [MessageHandler(DIALOG_TEXT, edit_move_position_order_finish)],
+            ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conversation_timeout_callback)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
         conversation_timeout=300,
@@ -6087,6 +6411,7 @@ def main():
             ASK_GROUP: [MessageHandler(DIALOG_TEXT, add_worker_group)],
             ASK_SCHEDULE: [MessageHandler(DIALOG_TEXT, add_worker_schedule)],
             ASK_NEEDS_DAILY_FACT: [MessageHandler(DIALOG_TEXT, add_worker_needs_daily_fact)],
+            ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conversation_timeout_callback)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
         conversation_timeout=300,
@@ -6098,6 +6423,7 @@ def main():
             ASK_REMOVE_DEPARTMENT: [MessageHandler(DIALOG_TEXT, delete_worker_department)],
             ASK_REMOVE_WORKER: [MessageHandler(DIALOG_TEXT, delete_worker_finish)],
             ASK_CONFIRM_DELETE: [MessageHandler(DIALOG_TEXT, delete_worker_confirm)],
+            ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conversation_timeout_callback)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
         conversation_timeout=300,
@@ -6107,18 +6433,19 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^🏢 Сотрудники отдела$"), department_workers_start)],
         states={
             ASK_DEPARTMENT: [MessageHandler(DIALOG_TEXT, department_workers_show)],
+            ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conversation_timeout_callback)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
         conversation_timeout=300,
     )
 
-    # Решение проблемы 12: хэндлер для настройки времени сводки
     summary_scheduler_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^⏰ Время сводки$"), summary_time_start)],
         states={
             ASK_REPORT_TIME: [MessageHandler(DIALOG_TEXT, summary_time_action)],
             ASK_EDIT_SCHEDULE: [MessageHandler(DIALOG_TEXT, summary_time_add_finish)],
             ASK_ORDER_DEPARTMENT: [MessageHandler(DIALOG_TEXT, summary_time_del_finish)],
+            ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conversation_timeout_callback)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
         conversation_timeout=300,
@@ -6132,6 +6459,7 @@ def main():
             ASK_EXPORT_DEPARTMENT: [MessageHandler(DIALOG_TEXT, export_department_selected)],
             ASK_GSHEETS_URL: [MessageHandler(DIALOG_TEXT, export_gsheets_url_received)],
             ASK_GSHEETS_CREDS: [MessageHandler(filters.Document.ALL | filters.TEXT & ~filters.COMMAND, export_gsheets_creds_received)],
+            ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conversation_timeout_callback)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
         conversation_timeout=300,
@@ -6141,6 +6469,7 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^📥 Импорт сотрудников$"), import_workers_start)],
         states={
             ASK_IMPORT_FILE: [MessageHandler(filters.Document.ALL, import_workers_file)],
+            ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conversation_timeout_callback)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
         conversation_timeout=300,
@@ -6153,6 +6482,7 @@ def main():
         ],
         states={
             ASK_SUMMARY_DATE: [MessageHandler(DIALOG_TEXT, summary_date_finish)],
+            ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conversation_timeout_callback)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
         conversation_timeout=300,
@@ -6166,6 +6496,22 @@ def main():
         states={
             ASK_EDIT_SCHEDULE_DEPT: [MessageHandler(DIALOG_TEXT, dept_schedule_value)],
             ASK_DEPT_SCHEDULE_VAL: [MessageHandler(DIALOG_TEXT, dept_schedule_finish)],
+            ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conversation_timeout_callback)],
+        },
+        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        conversation_timeout=300,
+    )
+
+    vacation_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("vacation", vacation_start),
+            MessageHandler(filters.Regex("^📅 Запланировать отсутствие$"), vacation_start)
+        ],
+        states={
+            ASK_VACATION_START: [MessageHandler(DIALOG_TEXT, vacation_start_received)],
+            ASK_VACATION_END: [MessageHandler(DIALOG_TEXT, vacation_end_received)],
+            ASK_VACATION_REASON: [MessageHandler(DIALOG_TEXT, vacation_reason_received)],
+            ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conversation_timeout_callback)]
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
         conversation_timeout=300,
@@ -6181,6 +6527,7 @@ def main():
     application.add_handler(import_handler)
     application.add_handler(summary_date_handler)
     application.add_handler(dept_schedule_handler)
+    application.add_handler(vacation_handler)
 
     # Хэндлер для приема аудио/видео/текстовых отчетов сотрудников (регистрируется в самом конце)
     application.add_handler(MessageHandler(
