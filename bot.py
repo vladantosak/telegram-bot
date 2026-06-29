@@ -928,8 +928,7 @@ def menu_for_user(user_id: int, chat_type: str = "private"):
     if get_worker(user_id) is not None:
         return ReplyKeyboardMarkup(
             [
-                ["📝 Сдать отчет", "📊 Мой статус"],
-                ["📅 Мои отчеты за 30 дней", "📅 Запланировать отсутствие"],
+                ["📝 Сдать отчет", "📅 Запланировать отсутствие"],
                 ["🛌 Не работаю сегодня"]
             ],
             resize_keyboard=True
