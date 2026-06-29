@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from openpyxl import load_workbook
 import hashlib
 import re
+import html
 
 try:
     import gspread
@@ -885,24 +886,27 @@ async def require_admin(update: Update) -> bool:
     return True
 
 async def notify_admins_new_registration(bot, w_fio: str, position: str, username: str, user_id: int):
+    w_fio_esc = html.escape(w_fio)
+    position_esc = html.escape(position)
+    username_esc = html.escape(username)
     admin_msg = (
-        f"🎉 *Зарегистрировался новый сотрудник!*\n\n"
-        f"👤 *ФИО:* {w_fio}\n"
-        f"💼 *Должность/Отдел:* {position}\n"
-        f"📱 *Никнейм в TG:* @{username}\n"
-        f"🆔 *Telegram ID:* `{user_id}`"
+        f"🎉 <b>Зарегистрировался новый сотрудник!</b>\n\n"
+        f"👤 <b>ФИО:</b> {w_fio_esc}\n"
+        f"💼 <b>Должность/Отдел:</b> {position_esc}\n"
+        f"📱 <b>Никнейм в TG:</b> @{username_esc}\n"
+        f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>"
     )
     # Notify individual admin IDs
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(chat_id=admin_id, text=admin_msg, parse_mode="Markdown")
+            await bot.send_message(chat_id=admin_id, text=admin_msg, parse_mode="HTML")
         except Exception as e:
             logger.error(f"Failed to send registration notification to admin {admin_id}: {e}")
             
     # Notify the summary chat if configured
     if SUMMARY_CHAT_ID and SUMMARY_CHAT_ID not in ADMIN_IDS:
         try:
-            await bot.send_message(chat_id=SUMMARY_CHAT_ID, text=admin_msg, parse_mode="Markdown")
+            await bot.send_message(chat_id=SUMMARY_CHAT_ID, text=admin_msg, parse_mode="HTML")
         except Exception as e:
             logger.error(f"Failed to send registration notification to SUMMARY_CHAT_ID {SUMMARY_CHAT_ID}: {e}")
 
@@ -5540,23 +5544,27 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
     
     if len(workers) == 0:
         # Уведомляем администраторов
+        last_name_tg_esc = html.escape(last_name_tg)
+        first_name_tg_esc = html.escape(first_name_tg)
+        username_esc = html.escape(username)
+        text_esc = html.escape(text)
         admin_msg = (
-            f"⚠️ *Неизвестный пользователь пытался зарегистрироваться:*\n\n"
-            f"ФИО в TG: *{last_name_tg} {first_name_tg}*\n"
-            f"Никнейм: @{username}\n"
-            f"Telegram ID: `{user_id}`\n"
-            f"Введенная фамилия: *{text}*"
+            f"⚠️ <b>Неизвестный пользователь пытался зарегистрироваться:</b>\n\n"
+            f"ФИО в TG: <b>{last_name_tg_esc} {first_name_tg_esc}</b>\n"
+            f"Никнейм: @{username_esc}\n"
+            f"Telegram ID: <code>{user_id}</code>\n"
+            f"Введенная фамилия: <b>{text_esc}</b>"
         )
         for admin_id in ADMIN_IDS:
             try:
-                await context.bot.send_message(chat_id=admin_id, text=admin_msg, parse_mode="Markdown")
+                await context.bot.send_message(chat_id=admin_id, text=admin_msg, parse_mode="HTML")
             except Exception:
                 pass
                 
         # Также отправляем в SUMMARY_CHAT_ID
         if SUMMARY_CHAT_ID and SUMMARY_CHAT_ID not in ADMIN_IDS:
             try:
-                await context.bot.send_message(chat_id=SUMMARY_CHAT_ID, text=admin_msg, parse_mode="Markdown")
+                await context.bot.send_message(chat_id=SUMMARY_CHAT_ID, text=admin_msg, parse_mode="HTML")
             except Exception:
                 pass
                 
