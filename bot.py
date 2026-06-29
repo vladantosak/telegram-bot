@@ -884,12 +884,57 @@ async def require_admin(update: Update) -> bool:
         return False
     return True
 
+async def notify_admins_new_registration(bot, w_fio: str, position: str, username: str, user_id: int):
+    admin_msg = (
+        f"🎉 *Зарегистрировался новый сотрудник!*\n\n"
+        f"👤 *ФИО:* {w_fio}\n"
+        f"💼 *Должность/Отдел:* {position}\n"
+        f"📱 *Никнейм в TG:* @{username}\n"
+        f"🆔 *Telegram ID:* `{user_id}`"
+    )
+    # Notify individual admin IDs
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(chat_id=admin_id, text=admin_msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Failed to send registration notification to admin {admin_id}: {e}")
+            
+    # Notify the summary chat if configured
+    if SUMMARY_CHAT_ID and SUMMARY_CHAT_ID not in ADMIN_IDS:
+        try:
+            await bot.send_message(chat_id=SUMMARY_CHAT_ID, text=admin_msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Failed to send registration notification to SUMMARY_CHAT_ID {SUMMARY_CHAT_ID}: {e}")
+
+async def send_report_instruction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_type = update.effective_chat.type
+    await update.message.reply_text(
+        "📝 *Как сдать отчет:*\n\n"
+        "Вы можете отправить отчет следующими способами:\n"
+        "1. **Текстом** — просто напишите сообщение с описанием проделанной работы в свободной форме.\n"
+        "2. **Голосовым сообщением** — запишите аудио с описанием работы.\n"
+        "3. **Видеосообщением (кружком)** — запишите видео.\n\n"
+        "💡 *Наш ИИ* автоматически распознает вашу речь, приведет отчет к официальному виду, проверит его и выставит оценку!",
+        parse_mode="Markdown",
+        reply_markup=menu_for_user(user_id, chat_type)
+    )
+
 def menu_for_user(user_id: int, chat_type: str = "private"):
     if is_admin(user_id) and chat_type == "private":
         return MAIN_MENU
-    elif chat_type == "private" and get_worker(user_id) is not None:
-        return ReplyKeyboardMarkup([["🛌 Не работаю сегодня", "📅 Запланировать отсутствие"]], resize_keyboard=True)
-    return ReplyKeyboardRemove()
+    if chat_type != "private":
+        return ReplyKeyboardRemove()
+    if get_worker(user_id) is not None:
+        return ReplyKeyboardMarkup(
+            [
+                ["📝 Сдать отчет", "📊 Мой статус"],
+                ["📅 Мои отчеты за 30 дней", "📅 Запланировать отсутствие"],
+                ["🛌 Не работаю сегодня"]
+            ],
+            resize_keyboard=True
+        )
+    return ReplyKeyboardMarkup([["🔑 Начать регистрацию"]], resize_keyboard=True)
 
 def positions_keyboard(rows):
     positions = sorted({row["position"] for row in rows})
@@ -2178,10 +2223,11 @@ async def dept_schedule_finish(update: Update, context: ContextTypes.DEFAULT_TYP
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     chat_type = update.effective_chat.type
-    if is_admin(update.effective_user.id) and chat_type == "private":
+    user_id = update.effective_user.id
+    if is_admin(user_id) and chat_type == "private":
         await update.message.reply_text("Действие отменено.", reply_markup=MAIN_MENU)
     else:
-        await update.message.reply_text("Действие отменено.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("Действие отменено.", reply_markup=menu_for_user(user_id, chat_type))
     return ConversationHandler.END
 
 async def import_workers_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5482,11 +5528,11 @@ async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def register_lastname_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    user_id = update.effective_user.id
     if text == CANCEL_TEXT:
-        await update.message.reply_text("Регистрация отменена.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("Регистрация отменена.", reply_markup=menu_for_user(user_id))
         return ConversationHandler.END
         
-    user_id = update.effective_user.id
     username = update.effective_user.username or "нет"
     first_name_tg = update.effective_user.first_name or ""
     last_name_tg = update.effective_user.last_name or ""
@@ -5508,11 +5554,18 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
             except Exception:
                 pass
                 
+        # Также отправляем в SUMMARY_CHAT_ID
+        if SUMMARY_CHAT_ID and SUMMARY_CHAT_ID not in ADMIN_IDS:
+            try:
+                await context.bot.send_message(chat_id=SUMMARY_CHAT_ID, text=admin_msg, parse_mode="Markdown")
+            except Exception:
+                pass
+                
         await update.message.reply_text(
             f"❌ Сотрудник с фамилией *{text}* не найден среди незарегистрированных в базе данных.\n\n"
             "Администраторы уведомлены о вашей попытке регистрации. Они свяжутся с вами или добавят в базу.",
             parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove()
+            reply_markup=menu_for_user(user_id)
         )
         return ConversationHandler.END
         
@@ -5524,7 +5577,10 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
         try:
             bind_worker_id(old_id, user_id)
         except Exception as e:
-            await update.message.reply_text("❌ Произошла ошибка при регистрации. Пожалуйста, попробуйте позже.")
+            await update.message.reply_text(
+                "❌ Произошла ошибка при регистрации. Пожалуйста, попробуйте позже.",
+                reply_markup=menu_for_user(user_id)
+            )
             return ConversationHandler.END
             
         w_fio = f"{candidate['last_name']} {candidate['first_name']}"
@@ -5537,18 +5593,13 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
         )
         
         # Уведомляем администраторов
-        admin_msg = (
-            f"🎉 *Сотрудник успешно привязал свой профиль!*\n\n"
-            f"Сотрудник: *{w_fio}*\n"
-            f"Должность/Отдел: {candidate['position']}\n"
-            f"TG никнейм: @{username}\n"
-            f"Telegram ID: `{user_id}`"
+        await notify_admins_new_registration(
+            bot=context.bot,
+            w_fio=w_fio,
+            position=candidate['position'],
+            username=username,
+            user_id=user_id
         )
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(chat_id=admin_id, text=admin_msg, parse_mode="Markdown")
-            except Exception:
-                pass
                 
         return ConversationHandler.END
         
@@ -5571,9 +5622,10 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
 
 async def register_firstname_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    user_id = update.effective_user.id
     if text == CANCEL_TEXT:
         context.user_data.pop("candidate_workers", None)
-        await update.message.reply_text("Регистрация отменена.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("Регистрация отменена.", reply_markup=menu_for_user(user_id))
         return ConversationHandler.END
         
     candidates = context.user_data.get("candidate_workers", [])
@@ -5589,14 +5641,16 @@ async def register_firstname_received(update: Update, context: ContextTypes.DEFA
         await update.message.reply_text("❌ Пожалуйста, выберите имя из списка на клавиатуре:")
         return ASK_REG_FIRST_NAME
         
-    user_id = update.effective_user.id
     username = update.effective_user.username or "нет"
     old_id = matched_candidate["telegram_id"]
     
     try:
         bind_worker_id(old_id, user_id)
     except Exception as e:
-        await update.message.reply_text("❌ Произошла ошибка при регистрации. Пожалуйста, попробуйте позже.")
+        await update.message.reply_text(
+            "❌ Произошла ошибка при регистрации. Пожалуйста, попробуйте позже.",
+            reply_markup=menu_for_user(user_id)
+        )
         context.user_data.pop("candidate_workers", None)
         return ConversationHandler.END
         
@@ -5610,18 +5664,13 @@ async def register_firstname_received(update: Update, context: ContextTypes.DEFA
     )
     
     # Уведомляем администраторов
-    admin_msg = (
-        f"🎉 *Сотрудник успешно привязал свой профиль!*\n\n"
-        f"Сотрудник: *{w_fio}*\n"
-        f"Должность/Отдел: {matched_candidate['position']}\n"
-        f"TG никнейм: @{username}\n"
-        f"Telegram ID: `{user_id}`"
+    await notify_admins_new_registration(
+        bot=context.bot,
+        w_fio=w_fio,
+        position=matched_candidate['position'],
+        username=username,
+        user_id=user_id
     )
-    for admin_id in ADMIN_IDS:
-        try:
-            await context.bot.send_message(chat_id=admin_id, text=admin_msg, parse_mode="Markdown")
-        except Exception:
-            pass
             
     context.user_data.pop("candidate_workers", None)
     return ConversationHandler.END
@@ -6723,7 +6772,10 @@ def main():
     )
 
     registration_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", register_start)],
+        entry_points=[
+            CommandHandler("start", register_start),
+            MessageHandler(filters.Regex("^🔑 Начать регистрацию$"), register_start)
+        ],
         states={
             ASK_REG_LAST_NAME: [MessageHandler(DIALOG_TEXT, register_lastname_received)],
             ASK_REG_FIRST_NAME: [MessageHandler(DIALOG_TEXT, register_firstname_received)],
@@ -6745,6 +6797,11 @@ def main():
     application.add_handler(summary_date_handler)
     application.add_handler(dept_schedule_handler)
     application.add_handler(vacation_handler)
+
+    # Дополнительные хэндлеры для меню обычных сотрудников
+    application.add_handler(MessageHandler(filters.Regex("^📝 Сдать отчет$"), send_report_instruction))
+    application.add_handler(MessageHandler(filters.Regex("^📊 Мой статус$"), status))
+    application.add_handler(MessageHandler(filters.Regex("^📅 Мои отчеты за 30 дней$"), myreports))
 
     # Хэндлер для приема аудио/видео/текстовых отчетов сотрудников (регистрируется в самом конце)
     application.add_handler(MessageHandler(
