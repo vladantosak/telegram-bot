@@ -426,6 +426,12 @@ def upsert_worker(telegram_id: int, last_name: str, first_name: str, position: s
     )
     conn.commit()
     conn.close()
+    try:
+        loop = asyncio.get_running_loop()
+        if loop.is_running():
+            loop.create_task(async_sync_gsheets_background())
+    except RuntimeError:
+        pass
 
 def get_object_group(object_id: str) -> int:
     conn = get_db()
@@ -612,6 +618,12 @@ def update_worker_field(telegram_id: int, field: str, value):
         
     conn.commit()
     conn.close()
+    try:
+        loop = asyncio.get_running_loop()
+        if loop.is_running():
+            loop.create_task(async_sync_gsheets_background())
+    except RuntimeError:
+        pass
 
 def swap_sort_order(id1: int, id2: int):
     conn = get_db()
@@ -625,10 +637,26 @@ def swap_sort_order(id1: int, id2: int):
 
 def delete_worker(telegram_id: int) -> bool:
     conn = get_db()
-    cur = conn.execute("DELETE FROM workers WHERE telegram_id = ?", (telegram_id,))
-    conn.commit()
-    deleted = cur.rowcount > 0
-    conn.close()
+    try:
+        conn.execute("DELETE FROM reports WHERE telegram_id = ?", (telegram_id,))
+        conn.execute("DELETE FROM sent_reminders WHERE telegram_id = ?", (telegram_id,))
+        conn.execute("DELETE FROM sent_pre_reminders WHERE telegram_id = ?", (telegram_id,))
+        conn.execute("DELETE FROM pending_unregistered_users WHERE telegram_id = ?", (telegram_id,))
+        cur = conn.execute("DELETE FROM workers WHERE telegram_id = ?", (telegram_id,))
+        conn.commit()
+        deleted = cur.rowcount > 0
+    except Exception as e:
+        logger.error(f"Error in delete_worker {telegram_id}: {e}")
+        conn.rollback()
+        deleted = False
+    finally:
+        conn.close()
+    try:
+        loop = asyncio.get_running_loop()
+        if loop.is_running():
+            loop.create_task(async_sync_gsheets_background())
+    except RuntimeError:
+        pass
     return deleted
 
 def save_group_name(group_id: int, group_name: str):
@@ -696,6 +724,12 @@ def save_report(telegram_id: int, report_date: str, report_type: str, slot_time:
     conn.commit()
     inserted_id = cur.lastrowid
     conn.close()
+    try:
+        loop = asyncio.get_running_loop()
+        if loop.is_running():
+            loop.create_task(async_sync_gsheets_background())
+    except RuntimeError:
+        pass
     return inserted_id
 
 def update_report_text_and_ai(report_id: int, is_ok: bool, format_comment: str, required_action: str, raw_text: str, received_at: str):
@@ -710,6 +744,12 @@ def update_report_text_and_ai(report_id: int, is_ok: bool, format_comment: str, 
     )
     conn.commit()
     conn.close()
+    try:
+        loop = asyncio.get_running_loop()
+        if loop.is_running():
+            loop.create_task(async_sync_gsheets_background())
+    except RuntimeError:
+        pass
 
 def get_worker_history_last_week(telegram_id: int) -> str:
     """Решение проблемы 6: Логирование истории отчетов сотрудника за неделю."""
@@ -1867,6 +1907,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
         conn.commit()
         conn.close()
+        asyncio.create_task(async_sync_gsheets_background())
         
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
         status_emoji = "✅" if new_ok == 1 else "⚠️"
@@ -1963,6 +2004,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             conn.commit()
         finally:
             conn.close()
+        
+        asyncio.create_task(async_sync_gsheets_background())
         
         await query.answer("Тип отчета изменен!")
         
@@ -2290,6 +2333,7 @@ async def import_workers_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         if os.path.exists(local_path):
             os.remove(local_path)
             
+        asyncio.create_task(async_sync_gsheets_background())
         await update.message.reply_text(
             f"✅ Импорт успешно завершен!\n"
             f"Загружено/обновлено сотрудников: {success_count}.",
@@ -2771,6 +2815,7 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
     except Exception as e:
         logger.warning(f"Не удалось отправить уведомление о новом сотруднике в группу {target_group_id}: {e}")
 
+    asyncio.create_task(async_sync_gsheets_background())
     await update.message.reply_text("Сотрудник успешно добавлен в базу!", reply_markup=MAIN_MENU)
     context.user_data.clear()
     return ConversationHandler.END
@@ -2821,6 +2866,7 @@ async def delete_worker_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         worker = context.user_data.get("worker_to_delete")
         if worker:
             delete_worker(worker["telegram_id"])
+            asyncio.create_task(async_sync_gsheets_background())
             await update.message.reply_text(f"✅ Сотрудник {worker['last_name']} успешно удален.", reply_markup=MAIN_MENU)
     else:
         await update.message.reply_text("Удаление сотрудника отменено.", reply_markup=MAIN_MENU)
@@ -3729,6 +3775,36 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
         caption=caption,
         reply_markup=MAIN_MENU
     )
+
+
+gsheets_sync_lock = asyncio.Lock()
+
+async def async_sync_gsheets_background():
+    """Асинхронно запускает фоновую синхронизацию с Google Таблицей, если она настроена, используя глобальную блокировку."""
+    spreadsheet_id = get_setting("google_spreadsheet_id")
+    service_account_str = get_setting("google_service_account")
+    if not spreadsheet_id or not service_account_str:
+        return
+    
+    async with gsheets_sync_lock:
+        data = fetch_export_data(None, False)
+        if not data:
+            return
+            
+        cur_date_str = now_local().strftime("%Y-%m-%d")
+        try:
+            await asyncio.to_thread(
+                run_gsheets_sync,
+                spreadsheet_id,
+                service_account_str,
+                None,
+                False,
+                data,
+                cur_date_str
+            )
+            logger.info("Автоматическая синхронизация с Google Таблицами успешно выполнена!")
+        except Exception as e:
+            logger.error(f"Ошибка при автоматической синхронизации Google Таблиц: {e}")
 
 
 def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, only_facts: bool, data, cur_date_str: str):
@@ -5792,6 +5868,7 @@ async def vacation_reason_received(update: Update, context: ContextTypes.DEFAULT
         
     conn.commit()
     conn.close()
+    asyncio.create_task(async_sync_gsheets_background())
     
     await update.message.reply_text(
         f"✅ Отпуск успешно оформлен на период с {start_date.strftime('%d.%m.%Y')} по {end_date.strftime('%d.%m.%Y')} ({len(dates_added)} дн.).\n"
@@ -5874,6 +5951,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
         conn.commit()
         conn.close()
+        asyncio.create_task(async_sync_gsheets_background())
         
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
         status_emoji = "✅" if report["is_ok"] == 1 else "⚠️"
