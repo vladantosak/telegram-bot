@@ -131,7 +131,9 @@ SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
     ASK_VACATION_START,
     ASK_VACATION_END,
     ASK_VACATION_REASON,
-) = range(35)
+    ASK_REG_LAST_NAME,
+    ASK_REG_FIRST_NAME,
+) = range(37)
 
 # Клавиатуры
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -336,6 +338,30 @@ def get_worker(telegram_id: int):
     row = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (telegram_id,)).fetchone()
     conn.close()
     return row
+
+def find_unregistered_workers_by_lastname(last_name: str):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM workers WHERE telegram_id < 0 AND LOWER(last_name) = LOWER(?)",
+        (last_name.strip(),)
+    ).fetchall()
+    conn.close()
+    return rows
+
+def bind_worker_id(old_id: int, new_id: int):
+    conn = get_db()
+    try:
+        conn.execute("UPDATE workers SET telegram_id = ? WHERE telegram_id = ?", (new_id, old_id))
+        conn.execute("UPDATE reports SET telegram_id = ? WHERE telegram_id = ?", (new_id, old_id))
+        conn.execute("UPDATE sent_reminders SET telegram_id = ? WHERE telegram_id = ?", (new_id, old_id))
+        conn.execute("UPDATE sent_pre_reminders SET telegram_id = ? WHERE telegram_id = ?", (new_id, old_id))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error binding worker ID: {e}")
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
 
 def save_pending_unregistered_user(telegram_id: int, first_name: str, last_name: str, username: str, timestamp: str, text_content: str):
     conn = get_db()
@@ -5423,6 +5449,185 @@ async def conversation_timeout_callback(update: Update, context: ContextTypes.DE
             pass
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Самостоятельная регистрация сотрудников
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_type = update.effective_chat.type
+    if chat_type != "private":
+        return ConversationHandler.END
+        
+    user_id = update.effective_user.id
+    if is_admin(user_id):
+        await update.message.reply_text("Привет! Выберите действие кнопкой ниже.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+        
+    worker = get_worker(user_id)
+    if worker:
+        await update.message.reply_text(
+            f"Привет! Отправьте видеоотчет, когда он будет готов.",
+            reply_markup=menu_for_user(user_id, chat_type)
+        )
+        return ConversationHandler.END
+        
+    # Не зарегистрирован
+    await update.message.reply_text(
+        "👋 *Добро пожаловать в систему сдачи отчетов!*\n\n"
+        "Вы не зарегистрированы в системе.\n"
+        "Пожалуйста, введите вашу **Фамилию** для поиска в списке сотрудников:",
+        parse_mode="Markdown",
+        reply_markup=CANCEL_KEYBOARD
+    )
+    return ASK_REG_LAST_NAME
+
+async def register_lastname_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == CANCEL_TEXT:
+        await update.message.reply_text("Регистрация отменена.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+        
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "нет"
+    first_name_tg = update.effective_user.first_name or ""
+    last_name_tg = update.effective_user.last_name or ""
+    
+    workers = find_unregistered_workers_by_lastname(text)
+    
+    if len(workers) == 0:
+        # Уведомляем администраторов
+        admin_msg = (
+            f"⚠️ *Неизвестный пользователь пытался зарегистрироваться:*\n\n"
+            f"ФИО в TG: *{last_name_tg} {first_name_tg}*\n"
+            f"Никнейм: @{username}\n"
+            f"Telegram ID: `{user_id}`\n"
+            f"Введенная фамилия: *{text}*"
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=admin_msg, parse_mode="Markdown")
+            except Exception:
+                pass
+                
+        await update.message.reply_text(
+            f"❌ Сотрудник с фамилией *{text}* не найден среди незарегистрированных в базе данных.\n\n"
+            "Администраторы уведомлены о вашей попытке регистрации. Они свяжутся с вами или добавят в базу.",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
+        
+    elif len(workers) == 1:
+        # Один кандидат найден
+        candidate = workers[0]
+        old_id = candidate["telegram_id"]
+        
+        try:
+            bind_worker_id(old_id, user_id)
+        except Exception as e:
+            await update.message.reply_text("❌ Произошла ошибка при регистрации. Пожалуйста, попробуйте позже.")
+            return ConversationHandler.END
+            
+        w_fio = f"{candidate['last_name']} {candidate['first_name']}"
+        await update.message.reply_text(
+            f"🎉 *Регистрация успешна!*\n\n"
+            f"Вы успешно привязаны к профилю: *{w_fio}* ({candidate['position']}).\n\n"
+            "Теперь вы можете отправлять отчеты в этот чат.",
+            parse_mode="Markdown",
+            reply_markup=menu_for_user(user_id)
+        )
+        
+        # Уведомляем администраторов
+        admin_msg = (
+            f"🎉 *Сотрудник успешно привязал свой профиль!*\n\n"
+            f"Сотрудник: *{w_fio}*\n"
+            f"Должность/Отдел: {candidate['position']}\n"
+            f"TG никнейм: @{username}\n"
+            f"Telegram ID: `{user_id}`"
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=admin_msg, parse_mode="Markdown")
+            except Exception:
+                pass
+                
+        return ConversationHandler.END
+        
+    else:
+        # Найдено несколько человек
+        context.user_data["candidate_workers"] = [dict(w) for w in workers]
+        
+        # Строим клавиатуру с именами
+        buttons = []
+        for w in workers:
+            buttons.append([f"{w['last_name']} {w['first_name']}"])
+        buttons.append([CANCEL_TEXT])
+        
+        await update.message.reply_text(
+            "🔍 Найдено несколько сотрудников с такой фамилией.\n"
+            "Пожалуйста, выберите ваше имя на клавиатуре ниже:",
+            reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+        )
+        return ASK_REG_FIRST_NAME
+
+async def register_firstname_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == CANCEL_TEXT:
+        context.user_data.pop("candidate_workers", None)
+        await update.message.reply_text("Регистрация отменена.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+        
+    candidates = context.user_data.get("candidate_workers", [])
+    matched_candidate = None
+    
+    for c in candidates:
+        candidate_fio = f"{c['last_name']} {c['first_name']}"
+        if text.lower() == candidate_fio.lower():
+            matched_candidate = c
+            break
+            
+    if not matched_candidate:
+        await update.message.reply_text("❌ Пожалуйста, выберите имя из списка на клавиатуре:")
+        return ASK_REG_FIRST_NAME
+        
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "нет"
+    old_id = matched_candidate["telegram_id"]
+    
+    try:
+        bind_worker_id(old_id, user_id)
+    except Exception as e:
+        await update.message.reply_text("❌ Произошла ошибка при регистрации. Пожалуйста, попробуйте позже.")
+        context.user_data.pop("candidate_workers", None)
+        return ConversationHandler.END
+        
+    w_fio = f"{matched_candidate['last_name']} {matched_candidate['first_name']}"
+    await update.message.reply_text(
+        f"🎉 *Регистрация успешна!*\n\n"
+        f"Вы успешно привязаны к профилю: *{w_fio}* ({matched_candidate['position']}).\n\n"
+        "Теперь вы можете отправлять отчеты в этот чат.",
+        parse_mode="Markdown",
+        reply_markup=menu_for_user(user_id)
+    )
+    
+    # Уведомляем администраторов
+    admin_msg = (
+        f"🎉 *Сотрудник успешно привязал свой профиль!*\n\n"
+        f"Сотрудник: *{w_fio}*\n"
+        f"Должность/Отдел: {matched_candidate['position']}\n"
+        f"TG никнейм: @{username}\n"
+        f"Telegram ID: `{user_id}`"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=admin_msg, parse_mode="Markdown")
+        except Exception:
+            pass
+            
+    context.user_data.pop("candidate_workers", None)
+    return ConversationHandler.END
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Оформление отпуска / больничного (Диапазон дат)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -6363,7 +6568,7 @@ def main():
     application = Application.builder().token(TOKEN).post_init(post_init).build()
 
     # Точечные команды и кнопки меню (срабатывают моментально)
-    application.add_handler(CommandHandler("start", start))
+    # Команда /start теперь обрабатывается в registration_handler для поддержки саморегистрации
     application.add_handler(CommandHandler("myreports", myreports))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("threshold", set_threshold_command))
@@ -6517,7 +6722,19 @@ def main():
         conversation_timeout=300,
     )
 
+    registration_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", register_start)],
+        states={
+            ASK_REG_LAST_NAME: [MessageHandler(DIALOG_TEXT, register_lastname_received)],
+            ASK_REG_FIRST_NAME: [MessageHandler(DIALOG_TEXT, register_firstname_received)],
+            ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conversation_timeout_callback)],
+        },
+        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        conversation_timeout=300,
+    )
+
     # Регистрация диалогов
+    application.add_handler(registration_handler)
     application.add_handler(list_handler)
     application.add_handler(add_handler)
     application.add_handler(delete_handler)
