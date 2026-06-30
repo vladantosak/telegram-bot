@@ -4099,8 +4099,10 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
                         
                         val_a = ""
                         if "userEnteredValue" in cell_a:
-                            val_a = str(cell_a["userEnteredValue"].get("stringValue", "")).strip()
-                            
+                            raw_a = str(cell_a["userEnteredValue"].get("stringValue", "")).strip()
+                            # Убираем \n(должность) — берём только первую строку как ключ
+                            val_a = raw_a.split("\n")[0].strip()
+
                         val_b = ""
                         if "userEnteredValue" in cell_b:
                             val_b = str(cell_b["userEnteredValue"].get("stringValue", "")).strip()
@@ -4309,11 +4311,12 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
             for sub_idx, slot in enumerate(worker_rows):
                 r_idx = curr_row + sub_idx
                 worker_full_name = f"{w['last_name']} {w['first_name']}".strip()
+                worker_display_name = f"{worker_full_name}\n({w['position']})" if w.get("position") else worker_full_name
                 new_worker_rows[(worker_full_name, slot)] = r_idx
                 row_vals = []
-                
+
                 if sub_idx == 0:
-                    row_vals.append(worker_full_name)
+                    row_vals.append(worker_display_name)
                 else:
                     row_vals.append("")
                     
@@ -7139,3 +7142,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
