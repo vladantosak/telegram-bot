@@ -6267,7 +6267,9 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await update.message.reply_text(
                 "Ошибка: Вы не зарегистрированы в системе авторизации бота.\n"
-                "Ваш отчет отправлен администраторам как временный."
+                "Ваш отчет отправлен администраторам как временный.\n\n"
+                "Нажмите кнопку ниже, чтобы зарегистрироваться:",
+                reply_markup=ReplyKeyboardMarkup([["🔑 Начать регистрацию"]], resize_keyboard=True)
             )
             return
 
