@@ -6897,7 +6897,7 @@ def main():
     application.add_handler(add_handler)
     application.add_handler(delete_handler)
     application.add_handler(view_dept_handler)
-    application.add_handler(summary_scheduler_handler)
+    application.add_handler(summary_scheduler_handler) 
     application.add_handler(export_handler)
     application.add_handler(import_handler)
     application.add_handler(settings_handler)
