@@ -290,6 +290,25 @@ def init_db():
     if "group_message_id" not in cols_reports:
         conn.execute("ALTER TABLE reports ADD COLUMN group_message_id INTEGER")
 
+    # Таблица для отслеживания каждого пересланного в группу видео/голосового по отчету.
+    # Нужна, чтобы при дополнении статуса В ПРЕДЕЛАХ временного окна (см. MEDIA_MERGE_WINDOW_MINUTES)
+    # можно было удалить СТАРЫЕ видео из группы и переслать заново уже ВСЕ видео этого статуса вместе,
+    # с одним общим комментарием под ними.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS report_media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id INTEGER NOT NULL,
+            source_chat_id INTEGER NOT NULL,
+            source_message_id INTEGER NOT NULL,
+            group_message_id INTEGER,
+            position INTEGER NOT NULL,
+            added_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_report_media_report ON report_media(report_id)")
+
     # Таблица для настроек (для сохранения расписания сводок)
     conn.execute(
         """
@@ -854,6 +873,34 @@ def build_addon_text(existing_raw: str, new_text: str, use_video_label: bool) ->
     else:
         label = "[Дополнение]"
     return f"{existing_raw}\n{label}: {new_text}" if existing_raw else new_text
+
+def add_report_media(report_id: int, source_chat_id: int, source_message_id: int, group_message_id: int | None, position: int, added_at: str):
+    """Запоминает, что для этого отчета в группу было переслано конкретное видео/голосовое —
+    откуда оно взято (source_chat_id/source_message_id, чтобы переслать заново) и куда было
+    переслано (group_message_id, чтобы можно было удалить, если потребуется)."""
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO report_media (report_id, source_chat_id, source_message_id, group_message_id, position, added_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (report_id, source_chat_id, source_message_id, group_message_id, position, added_at)
+    )
+    conn.commit()
+    conn.close()
+
+def get_report_media(report_id: int):
+    """Все видео/голосовые, привязанные к отчету, в порядке добавления."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM report_media WHERE report_id = ? ORDER BY position",
+        (report_id,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+def delete_report_media_rows(report_id: int):
+    conn = get_db()
+    conn.execute("DELETE FROM report_media WHERE report_id = ?", (report_id,))
+    conn.commit()
+    conn.close()
 
 def get_worker_history_last_week(telegram_id: int) -> str:
     """Решение проблемы 6: Логирование истории отчетов сотрудника за неделю."""
@@ -6493,6 +6540,14 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 MEDIA_BATCH_BUFFERS: dict[int, dict] = {}
 MEDIA_BATCH_DEBOUNCE_SECONDS = 8
 
+# Если сотрудник присылает ЕЩЁ одно видео к УЖЕ существующему статусу в пределах этого окна
+# (например, забыл что-то сказать и досылает видео через несколько минут) — старое видео и
+# старый комментарий-оценка в группе удаляются, и публикуются ЗАНОВО все видео этого статуса
+# вместе (например 2 видео) с одним общим обновленным комментарием под ними.
+# Если видео приходит позже этого окна — старое видео в группе не трогается (остается историей),
+# дополняется только текст и комментарий-оценка (как раньше).
+MEDIA_MERGE_WINDOW_MINUTES = 20
+
 
 async def enqueue_media_report_item(user_id: int, context: ContextTypes.DEFAULT_TYPE, update: Update, text_content: str, now: datetime):
     """Добавляет видео/голосовое сообщение в буфер пользователя и (пере)запускает таймер ожидания.
@@ -6570,6 +6625,23 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         existing = await run_db(get_existing_report_row, user_id, date_str, report_type, slot_time)
         use_label = len(items) > 1 or existing is not None
 
+        # Определяем, попадаем ли мы в окно "слияния с переотправкой видео":
+        # сотрудник дополняет статус ВИДЕО в пределах MEDIA_MERGE_WINDOW_MINUTES после последнего
+        # обновления этого же статуса — тогда старое видео и старый комментарий в группе удаляются,
+        # и публикуются заново ВСЕ видео этого статуса вместе с одним обновленным комментарием.
+        do_full_merge = False
+        if existing and report_type == "status":
+            try:
+                prev_h, prev_m, prev_s = map(int, existing["received_at"].split(":"))
+                elapsed_minutes = (now.hour * 60 + now.minute) - (prev_h * 60 + prev_m)
+                do_full_merge = 0 <= elapsed_minutes <= MEDIA_MERGE_WINDOW_MINUTES
+            except Exception:
+                do_full_merge = False
+
+        old_media_rows = []
+        if do_full_merge:
+            old_media_rows = await run_db(get_report_media, existing["id"])
+
         if existing:
             merged_raw = build_addon_text(existing["raw_text"], text_content, use_video_label=True)
             ai_res = await check_status_async(merged_raw, report_type_override=report_type)
@@ -6605,17 +6677,42 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             )
             is_addon_item = False
 
-        # Пересылаем видео в группу, сохраняя порядок отправки
         copied_msg_id = None
-        try:
-            copied_msg = await context.bot.copy_message(
-                chat_id=dest_chat,
-                from_chat_id=upd.effective_chat.id,
-                message_id=upd.message.message_id
-            )
-            copied_msg_id = copied_msg.message_id
-        except Exception as e:
-            logger.error(f"Ошибка копирования видео {idx} в чат {dest_chat}: {e}")
+        if do_full_merge and old_media_rows:
+            # Удаляем СТАРЫЕ видео из группы (и старый комментарий чуть ниже, через общий механизм)
+            for m in old_media_rows:
+                if m["group_message_id"]:
+                    try:
+                        await context.bot.delete_message(chat_id=dest_chat, message_id=m["group_message_id"])
+                    except Exception as e:
+                        logger.warning(f"Не удалось удалить старое видео {m['group_message_id']} в чате {dest_chat}: {e}")
+            await run_db(delete_report_media_rows, report_id)
+
+            # Пересылаем заново ВСЕ видео этого статуса по порядку: старые (из их исходных сообщений
+            # у сотрудника) + новое.
+            media_sources = [(m["source_chat_id"], m["source_message_id"]) for m in old_media_rows]
+            media_sources.append((upd.effective_chat.id, upd.message.message_id))
+            for pos, (src_chat, src_msg) in enumerate(media_sources, start=1):
+                try:
+                    copied_msg = await context.bot.copy_message(chat_id=dest_chat, from_chat_id=src_chat, message_id=src_msg)
+                    await run_db(add_report_media, report_id, src_chat, src_msg, copied_msg.message_id, pos, now.strftime("%H:%M:%S"))
+                    if pos == 1:
+                        copied_msg_id = copied_msg.message_id
+                except Exception as e:
+                    logger.error(f"Ошибка повторной пересылки видео {pos} в чат {dest_chat}: {e}")
+        else:
+            # Обычный случай: пересылаем только ЭТО видео, старые (если были) не трогаем
+            try:
+                copied_msg = await context.bot.copy_message(
+                    chat_id=dest_chat,
+                    from_chat_id=upd.effective_chat.id,
+                    message_id=upd.message.message_id
+                )
+                copied_msg_id = copied_msg.message_id
+                next_pos = len(await run_db(get_report_media, report_id)) + 1
+                await run_db(add_report_media, report_id, upd.effective_chat.id, upd.message.message_id, copied_msg_id, next_pos, now.strftime("%H:%M:%S"))
+            except Exception as e:
+                logger.error(f"Ошибка копирования видео {idx} в чат {dest_chat}: {e}")
 
         results.append({
             "idx": idx, "report_type": report_type, "slot_time": slot_time,
@@ -6677,8 +6774,8 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         inline_kbd = InlineKeyboardMarkup(kbd_rows)
 
     # Если для какого-то из обновленных отчетов уже было своё предыдущее сообщение-оценка в группе —
-    # удаляем его, чтобы не плодить дубли. Сами видео (медиа-сообщения) НИКОГДА не удаляются —
-    # удаляется только текстовое сообщение-оценка под ними.
+    # удаляем его, чтобы не плодить дубли (это отдельно от удаления видео при слиянии внутри
+    # MEDIA_MERGE_WINDOW_MINUTES — то уже сделано выше для каждого видео индивидуально).
     old_messages_to_delete = set()
     for r in results:
         if r["is_addon"]:
