@@ -126,21 +126,17 @@ SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
     ASK_GSHEETS_CREDS,
     ASK_IMPORT_FILE,
     ASK_MOVE_POSITION_ORDER,
-    ASK_SUMMARY_DATE,
-    ASK_EDIT_SCHEDULE_DEPT,
-    ASK_DEPT_SCHEDULE_VAL,
     ASK_REG_LAST_NAME,
     ASK_REG_FIRST_NAME,
-) = range(34)
+    ASK_SETTINGS_ACTION,
+) = range(32)
 
 # Клавиатуры
 MAIN_MENU = ReplyKeyboardMarkup(
     [
-        ["📋 Сотрудники", "📊 Сводка сейчас", "📅 Сводка за дату"],
-        ["➕ Добавить сотрудника", "➖ Удалить сотрудника"],
-        ["🏢 Сотрудники отдела", "🔄 График отдела"],
-        ["⏰ Время сводки", "🆔 ID чата", "📣 Напомнить всем"],
-        ["📥 Выгрузить отчеты", "📥 Импорт сотрудников"],
+        ["📋 Сотрудники", "➕ Добавить сотрудника", "➖ Удалить сотрудника"],
+        ["🏢 Сотрудники отдела", "⏰ Время оповещений о статусах", "📣 Напомнить всем"],
+        ["📥 Выгрузить отчеты", "📥 Импорт сотрудников", "⚙️ Настройки бота"],
     ],
     resize_keyboard=True,
 )
@@ -199,19 +195,7 @@ def get_db():
 
 
 async def run_db(func, *args, **kwargs):
-    """Выполняет блокирующую функцию работы с БД в отдельном потоке.
-
-    Любая существующая синхронная функция (get_worker, save_report, calculate_worker_stats и т.д.)
-    использует sqlite3 синхронно. Вызванная напрямую из async-хендлера, она блокирует event loop
-    на время диска I/O — при нескольких пользователях бот начинает "подвисать" на сообщениях.
-
-    Использование: вместо
-        worker = get_worker(telegram_id)
-    в async-функции пишем:
-        worker = await run_db(get_worker, telegram_id)
-
-    Это не требует переписывать сами DB-функции — только точки их вызова из async-хендлеров.
-    """
+    """Выполняет блокирующую функцию работы с БД в отдельном потоке."""
     return await asyncio.to_thread(func, *args, **kwargs)
 
 def init_db():
@@ -282,18 +266,11 @@ def init_db():
     cols_reports = {row["name"] for row in conn.execute("PRAGMA table_info(reports)").fetchall()}
     if "raw_text" not in cols_reports:
         conn.execute("ALTER TABLE reports ADD COLUMN raw_text TEXT NOT NULL DEFAULT ''")
-    # Колонки для отслеживания текстового сообщения-оценки в группе: при дополнении статуса
-    # старое текстовое сообщение удаляется и пересоздаётся, а пересланные медиа (видео/голос)
-    # остаются как есть и не трогаются.
     if "group_chat_id" not in cols_reports:
         conn.execute("ALTER TABLE reports ADD COLUMN group_chat_id INTEGER")
     if "group_message_id" not in cols_reports:
         conn.execute("ALTER TABLE reports ADD COLUMN group_message_id INTEGER")
 
-    # Таблица для отслеживания каждого пересланного в группу видео/голосового по отчету.
-    # Нужна, чтобы при дополнении статуса В ПРЕДЕЛАХ временного окна (см. MEDIA_MERGE_WINDOW_MINUTES)
-    # можно было удалить СТАРЫЕ видео из группы и переслать заново уже ВСЕ видео этого статуса вместе,
-    # с одним общим комментарием под ними.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS report_media (
@@ -309,7 +286,6 @@ def init_db():
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_report_media_report ON report_media(report_id)")
 
-    # Таблица для настроек (для сохранения расписания сводок)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS settings (
@@ -319,7 +295,6 @@ def init_db():
         """
     )
 
-    # Таблица для зафиксированных отправленных напоминаний
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS sent_reminders (
@@ -331,7 +306,6 @@ def init_db():
         """
     )
 
-    # Таблица для зафиксированных отправленных предварительных напоминаний (за 10 минут)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS sent_pre_reminders (
@@ -343,7 +317,6 @@ def init_db():
         """
     )
 
-    # Таблица для сохранения данных незарегистрированных сотрудников
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS pending_unregistered_users (
@@ -357,17 +330,14 @@ def init_db():
         """
     )
 
-    # Индексы
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_date ON reports(report_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_worker_date ON reports(telegram_id, report_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_workers_pos ON workers(position)")
 
-    # Очистка тестовых или отмененных данных сотрудника ("Отмена")
     conn.execute(
         "DELETE FROM workers WHERE last_name LIKE '%Отмена%' OR first_name LIKE '%Отмена%' OR position LIKE '%Отмена%'"
     )
     
-    # Очистка старых напоминаний старше 7 дней
     conn.execute("DELETE FROM sent_reminders WHERE report_date < date('now', '-7 days')")
     conn.execute("DELETE FROM sent_pre_reminders WHERE report_date < date('now', '-7 days')")
 
@@ -565,8 +535,6 @@ def read_excel(file_path: str):
         schedule_val = row_values[idx_schedule] if idx_schedule != -1 and idx_schedule < len(row_values) else None
         daily_fact_val = row_values[idx_daily_fact] if idx_daily_fact != -1 and idx_daily_fact < len(row_values) else None
         
-        # We also check if user has name/position/brigade/object columns which we map gracefully:
-        # object column could be mapped to position/department if not specified
         object_id = "Основной"
         if idx_object != -1 and idx_object < len(row_values) and row_values[idx_object] is not None:
             obj_val = str(row_values[idx_object]).strip()
@@ -609,7 +577,6 @@ def read_excel(file_path: str):
         group_id = DEFAULT_GROUP_ID
         if group_val is not None:
             try:
-                # If they wrote e.g. "Бригада 1", it isn't an integer, so we ignore or map to DEFAULT_GROUP_ID
                 group_id = int(float(str(group_val).strip()))
             except ValueError:
                 pass
@@ -624,7 +591,6 @@ def read_excel(file_path: str):
             if df_str in ("0", "false", "нет", "no"):
                 needs_daily_fact = False
                 
-        # Generate a fallback tg_id if not present
         if tg_id is None:
             name_str = f"{last_name} {first_name} {position}"
             tg_id_hash = int(hashlib.md5(name_str.encode('utf-8')).hexdigest()[:7], 16)
@@ -649,7 +615,6 @@ def update_worker_field(telegram_id: int, field: str, value):
         raise ValueError(f"Недопустимое поле: {field}")
     conn = get_db()
     
-    # Решение проблемы 9: Сброс sort_order в 0 при смене отдела (position)
     if field == "position":
         next_order = get_next_sort_order(value)
         conn.execute("UPDATE workers SET position = ?, sort_order = ? WHERE telegram_id = ?", (value, next_order, telegram_id))
@@ -718,7 +683,6 @@ def get_group_name(group_id: int) -> str:
     return row["group_name"] if row else str(group_id)
 
 async def get_group_name_async(bot, group_id: int) -> str:
-    """Решение проблемы 8: автоматическое подтягивание названия некэшированной группы из Telegram."""
     conn = get_db()
     row = conn.execute("SELECT group_name FROM groups WHERE group_id = ?", (group_id,)).fetchone()
     conn.close()
@@ -751,7 +715,6 @@ async def fetch_and_save_group_name(bot, group_id: int) -> str:
     return name
 
 def save_report(telegram_id: int, report_date: str, report_type: str, slot_time: str | None, received_at: str, is_ok: bool, is_late: bool, format_comment: str, required_action: str, raw_text: str = "") -> int:
-    """Слегка изменена для возврата ID новой записи (для исправления оценок ИИ)."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
@@ -792,9 +755,6 @@ def update_report_text_and_ai(report_id: int, is_ok: bool, format_comment: str, 
         pass
 
 def set_report_group_message(report_id: int, chat_id: int, message_id: int):
-    """Сохраняет id текстового сообщения-оценки в группе, чтобы при следующем дополнении
-    к этому же отчёту можно было удалить старое сообщение и отправить новое.
-    Сообщения с пересланными медиа (видео/голос) сюда не относятся — они не трогаются."""
     conn = get_db()
     conn.execute(
         "UPDATE reports SET group_chat_id = ?, group_message_id = ? WHERE id = ?",
@@ -804,14 +764,12 @@ def set_report_group_message(report_id: int, chat_id: int, message_id: int):
     conn.close()
 
 def get_report_group_message(report_id: int):
-    """Возвращает (group_chat_id, group_message_id) ранее сохраненного сообщения-оценки в группе."""
     conn = get_db()
     row = conn.execute("SELECT group_chat_id, group_message_id FROM reports WHERE id = ?", (report_id,)).fetchone()
     conn.close()
     return row
 
 def get_submitted_status_slots(telegram_id: int, report_date: str) -> set:
-    """Слоты, по которым на сегодня у сотрудника уже есть отчет-статус."""
     conn = get_db()
     rows = conn.execute(
         "SELECT DISTINCT slot_time FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = 'status'",
@@ -821,15 +779,6 @@ def get_submitted_status_slots(telegram_id: int, report_date: str) -> set:
     return {r["slot_time"] for r in rows}
 
 def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots: set):
-    """Выбирает слот, к которому нужно отнести статус-отчет.
-
-    Если есть уже прошедшие, но ещё не сданные слоты — берём САМЫЙ РАННИЙ из них.
-    Это нужно, чтобы несколько видео/сообщений подряд (например, вечером, когда сотрудник
-    "догоняется" по пропущенным статусам) последовательно закрывали пропуски по порядку,
-    а не все скидывались в один и тот же (последний) слот.
-
-    Если пропущенных слотов нет — обычная логика "ближайший по времени слот"
-    (стандартная сдача отчета в реальном времени)."""
     current_mins = now.hour * 60 + now.minute
     missing_passed = []
     for slot in schedule:
@@ -844,7 +793,6 @@ def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots:
     return find_nearest_slot(schedule, now)
 
 def get_existing_report_row(telegram_id: int, report_date: str, report_type: str, slot_time: str | None = None):
-    """Находит уже существующий отчет за слот (status) или за день (daily_fact), если он есть."""
     conn = get_db()
     if report_type == "status":
         row = conn.execute(
@@ -860,9 +808,6 @@ def get_existing_report_row(telegram_id: int, report_date: str, report_type: str
     return row
 
 def build_addon_text(existing_raw: str, new_text: str, use_video_label: bool) -> str:
-    """Склеивает текст дополнения со старым текстом отчета, нумеруя видео ("[Видео N]")
-    или помечая текстовое дополнение ("[Дополнение]"), чтобы и в чате, и для самого ИИ
-    было понятно, что это N-я по счету запись, а не разрозненный текст."""
     existing_raw = existing_raw or ""
     if use_video_label:
         idx = existing_raw.count("[Видео ") + 1
@@ -875,9 +820,6 @@ def build_addon_text(existing_raw: str, new_text: str, use_video_label: bool) ->
     return f"{existing_raw}\n{label}: {new_text}" if existing_raw else new_text
 
 def add_report_media(report_id: int, source_chat_id: int, source_message_id: int, group_message_id: int | None, position: int, added_at: str):
-    """Запоминает, что для этого отчета в группу было переслано конкретное видео/голосовое —
-    откуда оно взято (source_chat_id/source_message_id, чтобы переслать заново) и куда было
-    переслано (group_message_id, чтобы можно было удалить, если потребуется)."""
     conn = get_db()
     conn.execute(
         "INSERT INTO report_media (report_id, source_chat_id, source_message_id, group_message_id, position, added_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -887,7 +829,6 @@ def add_report_media(report_id: int, source_chat_id: int, source_message_id: int
     conn.close()
 
 def get_report_media(report_id: int):
-    """Все видео/голосовые, привязанные к отчету, в порядке добавления."""
     conn = get_db()
     rows = conn.execute(
         "SELECT * FROM report_media WHERE report_id = ? ORDER BY position",
@@ -902,8 +843,18 @@ def delete_report_media_rows(report_id: int):
     conn.commit()
     conn.close()
 
+def cancel_not_working(telegram_id: int, report_date: str):
+    """Отменяет статус 'Не работаю сегодня' за конкретную дату, не трогая остальные отчеты
+    сотрудника за этот день (если сотрудник уже сдавал статусы до того, как отпросился)."""
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = 'not_working'",
+        (telegram_id, report_date)
+    )
+    conn.commit()
+    conn.close()
+
 def get_worker_history_last_week(telegram_id: int) -> str:
-    """Решение проблемы 6: Логирование истории отчетов сотрудника за неделю."""
     conn = get_db()
     rows = conn.execute(
         """
@@ -938,10 +889,6 @@ def get_worker_history_last_week(telegram_id: int) -> str:
     return "\n".join(lines)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Решение проблемы 12 (Хранение расписания сводок в БД)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def get_scheduled_times() -> list[str]:
     conn = get_db()
     row = conn.execute("SELECT value FROM settings WHERE key = 'summary_times'").fetchone()
@@ -968,7 +915,6 @@ def reschedule_summary_jobs(application: Application):
         logger.warning("JobQueue недоступен.")
         return
 
-    # Удаление существующих задач сводки
     for job in job_queue.get_jobs_by_name("daily_summary"):
         job.schedule_removal()
     for job in job_queue.get_jobs_by_name("weekly_monthly_summary"):
@@ -989,7 +935,6 @@ def reschedule_summary_jobs(application: Application):
         except Exception as e:
             logger.error(f"Критическая ошибка при планировании сводки на {t_str}: {e}")
 
-    # Планируем еженедельный и ежемесячный отчет на 09:00 ежедневно
     try:
         time_obj_wm = dt_module.time(hour=9, minute=0, tzinfo=LOCAL_TZ)
         job_queue.run_daily(
@@ -1002,11 +947,9 @@ def reschedule_summary_jobs(application: Application):
     except Exception as e:
         logger.error(f"Ошибка при планировании еженедельного/ежемесячного отчета: {e}")
 
-    # Удаление существующих задач резервного копирования
     for job in job_queue.get_jobs_by_name("daily_backup"):
         job.schedule_removal()
         
-    # Планируем бэкап на 03:00 ночи ежедневно
     try:
         time_obj_backup = dt_module.time(hour=3, minute=0, tzinfo=LOCAL_TZ)
         job_queue.run_daily(
@@ -1040,20 +983,14 @@ async def scheduled_summary_callback(context: ContextTypes.DEFAULT_TYPE):
 
 async def weekly_monthly_summary_callback(context: ContextTypes.DEFAULT_TYPE):
     now = now_local()
-    # Если сегодня понедельник (weekday == 0), отправляем еженедельный отчет
     if now.weekday() == 0:
         logger.info("Отправка еженедельного отчета (понедельник)...")
         await send_weekly_summary(context.bot)
         
-    # Если сегодня первое число месяца, отправляем ежемесячный отчет
     if now.day == 1:
         logger.info("Отправка ежемесячного отчета (первое число месяца)...")
         await send_monthly_summary(context.bot)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Вспомогательные функции авторизации и меню
-# ══════════════════════════════════════════════════════════════════════════════
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -1087,14 +1024,12 @@ async def notify_admins_new_registration(bot, w_fio: str, position: str, usernam
         f"📱 <b>Никнейм в TG:</b> @{username_esc}\n"
         f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>"
     )
-    # Notify individual admin IDs
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(chat_id=admin_id, text=admin_msg, parse_mode="HTML")
         except Exception as e:
             logger.error(f"Failed to send registration notification to admin {admin_id}: {e}")
             
-    # Notify the summary chat if configured
     if SUMMARY_CHAT_ID and SUMMARY_CHAT_ID not in ADMIN_IDS:
         try:
             await bot.send_message(chat_id=SUMMARY_CHAT_ID, text=admin_msg, parse_mode="HTML")
@@ -1105,49 +1040,45 @@ async def send_report_instruction(update: Update, context: ContextTypes.DEFAULT_
     user_id = update.effective_user.id
     chat_type = update.effective_chat.type
     await update.message.reply_text(
-    "*📹 Видео-статус*\n\n"
-    "Отправляйте видео в чат:\n"
-    "🕙 10:00 | 12:00 | 15:00 | 17:00\n\n"
-
-    "*Видео должно содержать:*\n"
-    "✅ Что сделали за последние 2 часа\n"
-    "✅ Объём работы\n"
-    "✅ Показать результат на видео и обозначить его голосом\n\n"
-
-    "*В видео скажите голосом:*\n"
-    "• Что было сделано\n"
-    "• Сколько сделано\n"
-    "• И где\n\n"
-
-    "Пример:\n"
-    "«За 2 часа выкопал 15 метров траншеи. "
-    "Показываю выполненную работу в кадре»\n\n"
-
-    "Всем кроме механизатовов\n"
-    "(если вы работаете за рулём техники вы факт не присылаете)\n\n"
-    "*В 17:00 отправьте 2 видео:*\n\n"
-    "1️⃣ Статус за последние 2 часа\n"
-    "— что сделали сейчас\n"
-    "— показать результат\n\n"
-
-    "2️⃣ Факт за весь день\n"
-    "— что сделали за день\n"
-    "— общий объём\n"
-    "— итоговый результат\n\n"
-
-    "Если нельзя показать работу:\n"
-    "укажите голосом:\n"
-    "• что сделали\n"
-    "• где сделали\n"
-    "• сколько сделали\n"
-    "• почему нельзя показать\n\n"
-
-    "⚠️ Исправляйте замечания по прошлым статусам. если бот делает вам замчания.\n"
-    "При повторном несоблюдении требований информация передаётся руководству для принятия дальнейшего решения.\n",
-    
-    parse_mode="Markdown",
-    reply_markup=menu_for_user(user_id, chat_type)
-)
+        "*Видео-статусы и факт выполненной работы*\n\n"
+        "Ровно в 10:00, 12:00, 15:00, 17:00 вам необходимо отправлять видео-статус в отчётный чат.\n\n"
+        "Статус состоит из:\n"
+        "1) Формат:\n"
+        "Только видеозапись с голосовым объяснением.\n"
+        "Видео должно быть записано вами в момент отправки статуса.\n"
+        "Голос в видео должен принадлежать сотруднику, который выполнял работу.\n"
+        "2) Содержание видео-статуса:\n\n"
+        "Вам необходимо указать:\n\n"
+        "что вы выполнили за отчётный период (за последние 2 часа);\n"
+        "какой объём работы выполнили;\n"
+        "показать на видео результат выполненной работы.\n\n"
+        "Видео должно подтверждать:\n\n"
+        "что работа выполнена;\n"
+        "где она выполнена;\n"
+        "какой результат получен.\n\n"
+        "Пример:\n\n"
+        "«За последние 2 часа выполнил монтаж 15 метров кабеля. Показываю выполненный участок и результат работы».\n\n"
+        "Важно: вечером в 17:00 вам необходимо отправить 2 видео\n"
+        "1. Видео-статус за последние 2 часа\n\n"
+        "В видео необходимо показать:\n\n"
+        "какую работу выполнили за последние 2 часа;\n"
+        "объём выполненной работы;\n"
+        "результат работы на текущий момент.\n"
+        "2. Факт выполненной работы за весь день\n\n"
+        "Во втором видео необходимо:\n\n"
+        "рассказать, какие работы вы выполняли за весь рабочий день;\n"
+        "указать общий объём выполненной работы;\n"
+        "показать итоговый результат работы.\n\n"
+        "Если часть работы невозможно показать:\n\n"
+        "объясните голосом, что было выполнено;\n"
+        "укажите место выполнения;\n"
+        "укажите объём работы;\n"
+        "укажите причину, почему результат невозможно показать.\n\n"
+        "Важно: замечания по вашим предыдущим статусам необходимо учитывать и исправлять в следующих отчётах.\n\n"
+        "При повторном несоблюдении требований информация передаётся руководству для принятия дальнейшего решения.",
+        parse_mode="Markdown",
+        reply_markup=menu_for_user(user_id, chat_type)
+    )
 
 def menu_for_user(user_id: int, chat_type: str = "private"):
     if is_admin(user_id) and chat_type == "private":
@@ -1201,14 +1132,7 @@ def get_next_sort_order(position: str) -> int:
     return 1
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Работа с ИИ (Groq / Whisper / Llama)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def normalize_ai_result(data: dict, source_text: str, report_type: str | None = "status") -> dict:
-    # report_type="status"/"daily_fact" — тип жёстко задан системой по времени (днём это всегда так).
-    # report_type=None — "авто"-режим: вечером система не может заранее сказать, статус это или факт,
-    # поэтому доверяем выбору модели из её собственного ответа (data["report_type"]).
     if report_type not in ("status", "daily_fact"):
         report_type = str(data.get("report_type", "status")).strip().lower()
         if report_type not in ("status", "daily_fact"):
@@ -1514,8 +1438,6 @@ def check_status(text: str, report_type: str | None = "status") -> dict:
         json_type_field = ""
         cache_key_prefix = report_type
     else:
-        # Авто-режим: используется ВЕЧЕРОМ, когда система не может заранее сказать,
-        # это запоздавший статус по конкретному времени или итог за весь день — решает сама модель по смыслу.
         mode_instruction = (
             "ВАЖНО: сейчас вечер, и система НЕ может заранее определить тип отчёта — сотрудник может присылать как\n"
             "запоздавший СТАТУС о конкретном моменте/периоде работы, так и ИТОГ ДНЯ (финальное подведение итогов за весь день).\n"
@@ -1534,7 +1456,6 @@ def check_status(text: str, report_type: str | None = "status") -> dict:
         return _ai_status_cache[h]
     try:
         response = groq_client.chat.completions.create(
-            # Решение проблемы 10: смена модели на llama-3.3-70b-versatile
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "Отвечай только валидным JSON без Markdown."},
@@ -1561,25 +1482,11 @@ async def clean_report_async(text: str) -> str:
 
 
 async def check_status_async(text: str, report_type_override: str | None = None) -> dict:
-    # report_type_override="status" или "daily_fact" — тип жёстко задан системой (днём всегда так,
-    # факт дня физически не может прийти раньше последнего слота статуса).
-    # report_type_override=None — "авто"-режим (только вечером): тип определяет сама модель по смыслу,
-    # это позволяет различить, например, 2 видео "на статус" и 1 "на факт", присланные в одно и то же время.
     res = await asyncio.to_thread(check_status, text, report_type_override)
     return res
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Статистика и автоотчеты (Еженедельные / Ежемесячные / Систематические нарушители)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def calculate_worker_stats(worker, start_date_str: str, end_date_str: str, conn) -> dict:
-    """
-    Рассчитывает статистику сдачи отчетов сотрудником в диапазоне дат [start_date, end_date] (включительно).
-    Исключает дни, когда у сотрудника был выходной (report_type = 'not_working').
-    Учитывает дату первого отчета сотрудника как начало его работы, чтобы не считать пропуски до начала работы.
-    """
-    # Определяем дату самого первого отчета сотрудника
     join_row = conn.execute(
         "SELECT MIN(report_date) as start_date FROM reports WHERE telegram_id = ?",
         (worker["telegram_id"],)
@@ -1590,7 +1497,6 @@ def calculate_worker_stats(worker, start_date_str: str, end_date_str: str, conn)
         if join_row["start_date"] > start_date_str:
             adjusted_start_date_str = join_row["start_date"]
             
-    # Получаем все отчеты за период
     reports = conn.execute(
         "SELECT * FROM reports WHERE telegram_id = ? AND report_date >= ? AND report_date <= ?",
         (worker["telegram_id"], adjusted_start_date_str, end_date_str)
@@ -1639,7 +1545,6 @@ def calculate_worker_stats(worker, start_date_str: str, end_date_str: str, conn)
         if date_it_str not in not_working_dates:
             slots = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
             if date_it_str == now_date_str:
-                # Если сегодня, считаем только прошедшие временные слоты
                 for slot in slots:
                     hour, minute = map(int, slot.split(":"))
                     slot_mins = hour * 60 + minute
@@ -1699,7 +1604,6 @@ def save_violators_threshold(val: int):
 
 async def send_weekly_summary(bot):
     now = now_local()
-    # Период: с прошлого понедельника по вчерашнее воскресенье
     end_dt = now - dt_module.timedelta(days=1)
     start_dt = now - dt_module.timedelta(days=7)
     
@@ -1763,7 +1667,6 @@ async def send_weekly_summary(bot):
 
 async def send_monthly_summary(bot):
     now = now_local()
-    # Период: весь предыдущий календарный месяц
     first_day_this_month = now.replace(day=1)
     last_day_prev_month = first_day_this_month - dt_module.timedelta(days=1)
     start_day_prev_month = last_day_prev_month.replace(day=1)
@@ -1833,10 +1736,6 @@ async def send_monthly_summary(bot):
             pass
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Решение проблемы 4 (Детализированная сводка, различающая статус и факт дня)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def generate_daily_summary_text(report_date: str) -> str:
     conn = get_db()
     workers = conn.execute("SELECT * FROM workers ORDER BY position, sort_order, last_name, first_name").fetchall()
@@ -1869,7 +1768,6 @@ def generate_daily_summary_text(report_date: str) -> str:
         firstname_lower = (w["first_name"] or "").lower()
         dept_lower = (w["position"] or "").lower()
         
-        # Исключаем тестовые записи ("отмена" или "тест")
         if any(x in lastname_lower or x in firstname_lower or x in dept_lower for x in ("отмена", "test", "тест")):
             continue
             
@@ -1882,7 +1780,6 @@ def generate_daily_summary_text(report_date: str) -> str:
         if not dept_workers:
             continue
             
-        # Рассчитываем статистику отдела за сегодня
         dept_expected = 0
         dept_submitted = 0
         for w in dept_workers:
@@ -1922,7 +1819,6 @@ def generate_daily_summary_text(report_date: str) -> str:
                 
             w_reports = reports_by_worker.get(tid, {"status": {}, "daily_fact": [], "not_working": None})
             
-            # Проверяем, если сегодня человек не работает
             if w_reports.get("not_working"):
                 reason = w_reports["not_working"]["format_comment"] or "не указана"
                 summary_lines.append(f"👨‍💻 {name}")
@@ -1930,7 +1826,6 @@ def generate_daily_summary_text(report_date: str) -> str:
                 summary_lines.append("")
                 continue
                 
-            # 1. Почасовые статусы
             schedule_slots = SCHEDULES.get(w["schedule"], SCHEDULE_A)
             status_segments = []
             issues_list = []
@@ -1953,7 +1848,6 @@ def generate_daily_summary_text(report_date: str) -> str:
             
             status_str = " | ".join(status_segments)
             
-            # 2. Факт дня (daily_fact)
             if w["needs_daily_fact"]:
                 fact_reps = w_reports["daily_fact"]
                 if fact_reps:
@@ -1982,7 +1876,6 @@ def generate_daily_summary_text(report_date: str) -> str:
             summary_lines.append("")
         summary_lines.append("")
 
-    # ── Секция: Систематические нарушители (за последние 7 дней от даты сводки) ──
     violations_lines = []
     threshold = get_violators_threshold()
     
@@ -2028,10 +1921,6 @@ def generate_daily_summary_text(report_date: str) -> str:
 
     return "\n".join(summary_lines)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Решение проблемы 7 (Обработчик Callback-кнопки переключения результатов)
-# ══════════════════════════════════════════════════════════════════════════════
 
 def format_show_date(date_str: str) -> str:
     try:
@@ -2123,7 +2012,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         
         await query.answer("Оценка скорректирована!")
         
-        # Обновляем текст сообщения, сохраняя историю
         original_text = query.message.text or ""
         if "Официальный отчет:" in original_text:
             new_text = update_message_text_fields(original_text, new_ok == 1, new_comment)
@@ -2228,16 +2116,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             logger.error(f"Ошибка обновления типа отчета в сообщении: {e}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Базовые хэндлеры команд
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = update.effective_chat.type
     if is_admin(update.effective_user.id) and chat_type == "private":
         await update.message.reply_text("Привет! Выберите действие кнопкой ниже.", reply_markup=MAIN_MENU)
     else:
-        # Для зарегистрированных работников показываем меню с кнопкой, для остальных - убираем клавиатуру
         await update.message.reply_text(
             "Привет! Отправьте видеоотчет, когда он будет готов.",
             reply_markup=menu_for_user(update.effective_user.id, chat_type)
@@ -2247,7 +2130,61 @@ async def get_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"ID чата: {update.effective_chat.id}", reply_markup=menu_for_user(update.effective_user.id, update.effective_chat.type))
 
 
-# ── Нарушители: Управление порогом ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Настройки бота (ID чата, Google Таблица) — собраны под одной компактной кнопкой,
+# чтобы не загромождать главное меню
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update):
+        return ConversationHandler.END
+    kbd = ReplyKeyboardMarkup(
+        [["🆔 ID чата"], ["📊 Настроить Google Таблицу"], ["❌ Назад"]],
+        resize_keyboard=True
+    )
+    await update.message.reply_text("⚙️ Настройки бота. Выберите действие:", reply_markup=kbd)
+    return ASK_SETTINGS_ACTION
+
+async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    choice = update.message.text.strip()
+
+    if choice == "❌ Назад":
+        await update.message.reply_text("Главное меню.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+
+    if choice == "🆔 ID чата":
+        kbd = ReplyKeyboardMarkup(
+            [["🆔 ID чата"], ["📊 Настроить Google Таблицу"], ["❌ Назад"]],
+            resize_keyboard=True
+        )
+        await update.message.reply_text(f"ID чата: {update.effective_chat.id}", reply_markup=kbd)
+        return ASK_SETTINGS_ACTION
+
+    if choice == "📊 Настроить Google Таблицу":
+        spreadsheet_id = get_setting("google_spreadsheet_id", "Не задан")
+        service_account_str = get_setting("google_service_account")
+        email = "Не задан"
+        if service_account_str:
+            try:
+                email = json.loads(service_account_str).get("client_email", "Не задан")
+            except Exception:
+                pass
+
+        await update.message.reply_text(
+            f"⚙️ **Текущие настройки Google Таблиц:**\n\n"
+            f"🔗 **ID таблицы:** `{spreadsheet_id}`\n"
+            f"📧 **Сервисный аккаунт:** `{email}`\n\n"
+            f"Пришлите полную ссылку на вашу Google Таблицу или её ID, чтобы настроить или изменить интеграцию.\n\n"
+            f"💡 *Вы можете нажать кнопку ниже для отмены.*",
+            reply_markup=CANCEL_KEYBOARD,
+            parse_mode="Markdown"
+        )
+        return ASK_GSHEETS_URL
+
+    await update.message.reply_text("Пожалуйста, выберите один из вариантов на клавиатуре.")
+    return ASK_SETTINGS_ACTION
+
+
 async def set_threshold_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Эта команда доступна только администраторам.")
@@ -2274,7 +2211,6 @@ async def set_threshold_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("❌ Неверный формат числа. Пример: `/threshold 4`.")
 
 
-# ── Поиск сотрудника по имени ────────────────────────────────────────────────
 async def find_worker_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update):
         return ConversationHandler.END
@@ -2358,6 +2294,7 @@ async def find_worker_command(update: Update, context: ContextTypes.DEFAULT_TYPE
                 ["✏️ Изменить группу", "✏️ Изменить объект"],
                 ["✏️ Факт дня", "✏️ Статус работы"],
                 ["🔼 Вверх в списке", "🔽 Вниз в списке"],
+                ["↩️ Отменить 'Не работаю'"],
                 ["❌ Отмена"]
             ],
             resize_keyboard=True,
@@ -2376,103 +2313,6 @@ async def find_worker_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines.append("\n👉 Выберите сотрудника по номеру из списка:")
         await update.message.reply_text("\n".join(lines), reply_markup=numbered_workers_keyboard(valid_rows))
         return ASK_LIST_WORKER
-
-
-# ── Сводка за дату ───────────────────────────────────────────────────────────
-async def summary_date_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update): return ConversationHandler.END
-    await update.message.reply_text(
-        "📅 Пожалуйста, введите интересующую вас дату в формате *ДД.ММ.ГГГГ* (например, `26.06.2026`):",
-        parse_mode="Markdown",
-        reply_markup=CANCEL_KEYBOARD
-    )
-    return ASK_SUMMARY_DATE
-
-async def summary_date_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update): return ConversationHandler.END
-    raw = update.message.text.strip()
-    
-    parsed_date = None
-    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
-        try:
-            parsed_date = datetime.strptime(raw, fmt)
-            break
-        except ValueError:
-            continue
-            
-    if parsed_date is None:
-        await update.message.reply_text(
-            "❌ Неверный формат даты. Пожалуйста, введите дату в формате *ДД.ММ.ГГГГ* (например, `26.06.2026`):",
-            parse_mode="Markdown"
-        )
-        return ASK_SUMMARY_DATE
-        
-    date_str = parsed_date.strftime("%Y-%m-%d")
-    await update.message.reply_text(f"⏳ Формирую сводку за {parsed_date.strftime('%d.%m.%Y')}...")
-    summary_text = generate_daily_summary_text(date_str)
-    
-    parts = split_message(summary_text)
-    for part in parts[:-1]:
-        await update.message.reply_text(part)
-    if parts:
-        await update.message.reply_text(parts[-1], reply_markup=MAIN_MENU)
-        
-    return ConversationHandler.END
-
-
-# ── Массовое изменение графика отдела ─────────────────────────────────────────
-async def dept_schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update): return ConversationHandler.END
-    await update.message.reply_text(
-        "🏢 Выберите отдел, в котором хотите изменить график всех сотрудников:",
-        reply_markup=departments_reply_keyboard(context)
-    )
-    return ASK_EDIT_SCHEDULE_DEPT
-
-async def dept_schedule_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update): return ConversationHandler.END
-    dept = update.message.text.strip()
-    
-    conn = get_db()
-    rows = conn.execute("SELECT COUNT(*) as cnt FROM workers WHERE lower(position) = lower(?)", (dept,)).fetchone()
-    conn.close()
-    
-    if not rows or rows["cnt"] == 0:
-        await update.message.reply_text("❌ Отдел не найден. Попробуйте еще раз или выберите из меню.")
-        return ASK_EDIT_SCHEDULE_DEPT
-        
-    context.user_data["dept_to_change_schedule"] = dept
-    await update.message.reply_text(
-        f"⚙️ Выберите новый график для сотрудников отдела *{dept}* (всего {rows['cnt']} чел.):",
-        parse_mode="Markdown",
-        reply_markup=SCHEDULE_KEYBOARD
-    )
-    return ASK_DEPT_SCHEDULE_VAL
-
-async def dept_schedule_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update): return ConversationHandler.END
-    sched_val = update.message.text.strip().upper()
-    dept = context.user_data.get("dept_to_change_schedule")
-    
-    if sched_val not in ("A", "B"):
-        await update.message.reply_text("❌ Пожалуйста, выберите A или B:", reply_markup=SCHEDULE_KEYBOARD)
-        return ASK_DEPT_SCHEDULE_VAL
-        
-    conn = get_db()
-    conn.execute(
-        "UPDATE workers SET schedule = ? WHERE lower(position) = lower(?) AND is_active = 1",
-        (sched_val, dept)
-    )
-    conn.commit()
-    conn.close()
-    
-    await update.message.reply_text(
-        f"✅ График всех активных сотрудников отдела *{dept}* успешно изменен на *{sched_val}*!",
-        parse_mode="Markdown",
-        reply_markup=MAIN_MENU
-    )
-    context.user_data.clear()
-    return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2538,7 +2378,6 @@ async def import_workers_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             except Exception as ex:
                 logging.error(f"Error importing worker {w}: {ex}")
                 
-        # Clean up temp file
         if os.path.exists(local_path):
             os.remove(local_path)
             
@@ -2555,10 +2394,6 @@ async def import_workers_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"❌ Произошла ошибка во время импорта: {e}", reply_markup=MAIN_MENU)
         return ConversationHandler.END
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Диалог 📋 Список и редактирование сотрудников
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def list_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return ConversationHandler.END
@@ -2588,7 +2423,6 @@ async def list_workers_department(update: Update, context: ContextTypes.DEFAULT_
         gname = group_names.get(row["group_id"], str(row["group_id"]))
         lines.append(f"{i}. {row['last_name']} {row['first_name']}\n   График: {row['schedule']} ({schedule_str})\n   Группа: {gname} | Факт дня: {fact}")
 
-    # Решение проблемы 11: Объединение уведомления со списком сотрудников
     lines.append("\n👉 Выберите сотрудника по номеру из списка:")
     await update.message.reply_text("\n".join(lines), reply_markup=numbered_workers_keyboard(rows))
     return ASK_LIST_WORKER
@@ -2617,7 +2451,6 @@ async def list_workers_select(update: Update, context: ContextTypes.DEFAULT_TYPE
     object_name = worker.get("object_id", "Основной")
     info = f"👤 {worker['last_name']} {worker['first_name']}\nОбъект: {object_name}\nОтдел: {worker['position']}\nГрафик: {worker['schedule']} ({schedule_str})\nГруппа: {gname}\nФакт дня: {fact}\nСтатус работы: {active_str}\n\nЧто хотите сделать?"
 
-    # Добавление кнопки Истории еженедельных оценок (проблема 6)
     kbd = ReplyKeyboardMarkup(
         [
             ["📅 История за неделю", "✏️ Номер в списке"],
@@ -2626,6 +2459,7 @@ async def list_workers_select(update: Update, context: ContextTypes.DEFAULT_TYPE
             ["✏️ Изменить группу", "✏️ Изменить объект"],
             ["✏️ Факт дня", "✏️ Статус работы"],
             ["🔼 Вверх в списке", "🔽 Вниз в списке"],
+            ["↩️ Отменить 'Не работаю'"],
             ["❌ Отмена"]
         ],
         resize_keyboard=True,
@@ -2664,6 +2498,34 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
             return ConversationHandler.END
         swap_sort_order(worker["telegram_id"], rows[target_idx]["telegram_id"])
         await update.message.reply_text(f"Порядок изменен для {worker['last_name']}.", reply_markup=MAIN_MENU)
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if action == "↩️ Отменить 'Не работаю'":
+        date_str = now_local().strftime("%Y-%m-%d")
+        existing = await run_db(get_existing_report_row, worker["telegram_id"], date_str, "not_working", None)
+        if not existing:
+            await update.message.reply_text(
+                f"У {worker['last_name']} {worker['first_name']} сегодня не установлен статус «Не работаю».",
+                reply_markup=MAIN_MENU
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        await run_db(cancel_not_working, worker["telegram_id"], date_str)
+        asyncio.create_task(async_sync_gsheets_background())
+        await update.message.reply_text(
+            f"✅ Статус «Не работаю» для {worker['last_name']} {worker['first_name']} отменён. "
+            f"Сотрудник снова может сдавать отчёты сегодня.",
+            reply_markup=MAIN_MENU
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=worker["telegram_id"],
+                text="ℹ️ Администратор отменил ваш статус «Не работаю сегодня». Вы можете продолжать сдавать отчёты."
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить сотрудника {worker['telegram_id']} об отмене статуса 'не работаю': {e}")
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -2813,7 +2675,7 @@ async def edit_sort_order_finish(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(f"Недопустимый порядковый номер. Пожалуйста, введите число от 1 до {num_workers}:")
         return ASK_EDIT_SORT_ORDER
         
-    target_idx = target_num - 1 # 0-based target index
+    target_idx = target_num - 1
     
     position = worker["position"]
     all_dept_workers = [dict(r) for r in get_workers_by_position(position)]
@@ -2923,10 +2785,6 @@ async def edit_move_position_order_finish(update: Update, context: ContextTypes.
     return ConversationHandler.END
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Диалог ➕ Добавление сотрудника
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def add_worker_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return ConversationHandler.END
     context.user_data.clear()
@@ -3015,7 +2873,6 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
     delete_pending_unregistered_user(context.user_data["new_worker_id"])
     await fetch_and_save_group_name(context.bot, context.user_data["group_id"])
     
-    # Отправляем уведомление о новом сотруднике в группу
     target_group_id = context.user_data["group_id"] or DEFAULT_GROUP_ID
     try:
         notify_msg = f"👤 {context.user_data['last_name']} {context.user_data['first_name']} добавлен в систему, ID: {context.user_data['new_worker_id']}"
@@ -3029,10 +2886,6 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
     context.user_data.clear()
     return ConversationHandler.END
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Диалог ➖ Удаление сотрудника
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def delete_worker_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return ConversationHandler.END
@@ -3084,10 +2937,6 @@ async def delete_worker_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Просмотр сотрудников отдела и Сводка
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def department_workers_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return ConversationHandler.END
     rows = get_all_workers()
@@ -3111,25 +2960,6 @@ async def department_workers_show(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text("\n".join(lines), reply_markup=MAIN_MENU)
     return ConversationHandler.END
 
-async def send_summary_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update): return
-    now = now_local()
-    date_str = now.strftime("%Y-%m-%d")
-    summary_text = generate_daily_summary_text(date_str)
-    
-    parts = split_message(summary_text)
-    for part in parts[:-1]:
-        await update.message.reply_text(part)
-    if parts:
-        await update.message.reply_text(parts[-1], reply_markup=MAIN_MENU)
-    
-    if SUMMARY_CHAT_ID and SUMMARY_CHAT_ID != update.effective_chat.id:
-        try:
-            for part in split_message(summary_text):
-                await context.bot.send_message(chat_id=SUMMARY_CHAT_ID, text=part)
-        except Exception as e:
-            logger.error(f"Не удалось отправить сводку в чат {SUMMARY_CHAT_ID}: {e}")
-
 
 async def myreports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -3144,13 +2974,11 @@ async def myreports(update: Update, context: ContextTypes.DEFAULT_TYPE):
         thirty_days_ago = (now - dt_module.timedelta(days=30)).strftime("%Y-%m-%d")
         seven_days_ago = (now - dt_module.timedelta(days=7)).strftime("%Y-%m-%d")
         
-        # Извлекаем отчеты за последние 30 дней для этого сотрудника
         reports_30 = conn.execute(
             "SELECT * FROM reports WHERE telegram_id = ? AND report_date >= ? ORDER BY report_date DESC, received_at DESC",
             (user_id, thirty_days_ago)
         ).fetchall()
         
-        # Получаем дату первого отчета
         join_row = conn.execute(
             "SELECT MIN(report_date) as start_date FROM reports WHERE telegram_id = ?",
             (user_id,)
@@ -3158,7 +2986,6 @@ async def myreports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         conn.close()
 
-    # Сначала считаем статистику за 30 дней
     not_working_dates = set()
     submitted_statuses = set()
     submitted_facts = set()
@@ -3196,7 +3023,6 @@ async def myreports(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if join_row["start_date"] > thirty_days_ago:
             start_date_str = join_row["start_date"]
             
-    # Расчет ожидаемых отчетов
     start_dt = datetime.strptime(start_date_str, "%Y-%m-%d").date()
     end_dt = now.date()
     
@@ -3333,7 +3159,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
 
-    # Check status slots
     schedule_slots = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
     status_segments = []
     issues_list = []
@@ -3356,7 +3181,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     comment = comment[len("не ОК: "):]
                 issues_list.append(f"  └ ⚠️ {slot} — {comment}")
         else:
-            # Check if slot time has passed
             sh, sm = map(int, slot.split(":"))
             current_mins = now.hour * 60 + now.minute
             slot_mins = sh * 60 + sm
@@ -3369,7 +3193,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.extend(status_segments)
     lines.append("")
     
-    # Check daily_fact
     if worker["needs_daily_fact"]:
         if fact_reps:
             f_rep = fact_reps[-1]
@@ -3404,12 +3227,10 @@ def format_date_no_year(date_str) -> str:
     if not date_str or date_str == "-":
         return "-"
     try:
-        # Try YYYY-MM-DD
         dt = datetime.strptime(date_str, "%Y-%m-%d")
         return dt.strftime("%d.%m")
     except Exception:
         try:
-            # Try DD.MM.YYYY
             dt = datetime.strptime(date_str, "%d.%m.%Y")
             return dt.strftime("%d.%m")
         except Exception:
@@ -3425,12 +3246,10 @@ def format_time_no_seconds(time_str) -> str:
     if not time_str or time_str == "-":
         return "-"
     try:
-        # Try HH:MM:SS
         dt = datetime.strptime(time_str, "%H:%M:%S")
         return dt.strftime("%H:%M")
     except Exception:
         try:
-            # Try HH:MM
             dt = datetime.strptime(time_str, "%H:%M")
             return dt.strftime("%H:%M")
         except Exception:
@@ -3440,20 +3259,11 @@ def format_time_no_seconds(time_str) -> str:
             return time_str
 
 
-# ── Шифрование чувствительных настроек ───────────────────────────────────────
-# Ключи, которые нельзя хранить в settings открытым текстом (секреты, токены доступа).
 ENCRYPTED_SETTING_KEYS = {"google_service_account"}
 
 _fernet = None
 
 def _get_fernet():
-    """Возвращает Fernet-инстанс для шифрования/расшифровки настроек.
-
-    Ключ берётся из переменной окружения SETTINGS_ENCRYPTION_KEY (сгенерировать через
-    `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
-    и сохранить в .env). Если ключ не задан — шифрование выключено (с предупреждением в лог),
-    чтобы не потерять доступ к существующим данным при первом запуске без настройки.
-    """
     global _fernet
     if _fernet is not None:
         return _fernet
@@ -3488,8 +3298,6 @@ def get_setting(key: str, default: str = None) -> str:
             try:
                 return fernet.decrypt(value.encode()).decode()
             except Exception:
-                # Значение могло быть сохранено до включения шифрования — отдаём как есть,
-                # но логируем, чтобы было видно, что есть незашифрованные legacy-данные.
                 logger.warning("Настройка %s не расшифрована (возможно, сохранена без шифрования)", key)
                 return value
     return value
@@ -3513,7 +3321,6 @@ def set_setting(key: str, value: str):
 def fetch_export_data(dept: str = None, only_facts: bool = False):
     conn = get_db()
     try:
-        # 1. Fetch active workers that match dept
         if dept is not None:
             workers = conn.execute("SELECT * FROM workers WHERE lower(position) = lower(?)", (dept,)).fetchall()
         else:
@@ -3531,7 +3338,6 @@ def fetch_export_data(dept: str = None, only_facts: bool = False):
             
         where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
         
-        # We fetch relevant reports
         query = f"""
             SELECT r.id, r.telegram_id, r.report_date, r.report_type, r.slot_time, r.is_ok, r.format_comment, r.received_at
             FROM reports r
@@ -3540,7 +3346,6 @@ def fetch_export_data(dept: str = None, only_facts: bool = False):
         """
         reports = conn.execute(query, params).fetchall()
         
-        # Fetch first daily_fact date for each worker to determine when the fact requirement started
         first_fact_rows = conn.execute(
             "SELECT telegram_id, MIN(report_date) as first_date FROM reports WHERE report_type = 'daily_fact' GROUP BY telegram_id"
         ).fetchall()
@@ -3551,10 +3356,8 @@ def fetch_export_data(dept: str = None, only_facts: bool = False):
     if not reports:
         return None
         
-    # Find list of unique dates and sort them chronologically
     unique_dates = sorted(list(set(r["report_date"] for r in reports)))
     
-    # Map report keys: (telegram_id, date, slot/type)
     reports_map = {}
     for r in reports:
         tid = r["telegram_id"]
@@ -3575,7 +3378,6 @@ def fetch_export_data(dept: str = None, only_facts: bool = False):
             "received_at": r["received_at"]
         }
         
-    # Include all workers we fetched
     workers_dict = {}
     for w in workers:
         workers_dict[w["telegram_id"]] = {
@@ -3589,7 +3391,6 @@ def fetch_export_data(dept: str = None, only_facts: bool = False):
             "sort_order": w["sort_order"] or 0,
         }
         
-    # Also include any worker from reports who is not in workers_dict (e.g. deleted worker)
     for r in reports:
         tid = r["telegram_id"]
         if tid not in workers_dict:
@@ -3604,10 +3405,8 @@ def fetch_export_data(dept: str = None, only_facts: bool = False):
                 "sort_order": 99999,
             }
             
-    # Group display_workers by dynamic department
     workers_by_dept = {}
     for tid, w in workers_dict.items():
-        # Exclude test/placeholder objects
         lastname_lower = (w["last_name"] or "").lower()
         firstname_lower = (w["first_name"] or "").lower()
         dept_lower = (w["position"] or "").lower()
@@ -3642,7 +3441,6 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
         
     unique_dates, reports_map, sorted_depts, workers_by_dept, first_fact_dates = data
         
-    # Start Excel Generation
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
     from openpyxl.comments import Comment
@@ -3655,7 +3453,6 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
     
     font_family = "Segoe UI"
     
-    # Style declarations
     header_font = Font(name=font_family, size=11, bold=True, color="000000")
     dept_font = Font(name=font_family, size=11, bold=True, color="000000")
     worker_font = Font(name=font_family, size=11, bold=False, color="000000")
@@ -3663,21 +3460,17 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
     ok_font = Font(name=font_family, size=12, bold=False, color="000000")
     fail_font = Font(name=font_family, size=12, bold=False, color="000000")
     
-    # Fills
     header_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
     dept_fill = PatternFill(start_color="D6C9F5", end_color="D6C9F5", fill_type="solid")
     fail_fill = PatternFill(start_color="FCE4E4", end_color="FCE4E4", fill_type="solid")
     gray_fill = PatternFill(start_color="EAEAEA", end_color="EAEAEA", fill_type="solid")
     
-    # Borders
     thin_border_side = Side(border_style="thin", color="000000")
     grid_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
     
-    # Alignments
     center_align = Alignment(vertical="center", horizontal="center")
     left_align_wrap = Alignment(vertical="center", horizontal="left", wrap_text=True)
     
-    # Headers
     ws.cell(row=1, column=1, value="Сотрудник").font = header_font
     ws.cell(row=1, column=1).fill = header_fill
     ws.cell(row=1, column=1).alignment = center_align
@@ -3710,7 +3503,6 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
         if not dept_workers:
             continue
             
-        # Write Department Section header row
         ws.row_dimensions[curr_row].height = 22
         ws.merge_cells(start_row=curr_row, start_column=1, end_row=curr_row, end_column=len(unique_dates) + 2)
         cell = ws.cell(row=curr_row, column=1, value=f"{dept_name}")
@@ -3749,13 +3541,11 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
                 r_idx = curr_row + sub_idx
                 ws.row_dimensions[r_idx].height = 20
                 
-                # Column B (Time slot)
                 slot_cell = ws.cell(row=r_idx, column=2, value=slot)
                 slot_cell.font = slot_font
                 slot_cell.alignment = center_align
                 slot_cell.border = grid_border
                 
-                # Column C onwards
                 for d_idx, date in enumerate(unique_dates, start=3):
                     cell = ws.cell(row=r_idx, column=d_idx)
                     cell.alignment = center_align
@@ -3805,7 +3595,6 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
                             else:
                                 cell.value = ""
                         
-            # Format and set borders inside merged cell parts
             for sub_idx in range(num_rows):
                 r_idx = curr_row + sub_idx
                 for c_idx in range(1, len(unique_dates) + 3):
@@ -3813,16 +3602,13 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
                     
             curr_row += num_rows
 
-    # ── Создание второго листа: Аналитика ──
     try:
         ws_anal = wb.create_sheet(title="Аналитика")
         ws_anal.views.sheetView[0].showGridLines = True
         
-        # Styles for Analytics
         anal_header_font = Font(name=font_family, size=11, bold=True, color="000000")
         anal_cell_font = Font(name=font_family, size=11, color="000000")
         
-        # Determine the weeks present in unique_dates
         import datetime as dt_mod
         week_keys = set()
         for d_str in unique_dates:
@@ -3835,7 +3621,6 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
                 
         sorted_weeks = sorted(list(week_keys))
         
-        # Headers
         ws_anal.cell(row=1, column=1, value="Сотрудник").font = anal_header_font
         ws_anal.cell(row=1, column=1).alignment = center_align
         ws_anal.cell(row=1, column=1).border = grid_border
@@ -3868,11 +3653,9 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
         ws_anal.cell(row=1, column=8).alignment = center_align
         ws_anal.cell(row=1, column=8).border = grid_border
         
-        # Week headers and map them to columns
         col_idx = 9
-        week_columns = {} # (year, week): col_idx
+        week_columns = {}
         for (year, week) in sorted_weeks:
-            # Get monday and sunday
             d = dt_mod.date(year, 1, 4)
             d = d + dt_mod.timedelta(weeks=week - 1)
             mon = d - dt_mod.timedelta(days=d.weekday())
@@ -3890,7 +3673,6 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
             week_columns[(year, week)] = col_idx
             col_idx += 1
             
-        # Add worker rows
         conn_anal = get_db()
         row_idx = 2
         
@@ -3910,7 +3692,6 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
                 ws_anal.cell(row=row_idx, column=3, value=worker.get('object_id', 'Основной')).font = anal_cell_font
                 ws_anal.cell(row=row_idx, column=3).border = grid_border
                 
-                # Calculate overall stats
                 overall_expected = 0
                 overall_submitted = 0
                 overall_lates = 0
@@ -3958,9 +3739,7 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
                 else:
                     c_overall.fill = gray_light_fill
 
-                # Calculate for each week
                 for (year, week), col_c in week_columns.items():
-                    # calculate start and end dates
                     d = dt_mod.date(year, 1, 4)
                     d = d + dt_mod.timedelta(weeks=week - 1)
                     mon = d - dt_mod.timedelta(days=d.weekday())
@@ -3981,7 +3760,6 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
                             cell.value = percent_val
                             cell.number_format = '0.0%'
                             
-                            # Heatmap color scale
                             if stats["percent"] >= 90:
                                 cell.fill = green_fill
                             elif stats["percent"] >= 70:
@@ -3999,7 +3777,6 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
                 
         conn_anal.close()
         
-        # Auto-adjust column widths for Analytics sheet
         for col in ws_anal.columns:
             max_len = 0
             for cell in col:
@@ -4013,7 +3790,6 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
     except Exception as ex:
         logger.error(f"Не удалось сформировать лист Аналитика в Excel: {ex}")
             
-    # Save Workbook to dynamic ByteIO
     from io import BytesIO
     bio = BytesIO()
     wb.save(bio)
@@ -4042,7 +3818,6 @@ async def generate_and_send_excel(update: Update, context: ContextTypes.DEFAULT_
 gsheets_sync_lock = asyncio.Lock()
 
 async def async_sync_gsheets_background():
-    """Асинхронно запускает фоновую синхронизацию с Google Таблицей, если она настроена, используя глобальную блокировку."""
     spreadsheet_id = get_setting("google_spreadsheet_id")
     service_account_str = get_setting("google_service_account")
     if not spreadsheet_id or not service_account_str:
@@ -4534,7 +4309,6 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
 
     total_rows = len(values)
     
-    # Получаем исходные размеры листа для полной очистки перед форматированием
     orig_rows = 1000
     orig_cols = 50
     try:
@@ -4715,7 +4489,6 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
     restore_requests = []
     new_date_cols = {d: idx for idx, d in enumerate(unique_dates, start=2)}
     
-    # 1. Column colors
     for date_str, bg in existing_column_colors.items():
         if date_str in new_date_cols:
             col_idx = new_date_cols[date_str]
@@ -4737,7 +4510,6 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
                 }
             })
             
-    # 2. Cell colors
     for (w_name, date_str, slot), bg in existing_cell_colors.items():
         if slot == "dept_header":
             if w_name in new_dept_rows and date_str in new_date_cols:
@@ -4782,7 +4554,6 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
                     }
                 })
                 
-    # 3. Cell notes
     for (w_name, date_str, slot), note in existing_notes_map.items():
         if (w_name, slot) in new_worker_rows and date_str in new_date_cols:
             r_idx = new_worker_rows[(w_name, slot)]
@@ -4803,7 +4574,6 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
                 }
             })
             
-    # 4. Merges
     for m in existing_manual_merges:
         if m["type"] == "worker":
             w_name = m["worker"]
@@ -5345,7 +5115,6 @@ async def export_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     kbd = ReplyKeyboardMarkup([
         ["📊 Excel (.xlsx)", "🟢 Google Таблица"],
-        ["⚙️ Настроить Google Таблицу"],
         ["❌ Отмена"]
     ], resize_keyboard=True)
     
@@ -5384,7 +5153,7 @@ async def export_format_selected(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text(
                 "⚠️ **Интеграция с Google Таблицами не настроена!**\n\n"
                 "Для работы интеграции:\n"
-                "1. Настройте интеграцию с помощью кнопки *⚙️ Настроить Google Таблицу*.\n"
+                "1. Откройте *⚙️ Настройки бота → 📊 Настроить Google Таблицу*.\n"
                 "2. Укажите ID таблицы и JSON-ключ сервисного аккаунта.\n"
                 "3. Дайте права Редактора аккаунту Google.",
                 reply_markup=MAIN_MENU,
@@ -5401,27 +5170,6 @@ async def export_format_selected(update: Update, context: ContextTypes.DEFAULT_T
             reply_markup=kbd
         )
         return ASK_EXPORT_TYPE
-        
-    if choice == "⚙️ Настроить Google Таблицу":
-        spreadsheet_id = get_setting("google_spreadsheet_id", "Не задан")
-        service_account_str = get_setting("google_service_account")
-        email = "Не задан"
-        if service_account_str:
-            try:
-                email = json.loads(service_account_str).get("client_email", "Не задан")
-            except Exception:
-                pass
-                
-        await update.message.reply_text(
-            f"⚙️ **Текущие настройки Google Таблиц:**\n\n"
-            f"🔗 **ID таблицы:** `{spreadsheet_id}`\n"
-            f"📧 **Сервисный аккаунт:** `{email}`\n\n"
-            f"Пришлите полную ссылку на вашу Google Таблицу или её ID, чтобы настроить или изменить интеграцию.\n\n"
-            f"💡 *Вы можете нажать кнопку ниже для отмены.*",
-            reply_markup=CANCEL_KEYBOARD,
-            parse_mode="Markdown"
-        )
-        return ASK_GSHEETS_URL
         
     await update.message.reply_text("Пожалуйста, выберите один из вариантов на клавиатуре.")
     return ASK_EXPORT_FORMAT
@@ -5565,8 +5313,6 @@ async def export_department_selected(update: Update, context: ContextTypes.DEFAU
 async def check_missing_reports_job(context: ContextTypes.DEFAULT_TYPE):
     now = now_local()
 
-    # Напоминания о статусах нужны только в будние дни (пн-пт).
-    # weekday(): 0=понедельник ... 5=субота, 6=воскресенье
     if now.weekday() >= 5:
         return
 
@@ -5582,7 +5328,6 @@ async def check_missing_reports_job(context: ContextTypes.DEFAULT_TYPE):
     ).fetchall()
     submitted_worker_slots = {(r["telegram_id"], r["slot_time"]) for r in reports}
     
-    # Исключаем сотрудников, у которых сегодня выходной/не работают
     not_working_reports = conn.execute(
         "SELECT telegram_id FROM reports WHERE report_date = ? AND report_type = 'not_working'",
         (date_str,)
@@ -5615,7 +5360,6 @@ async def check_missing_reports_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 continue
                 
-            # 1. Предварительное напоминание (за 10 минут до слота)
             if current_mins >= slot_mins - 12 and current_mins <= slot_mins - 6:
                 if (tid, slot) not in submitted_worker_slots and (tid, slot) not in sent_pre_worker_slots:
                     conn.execute(
@@ -5633,7 +5377,6 @@ async def check_missing_reports_job(context: ContextTypes.DEFAULT_TYPE):
                     except Exception as e:
                         logger.warning(f"Ошибка личного предварительного уведомления {tid} за слот {slot}: {e}")
 
-            # 2. Опоздание / Забытый отчет (через 30 минут после слота)
             if current_mins >= slot_mins + 25 and current_mins <= slot_mins + 55:
                 if (tid, slot) not in submitted_worker_slots and (tid, slot) not in sent_worker_slots:
                     conn.execute(
@@ -5698,7 +5441,6 @@ async def remind_all_missing(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if overdue_slots:
             slots_str = ", ".join(overdue_slots)
             try:
-                # Напоминание сотруднику
                 await context.bot.send_message(
                     chat_id=tid,
                     text=f"⏰ Срочное напоминание! Вы пропустили отправку отчетов за слоты (сегменты): **{slots_str}**.\n\nПожалуйста, немедленно отправьте отчет в бот!",
@@ -5706,7 +5448,6 @@ async def remind_all_missing(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
                 reminded_count += 1
                 
-                # Сообщение в чат бригады
                 if not is_quiet_mode_enabled():
                     group_id = w["group_id"] or DEFAULT_GROUP_ID
                     await context.bot.send_message(
@@ -5721,10 +5462,6 @@ async def remind_all_missing(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup=MAIN_MENU
     )
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Настройка расписания автоматической сводки (Время сводки)
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def summary_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return ConversationHandler.END
@@ -5840,10 +5577,6 @@ async def conversation_timeout_callback(update: Update, context: ContextTypes.DE
         except Exception:
             pass
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Самостоятельная регистрация сотрудников
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = update.effective_chat.type
     if chat_type != "private":
@@ -5862,7 +5595,6 @@ async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
         
-    # Не зарегистрирован
     await update.message.reply_text(
         "👋 *Добро пожаловать в систему сдачи отчетов!*\n\n"
         "Вы не зарегистрированы в системе.\n"
@@ -5886,7 +5618,6 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
     workers = find_unregistered_workers_by_lastname(text)
     
     if len(workers) == 0:
-        # Уведомляем администраторов
         last_name_tg_esc = html.escape(last_name_tg)
         first_name_tg_esc = html.escape(first_name_tg)
         username_esc = html.escape(username)
@@ -5904,7 +5635,6 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
             except Exception:
                 pass
                 
-        # Также отправляем в SUMMARY_CHAT_ID
         if SUMMARY_CHAT_ID and SUMMARY_CHAT_ID not in ADMIN_IDS:
             try:
                 await context.bot.send_message(chat_id=SUMMARY_CHAT_ID, text=admin_msg, parse_mode="HTML")
@@ -5920,7 +5650,6 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
         return ConversationHandler.END
         
     elif len(workers) == 1:
-        # Один кандидат найден
         candidate = workers[0]
         old_id = candidate["telegram_id"]
         
@@ -5942,7 +5671,6 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
             reply_markup=menu_for_user(user_id)
         )
         
-        # Уведомляем администраторов
         await notify_admins_new_registration(
             bot=context.bot,
             w_fio=w_fio,
@@ -5954,10 +5682,8 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
         return ConversationHandler.END
         
     else:
-        # Найдено несколько человек
         context.user_data["candidate_workers"] = [dict(w) for w in workers]
         
-        # Строим клавиатуру с именами
         buttons = []
         for w in workers:
             buttons.append([f"{w['last_name']} {w['first_name']}"])
@@ -6013,7 +5739,6 @@ async def register_firstname_received(update: Update, context: ContextTypes.DEFA
         reply_markup=menu_for_user(user_id)
     )
     
-    # Уведомляем администраторов
     await notify_admins_new_registration(
         bot=context.bot,
         w_fio=w_fio,
@@ -6027,28 +5752,21 @@ async def register_firstname_received(update: Update, context: ContextTypes.DEFA
 
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Прием отчетов от сотрудников (Голос / Видео / Текст)
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    # Проверка, не редактирует ли администратор комментарий ИИ к отчету
     if is_admin(user_id) and context.user_data.get("editing_comment_report_id"):
         report_id = context.user_data["editing_comment_report_id"]
         original_chat_id = context.user_data.get("editing_comment_chat_id")
         original_msg_id = context.user_data.get("editing_comment_message_id")
         original_text = context.user_data.get("editing_comment_original_text", "")
         
-        # Сброс состояния
         del context.user_data["editing_comment_report_id"]
         context.user_data.pop("editing_comment_chat_id", None)
         context.user_data.pop("editing_comment_message_id", None)
         context.user_data.pop("editing_comment_original_text", None)
         prompt_message_id = context.user_data.pop("editing_comment_prompt_message_id", None)
         
-        # Попытка удалить сообщение-запрос и ответ администратора
         if prompt_message_id and original_chat_id:
             try:
                 await context.bot.delete_message(chat_id=original_chat_id, message_id=prompt_message_id)
@@ -6069,13 +5787,11 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
             return
             
-        # Обновляем комментарий в БД
         new_action = f"Комментарий изменен администратором вручную: {new_comment}"
         conn.execute(
             "UPDATE reports SET format_comment = ?, required_action = ? WHERE id = ?",
             (new_comment, new_action, report_id)
         )
-        # Получаем обновленное состояние
         report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
         worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
         conn.commit()
@@ -6085,10 +5801,8 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
         status_emoji = "✅" if report["is_ok"] == 1 else "⚠️"
         
-        # Обновляем оригинальное сообщение в группе / чате
         if original_chat_id and original_msg_id:
             try:
-                # Если исходное сообщение в укороченном формате
                 if "Официальный отчет:" not in (original_text or ""):
                     updated_text = (
                         f"🔧 Оценка отчета изменена вручную администратором @{update.effective_user.username or user_id}:\n"
@@ -6120,7 +5834,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker = await run_db(get_worker, user_id)
     
     text_content = ""
-    # Решение проблемы 2: Обеспечение гарантированного создания каталога tmp/ и очистки через try/finally
     tmp_path = None
     
     try:
@@ -6153,7 +5866,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         is_media = bool(update.message.voice or update.message.video or update.message.video_note)
 
-        # Решение проблемы 3: Сохранение данных незарегистрированных сотрудников по TELEGRAM_ID (через SQLite)
         if not worker:
             user_info = {
                 "first_name": update.effective_user.first_name or "",
@@ -6171,7 +5883,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text_content=user_info["text"]
             )
             
-            # Оповещение администраторов
             admin_msg = (
                 f"👤 Обнаружен отчет от незарегистрированного сотрудника!\n"
                 f"TG ID: {user_id}\n"
@@ -6212,7 +5923,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Проверка статуса "Не работаю сегодня"
         if context.user_data.get("awaiting_not_working_reason"):
             reason = text_content
             if reason.lower() in ("отмена", "❌ отмена"):
@@ -6229,8 +5939,8 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             kbd = ReplyKeyboardMarkup([["Да, я уверен", "❌ Отмена"]], resize_keyboard=True)
             await update.message.reply_text(
-                f"⚠️ Внимание! При переключении в статус 'Не работаю сегодня' ВСЕ ваши сегодняшние отчеты будут безвозвратно удалены.\n\n"
-                f"Вы уверены, что хотите продолжить? Причина: {reason}",
+                f"Уже сданные сегодня отчёты (если были) сохранятся — статус «Не работаю» просто добавится к ним.\n\n"
+                f"Подтвердите: причина — {reason}",
                 reply_markup=kbd
             )
             return
@@ -6244,13 +5954,9 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 now = now_local()
                 date_str = now.strftime("%Y-%m-%d")
                 
-                conn = get_db()
-                conn.execute(
-                    "DELETE FROM reports WHERE telegram_id = ? AND report_date = ?",
-                    (user_id, date_str)
-                )
-                conn.commit()
-                conn.close()
+                # Не удаляем уже сданные сегодня отчёты (статусы/факт) — например, сотрудник
+                # сдал статус в 10:00, а в 12:00 ему стало плохо и он отпросился домой.
+                # Утренние отчёты должны сохраниться.
                 
                 await run_db(
                     save_report,
@@ -6321,12 +6027,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # КРИТИЧЕСКАЯ ЗАЩИТА: текст кнопок клавиатуры (например "❌ Отмена", "Да, я уверен")
-        # НИКОГДА не должен попадать в систему как настоящий отчет сотрудника.
-        # Такое могло произойти, если человек нажал кнопку диалога ПОСЛЕ того, как этот диалог
-        # уже завершился/истёк по таймауту — тогда нажатие "проваливалось" сюда и неправильно
-        # классифицировалось ИИ как реальный (плохой) отчет, попадая в группу и в БД.
-        # Отчетом считается ТОЛЬКО то, что сотрудник реально написал сам, или видео/голосовое — и ничего больше.
         if not is_media and text_content.strip() in (CANCEL_TEXT, "Да, я уверен"):
             await update.message.reply_text(
                 "Это была кнопка диалога, который уже завершился — отчётом она не считается.\n"
@@ -6337,9 +6037,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         now = now_local()
 
-        # Видео/голосовые отчеты теперь обрабатываются пачкой (см. enqueue_media_report_item):
-        # если сотрудник пришлет несколько видео подряд, бот подождет немного, соберет их вместе
-        # и сформирует ОДНО общее сообщение-оценку в группе вместо нескольких разрозненных.
         if is_media:
             await enqueue_media_report_item(user_id, context, update, text_content, now)
             return
@@ -6347,10 +6044,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date_str = now.strftime("%Y-%m-%d")
         sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
         
-        # Определение типа отчёта по времени: факт дня физически не может прийти раньше
-        # последнего слота статуса — днём тип всегда "статус". Вечером же тип не фиксируем
-        # жёстко, а даём ИИ самому решить по смыслу (см. check_status: режим "авто") —
-        # это нужно, чтобы отличить запоздавший статус по конкретному времени от итога дня.
         last_slot_time_str = sched_list[-1]
         last_hour, last_minute = map(int, last_slot_time_str.split(":"))
         last_slot_time = now.replace(hour=last_hour, minute=last_minute, second=0, microsecond=0)
@@ -6358,7 +6051,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         report_type_override = "status" if now <= last_slot_limit else None
 
-        # Анализ промптом Llama для определения типа отчета
         ai_res_pre = await check_status_async(text_content, report_type_override=report_type_override)
         report_type = ai_res_pre["report_type"]
 
@@ -6373,15 +6065,11 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_addon = False
         if existing_report:
             is_addon = True
-            # Склеиваем предыдущий текст и новое текстовое дополнение.
             text_content = build_addon_text(existing_report["raw_text"], text_content, use_video_label=False)
-            # Прогоняем КЛАССИФИКАЦИЮ и АНАЛИЗ заново для объединенного контента.
-            # Тип отчета при дополнении не пересматриваем — он уже закреплен за этой записью.
             ai_res = await check_status_async(text_content, report_type_override=report_type)
             cleaned_text = await clean_report_async(text_content)
             report_id = existing_report["id"]
             
-            # Обновляем существующий отчет в БД
             await run_db(
                 update_report_text_and_ai,
                 report_id=report_id,
@@ -6410,7 +6098,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         w_name = f"{worker['last_name']} {worker['first_name']}"
         
-        # Информирование сотрудника
         time_str = now.strftime("%H:%M")
         if ai_res["report_type"] == "status" and nearest_slot:
             sh, sm = map(int, nearest_slot.split(":"))
@@ -6451,10 +6138,8 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
 
-        # Решение проблемы 7: Кнопка «Исправить оценку» во всех отчетах для администраторов или в группе
         dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
         
-        # Получаем красивое название группы
         gname = await get_group_name_async(context.bot, dest_chat)
         
         title_text = f"Дополнение к отчету (отчет обновлен): {w_name}" if is_addon else w_name
@@ -6471,9 +6156,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         inline_kbd = make_report_keyboard(report_id, ai_res["report_type"])
 
-        # При дополнении удаляем СТАРОЕ текстовое сообщение-оценку в группе (если оно есть),
-        # чтобы не плодить дубли. Пересланные медиа (видео/голосовые) НЕ трогаем — они остаются
-        # в группе как и были, новое медиа (если есть) просто добавляется отдельным сообщением ниже.
         if is_addon and existing_report and existing_report["group_chat_id"] and existing_report["group_message_id"]:
             try:
                 await context.bot.delete_message(
@@ -6510,11 +6192,8 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=notify_text,
                     reply_markup=inline_kbd
                 )
-            # Запоминаем id этого сообщения, чтобы следующее дополнение к этому отчету
-            # могло его удалить и заменить новым (а не плодить дубли в группе).
             await run_db(set_report_group_message, report_id, dest_chat, sent_notify_msg.message_id)
         except Exception as e:
-            # Предохранитель: если отправка в группу сломалась, дублируем всем админам
             logger.error(f"Ошибка отправки оценки в чат {dest_chat}: {e}")
             for admin_id in ADMIN_IDS:
                 try:
@@ -6551,7 +6230,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lock.release()
         except Exception:
             pass
-        # Решение проблемы 2: безусловная чистка временного файла
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -6559,34 +6237,13 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Ошибка удаления файла {tmp_path}: {rm_e}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Пачковая обработка видео/голосовых отчетов
-# ══════════════════════════════════════════════════════════════════════════════
-# Если сотрудник присылает несколько видео подряд (например, 3 видео вечером, из которых
-# 2 на самом деле статус по конкретному времени, а 1 — итог дня), бот не обрабатывает их
-# по одному, а ждет короткую паузу, собирает все пришедшие видео вместе и:
-#   1) пересылает их все в группу по порядку (как и раньше);
-#   2) классифицирует КАЖДОЕ видео отдельно (статус/факт — по смыслу, если вечер);
-#   3) создает/дополняет правильные строки в БД для каждого видео отдельно;
-#   4) публикует ОДНО общее сообщение под всеми видео с разбивкой "Видео 1 / 2 / 3"
-#      и общим итогом, вместо нескольких разрозненных сообщений.
-
 MEDIA_BATCH_BUFFERS: dict[int, dict] = {}
 MEDIA_BATCH_DEBOUNCE_SECONDS = 8
 
-# Если сотрудник присылает ЕЩЁ одно видео к УЖЕ существующему статусу в пределах этого окна
-# (например, забыл что-то сказать и досылает видео через несколько минут) — старое видео и
-# старый комментарий-оценка в группе удаляются, и публикуются ЗАНОВО все видео этого статуса
-# вместе (например 2 видео) с одним общим обновленным комментарием под ними.
-# Если видео приходит позже этого окна — старое видео в группе не трогается (остается историей),
-# дополняется только текст и комментарий-оценка (как раньше).
 MEDIA_MERGE_WINDOW_MINUTES = 20
 
 
 async def enqueue_media_report_item(user_id: int, context: ContextTypes.DEFAULT_TYPE, update: Update, text_content: str, now: datetime):
-    """Добавляет видео/голосовое сообщение в буфер пользователя и (пере)запускает таймер ожидания.
-    Если в течение MEDIA_BATCH_DEBOUNCE_SECONDS придет еще одно видео — таймер сбрасывается,
-    и все видео будут обработаны вместе одной пачкой."""
     buf = MEDIA_BATCH_BUFFERS.setdefault(user_id, {"items": [], "task": None})
     buf["items"].append({"update": update, "text_content": text_content, "now": now})
 
@@ -6600,7 +6257,6 @@ async def _flush_media_batch(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     try:
         await asyncio.sleep(MEDIA_BATCH_DEBOUNCE_SECONDS)
     except asyncio.CancelledError:
-        # Пришло новое видео, таймер был перезапущен — эта задача больше не нужна
         return
 
     buf = MEDIA_BATCH_BUFFERS.pop(user_id, None)
@@ -6623,7 +6279,7 @@ async def _flush_media_batch(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 async def process_media_batch(user_id: int, items: list[dict], context: ContextTypes.DEFAULT_TYPE):
     worker = await run_db(get_worker, user_id)
     if not worker:
-        return  # незарегистрированный сотрудник уже обработан на этапе приёма каждого видео
+        return
 
     sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
     w_name = f"{worker['last_name']} {worker['first_name']}"
@@ -6642,9 +6298,6 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         last_slot_time = now.replace(hour=last_hour, minute=last_minute, second=0, microsecond=0)
         last_slot_limit = last_slot_time + dt_module.timedelta(minutes=LATE_THRESHOLD_MIN)
 
-        # Днём факт дня в принципе невозможен — это всегда статус.
-        # Вечером даём ИИ решить по смыслу каждого видео отдельно — так бот различает
-        # видео "на статус" и видео "на факт", даже если все они присланы в одно и то же время.
         forced_type = "status" if now <= last_slot_limit else None
 
         ai_res_pre = await check_status_async(text_content, report_type_override=forced_type)
@@ -6659,10 +6312,6 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         existing = await run_db(get_existing_report_row, user_id, date_str, report_type, slot_time)
         use_label = len(items) > 1 or existing is not None
 
-        # Определяем, попадаем ли мы в окно "слияния с переотправкой видео":
-        # сотрудник дополняет статус ВИДЕО в пределах MEDIA_MERGE_WINDOW_MINUTES после последнего
-        # обновления этого же статуса — тогда старое видео и старый комментарий в группе удаляются,
-        # и публикуются заново ВСЕ видео этого статуса вместе с одним обновленным комментарием.
         do_full_merge = False
         if existing and report_type == "status":
             try:
@@ -6713,7 +6362,6 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
 
         copied_msg_id = None
         if do_full_merge and old_media_rows:
-            # Удаляем СТАРЫЕ видео из группы (и старый комментарий чуть ниже, через общий механизм)
             for m in old_media_rows:
                 if m["group_message_id"]:
                     try:
@@ -6722,8 +6370,6 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                         logger.warning(f"Не удалось удалить старое видео {m['group_message_id']} в чате {dest_chat}: {e}")
             await run_db(delete_report_media_rows, report_id)
 
-            # Пересылаем заново ВСЕ видео этого статуса по порядку: старые (из их исходных сообщений
-            # у сотрудника) + новое.
             media_sources = [(m["source_chat_id"], m["source_message_id"]) for m in old_media_rows]
             media_sources.append((upd.effective_chat.id, upd.message.message_id))
             for pos, (src_chat, src_msg) in enumerate(media_sources, start=1):
@@ -6735,7 +6381,6 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 except Exception as e:
                     logger.error(f"Ошибка повторной пересылки видео {pos} в чат {dest_chat}: {e}")
         else:
-            # Обычный случай: пересылаем только ЭТО видео, старые (если были) не трогаем
             try:
                 copied_msg = await context.bot.copy_message(
                     chat_id=dest_chat,
@@ -6755,7 +6400,6 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             "date_str": date_str,
         })
 
-        # Личный фидбек сотруднику по каждому видео отдельно (как и раньше)
         time_str = now.strftime("%H:%M")
         suffix_tail = f" (видео {idx} из {len(items)})" if len(items) > 1 else ""
         if report_type == "status" and slot_time:
@@ -6773,7 +6417,6 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
     if not results:
         return
 
-    # Формируем ОДНО общее сообщение-оценку в группу под всеми видео этой пачки
     if len(results) == 1:
         r = results[0]
         notify_text = (
@@ -6807,9 +6450,6 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             ])
         inline_kbd = InlineKeyboardMarkup(kbd_rows)
 
-    # Если для какого-то из обновленных отчетов уже было своё предыдущее сообщение-оценка в группе —
-    # удаляем его, чтобы не плодить дубли (это отдельно от удаления видео при слиянии внутри
-    # MEDIA_MERGE_WINDOW_MINUTES — то уже сделано выше для каждого видео индивидуально).
     old_messages_to_delete = set()
     for r in results:
         if r["is_addon"]:
@@ -6841,8 +6481,6 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 pass
 
 
-# ── Новые функции для Прораб-Бот ──
-
 async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id) and await run_db(get_worker, user_id) is None:
@@ -6872,7 +6510,6 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if stats["expected"] > 0:
                 leaderboard.append((w, stats))
         
-        # Сортировка по проценту, количеству сданных, отсутствию опозданий
         leaderboard.sort(key=lambda x: (x[1]["percent"], x[1]["submitted"], -x[1]["lates"]), reverse=True)
         
         top_5 = leaderboard[:5]
@@ -6969,7 +6606,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     now = now_local()
-    # По умолчанию с начала текущего месяца до сегодняшнего дня
     start_date = dt_module.date(now.year, now.month, 1)
     end_date = now.date()
     
@@ -7117,13 +6753,7 @@ async def daily_backup_callback(context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Инициализация и запуск приложения
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def post_init(application: Application):
-    """Срабатывает после запуска приложения Telegram."""
-    # Решение проблемы 8: автоматическое сохранение имени группы по умолчанию при старте
     try:
         chat = await application.bot.get_chat(DEFAULT_GROUP_ID)
         name = chat.title or str(DEFAULT_GROUP_ID)
@@ -7132,10 +6762,8 @@ async def post_init(application: Application):
     except Exception as e:
         logger.error(f"Не удалось получить название DEFAULT_GROUP_ID {DEFAULT_GROUP_ID}: {e}")
 
-    # Решение проблемы 12: Восстановление автосводок из БД при старте / перезапуске
     reschedule_summary_jobs(application)
 
-    # Периодическая фоновая проверка забытых/пропущенных отчетов (каждые 5 минут)
     job_queue = application.job_queue
     if job_queue:
         job_queue.run_repeating(check_missing_reports_job, interval=300, first=10)
@@ -7146,11 +6774,8 @@ def main():
         logger.error("Критическая ошибка: не задан TELEGRAM_TOKEN")
         return
 
-    # Запуск бота с подключением к функции post_init для восстановления кеша и сводок
     application = Application.builder().token(TOKEN).post_init(post_init).build()
 
-    # Точечные команды и кнопки меню (срабатывают моментально)
-    # Команда /start теперь обрабатывается в registration_handler для поддержки саморегистрации
     application.add_handler(CommandHandler("myreports", myreports))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("threshold", set_threshold_command))
@@ -7158,14 +6783,10 @@ def main():
     application.add_handler(CommandHandler("set_object_group", set_object_group_command))
     application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CommandHandler("quiet_mode", cmd_quiet_mode))
-    application.add_handler(MessageHandler(filters.Regex("^🆔 ID чата$"), get_chat_id))
-    application.add_handler(MessageHandler(filters.Regex("^📊 Сводка сейчас$"), send_summary_now))
     application.add_handler(MessageHandler(filters.Regex("^📣 Напомнить всем$"), remind_all_missing))
     
-    # Callback-кнопки (для изменения оценок)
     application.add_handler(CallbackQueryHandler(handle_callback_query))
 
-    # Диалоговые обработчики (ConversationHandlers)
     list_handler = ConversationHandler(
         entry_points=[
             CommandHandler("find", find_worker_command),
@@ -7227,7 +6848,7 @@ def main():
     )
 
     summary_scheduler_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^⏰ Время сводки$"), summary_time_start)],
+        entry_points=[MessageHandler(filters.Regex("^⏰ Время оповещений о статусах$"), summary_time_start)],
         states={
             ASK_REPORT_TIME: [MessageHandler(DIALOG_TEXT, summary_time_action)],
             ASK_EDIT_SCHEDULE: [MessageHandler(DIALOG_TEXT, summary_time_add_finish)],
@@ -7262,27 +6883,12 @@ def main():
         conversation_timeout=300,
     )
 
-    summary_date_handler = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex("^📅 Сводка за дату$"), summary_date_start),
-            CommandHandler("summary_date", summary_date_start)
-        ],
+    settings_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^⚙️ Настройки бота$"), settings_start)],
         states={
-            ASK_SUMMARY_DATE: [MessageHandler(DIALOG_TEXT, summary_date_finish)],
-            ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conversation_timeout_callback)],
-        },
-        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
-        conversation_timeout=300,
-    )
-
-    dept_schedule_handler = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex("^🔄 График отдела$"), dept_schedule_start),
-            CommandHandler("dept_schedule", dept_schedule_start)
-        ],
-        states={
-            ASK_EDIT_SCHEDULE_DEPT: [MessageHandler(DIALOG_TEXT, dept_schedule_value)],
-            ASK_DEPT_SCHEDULE_VAL: [MessageHandler(DIALOG_TEXT, dept_schedule_finish)],
+            ASK_SETTINGS_ACTION: [MessageHandler(DIALOG_TEXT, settings_action)],
+            ASK_GSHEETS_URL: [MessageHandler(DIALOG_TEXT, export_gsheets_url_received)],
+            ASK_GSHEETS_CREDS: [MessageHandler(filters.Document.ALL | filters.TEXT & ~filters.COMMAND, export_gsheets_creds_received)],
             ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conversation_timeout_callback)],
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
@@ -7303,7 +6909,6 @@ def main():
         conversation_timeout=300,
     )
 
-    # Регистрация диалогов
     application.add_handler(registration_handler)
     application.add_handler(list_handler)
     application.add_handler(add_handler)
@@ -7312,15 +6917,12 @@ def main():
     application.add_handler(summary_scheduler_handler)
     application.add_handler(export_handler)
     application.add_handler(import_handler)
-    application.add_handler(summary_date_handler)
-    application.add_handler(dept_schedule_handler)
+    application.add_handler(settings_handler)
 
-    # Дополнительные хэндлеры для меню обычных сотрудников
     application.add_handler(MessageHandler(filters.Regex("^📋 Инструкция по сдаче видео-статуса$"), send_report_instruction))
     application.add_handler(MessageHandler(filters.Regex("^📊 Мой статус$"), status))
     application.add_handler(MessageHandler(filters.Regex("^📅 Мои отчеты за 30 дней$"), myreports))
 
-    # Хэндлер для приема аудио/видео/текстовых отчетов сотрудников (регистрируется в самом конце)
     application.add_handler(MessageHandler(
         filters.VOICE | filters.VIDEO | filters.VIDEO_NOTE | filters.TEXT & ~filters.COMMAND, 
         handle_report
