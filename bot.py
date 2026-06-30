@@ -4532,6 +4532,18 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
         
     full_requests = [
         {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": ws_id,
+                    "gridProperties": {
+                        "frozenRowCount": 0,
+                        "frozenColumnCount": 0
+                    }
+                },
+                "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount"
+            }
+        },
+        {
             "setDataValidation": {
                 "range": {
                     "sheetId": ws_id,
