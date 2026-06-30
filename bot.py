@@ -4231,12 +4231,12 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
                     "startRowIndex": curr_row,
                     "endRowIndex": curr_row + 1,
                     "startColumnIndex": 0,
-                    "endColumnIndex": 2
+                    "endColumnIndex": num_cols
                 },
                 "mergeType": "MERGE_ALL"
             }
         })
-        
+
         requests.append({
             "repeatCell": {
                 "range": {
