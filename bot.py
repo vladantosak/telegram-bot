@@ -2174,7 +2174,7 @@ async def settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update):
         return ConversationHandler.END
     kbd = ReplyKeyboardMarkup(
-        [["📊 Настроить Google Таблицу"], ["❌ Назад"]],
+        [["📊 Настроить Google Таблицу"], ["🗑 Очистить базу от удалённых сотрудников"], ["❌ Назад"]],
         resize_keyboard=True
     )
     await update.message.reply_text("⚙️ Настройки бота. Выберите действие:", reply_markup=kbd)
@@ -2185,6 +2185,18 @@ async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if choice == "❌ Назад":
         await update.message.reply_text("Главное меню.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+
+    if choice == "🗑 Очистить базу от удалённых сотрудников":
+        deleted = await asyncio.to_thread(cleanup_orphaned_reports)
+        if deleted:
+            await update.message.reply_text(
+                f"✅ Удалено {deleted} записей отчётов от сотрудников, которых больше нет в базе.",
+                reply_markup=MAIN_MENU
+            )
+            asyncio.create_task(async_sync_gsheets_background())
+        else:
+            await update.message.reply_text("✅ Нет лишних записей — база чистая.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
 
     if choice == "📊 Настроить Google Таблицу":
