@@ -4144,7 +4144,7 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
                                     "userEnteredFormat": {
                                         "backgroundColor": COLOR_GRAY
                                     },
-                                    "note": reason_str
+                                    "note": reason_str if sub_idx == 0 else ""
                                 },
                                 "fields": "userEnteredFormat.backgroundColor,note"
                             }
@@ -4160,6 +4160,19 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
                                 }
                             }
                         })
+                        if sub_idx == 0 and num_rows > 1:
+                            requests.append({
+                                "mergeCells": {
+                                    "range": {
+                                        "sheetId": ws_id,
+                                        "startRowIndex": r_idx,
+                                        "endRowIndex": r_idx + num_rows,
+                                        "startColumnIndex": d_idx,
+                                        "endColumnIndex": d_idx + 1
+                                    },
+                                    "mergeType": "MERGE_ALL"
+                                }
+                            })
                     else:
                         rep_key = (w["telegram_id"], date, slot)
                         sheet_key = (worker_full_name, date, slot)
