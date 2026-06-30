@@ -4287,10 +4287,22 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
     max_rows = max(orig_rows, total_rows)
     max_cols = max(orig_cols, num_cols)
 
+    # Расширяем лист ДО записи значений (если сотрудников/дат стало больше, чем
+    # текущий размер листа) — иначе запись значений может тихо не пройти,
+    # если диапазон A1:... выходит за границы текущей сетки листа.
+    if total_rows > orig_rows or num_cols > orig_cols:
+        try:
+            ws.resize(rows=max(total_rows, orig_rows), cols=max(num_cols, orig_cols))
+        except Exception as resize_ex:
+            logger.warning(f"Не удалось заранее расширить лист 'Сводка' перед записью: {resize_ex}")
+
     try:
         ws.update(values=values, range_name="A1")
     except TypeError:
         ws.update("A1", values)
+    except Exception as update_ex:
+        logger.error(f"Не удалось записать значения в лист 'Сводка': {update_ex}")
+        raise
         
     full_requests = [
         {
@@ -4787,11 +4799,6 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
                 
         conn_anal.close()
         
-        try:
-            ws_anal.update(values=values_anal, range_name="A1")
-        except TypeError:
-            ws_anal.update("A1", values_anal)
-            
         total_anal_rows = len(values_anal)
         num_anal_cols = len(anal_header)
         
@@ -4805,6 +4812,21 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
             
         max_anal_rows = max(orig_anal_rows, total_anal_rows)
         max_anal_cols = max(orig_anal_cols, num_anal_cols)
+
+        # Расширяем лист ДО записи значений по той же причине, что и для листа "Сводка".
+        if total_anal_rows > orig_anal_rows or num_anal_cols > orig_anal_cols:
+            try:
+                ws_anal.resize(rows=max(total_anal_rows, orig_anal_rows), cols=max(num_anal_cols, orig_anal_cols))
+            except Exception as resize_ex:
+                logger.warning(f"Не удалось заранее расширить лист 'Аналитика' перед записью: {resize_ex}")
+
+        try:
+            ws_anal.update(values=values_anal, range_name="A1")
+        except TypeError:
+            ws_anal.update("A1", values_anal)
+        except Exception as update_ex:
+            logger.error(f"Не удалось записать значения в лист 'Аналитика': {update_ex}")
+            raise
         
         anal_formatting_requests = [
             {
@@ -6897,7 +6919,7 @@ def main():
     application.add_handler(add_handler)
     application.add_handler(delete_handler)
     application.add_handler(view_dept_handler)
-    application.add_handler(summary_scheduler_handler) 
+    application.add_handler(summary_scheduler_handler)
     application.add_handler(export_handler)
     application.add_handler(import_handler)
     application.add_handler(settings_handler)
