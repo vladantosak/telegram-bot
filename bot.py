@@ -6528,14 +6528,13 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         else:
             slot_time, is_late = None, False
 
-        # daily_fact — всегда новый отдельный отчёт, статусы склеиваются
+        # daily_fact — всегда новый отдельный отчёт, статусы могут объединяться
         if report_type == "daily_fact":
             existing = None
         else:
             existing = await run_db(get_existing_report_row, user_id, date_str, report_type, slot_time)
-        use_label = len(items) > 1 or existing is not None
 
-        # для статуса: проверяем можно ли полностью переснять видео в одном блоке
+        # Для статуса: если пришло в окне объединения — перепосылаем все видео вместе
         do_full_merge = False
         old_media_rows = []
         if existing and report_type == "status":
@@ -6565,7 +6564,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             is_addon_item = True
         else:
             ai_res = ai_res_pre
-            raw_text_final = f"[Видео {idx}]: {text_content}" if use_label else text_content
+            raw_text_final = text_content
             cleaned_text = await clean_report_async(raw_text_final)
             report_id = await run_db(
                 save_report,
@@ -6585,7 +6584,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
 
         copied_msg_id = None
         if do_full_merge and old_media_rows:
-            # Статус: удаляем старые видео, пересылаем все вместе (старые + новое)
+            # Статус: удаляем старые видео из группы, пересылаем все вместе
             for m in old_media_rows:
                 if m["group_message_id"]:
                     try:
