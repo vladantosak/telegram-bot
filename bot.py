@@ -1104,7 +1104,7 @@ async def notify_admins_new_registration(bot, w_fio: str, position: str, usernam
 async def send_report_instruction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_type = update.effective_chat.type
-   await update.message.reply_text(
+    await update.message.reply_text(
     "*📹 Видео-статус*\n\n"
     "Отправляйте видео в чат:\n"
     "🕙 10:00 | 12:00 | 15:00 | 17:00\n\n"
@@ -1123,6 +1123,7 @@ async def send_report_instruction(update: Update, context: ContextTypes.DEFAULT_
     "«За 2 часа выкопал 15 метров траншеи. "
     "Показываю выполненную работу»\n\n"
 
+    "Всем кроме механизатовов (если вы работаете за рулём техники вы факт не присылаете)"
     "*В 17:00 отправьте 2 видео:*\n\n"
     "1️⃣ Статус за последние 2 часа\n"
     "— что сделали сейчас\n"
