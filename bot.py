@@ -129,7 +129,8 @@ SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
     ASK_REG_LAST_NAME,
     ASK_REG_FIRST_NAME,
     ASK_SETTINGS_ACTION,
-) = range(32)
+    ASK_IMPORT_ACTION,
+) = range(33)
 
 # Клавиатуры
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -505,7 +506,9 @@ def read_excel(file_path: str):
     idx_schedule = -1
     idx_daily_fact = -1
     idx_object = -1
-    
+    idx_is_active = -1
+    idx_sort_order = -1
+
     for idx, h in enumerate(headers):
         if h in ("telegram_id", "id", "tg id", "telegram", "телеграм id", "тг id"):
             idx_id = idx
@@ -525,6 +528,10 @@ def read_excel(file_path: str):
             idx_daily_fact = idx
         elif h in ("object", "объект"):
             idx_object = idx
+        elif h in ("is_active", "активен", "статус"):
+            idx_is_active = idx
+        elif h in ("sort_order", "порядок", "order"):
+            idx_sort_order = idx
             
     for row_idx in range(2, sheet.max_row + 1):
         row_values = []
@@ -552,6 +559,21 @@ def read_excel(file_path: str):
                 pos_val = obj_val
             else:
                 pos_val = f"{str(pos_val).strip()} ({obj_val})"
+
+        is_active_val = row_values[idx_is_active] if idx_is_active != -1 and idx_is_active < len(row_values) else None
+        is_active = True
+        if is_active_val is not None:
+            s = str(is_active_val).strip().lower()
+            if s in ("0", "false", "нет", "no", "неактивен"):
+                is_active = False
+
+        sort_order_val = row_values[idx_sort_order] if idx_sort_order != -1 and idx_sort_order < len(row_values) else None
+        sort_order = 0
+        if sort_order_val is not None:
+            try:
+                sort_order = int(float(str(sort_order_val).strip()))
+            except ValueError:
+                pass
 
         tg_id = None
         if tg_id_val is not None:
@@ -613,10 +635,67 @@ def read_excel(file_path: str):
             "group_id": group_id,
             "schedule": schedule,
             "needs_daily_fact": needs_daily_fact,
-            "object_id": object_id
+            "object_id": object_id,
+            "is_active": is_active,
+            "sort_order": sort_order,
         })
         
     return workers
+
+def export_workers_to_excel() -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM workers ORDER BY position, sort_order, last_name, first_name"
+    ).fetchall()
+    conn.close()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Сотрудники"
+
+    headers = ["telegram_id", "last_name", "first_name", "position", "group_id", "schedule", "needs_daily_fact", "is_active", "sort_order", "object_id"]
+    header_labels = ["Telegram ID", "Фамилия", "Имя", "Должность", "ID группы", "График", "Факт дня", "Активен", "Порядок", "Объект"]
+
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+
+    for col_idx, (h, label) in enumerate(zip(headers, header_labels), start=1):
+        cell = ws.cell(row=1, column=col_idx, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+        ws.cell(row=1, column=col_idx).comment = None
+        ws.column_dimensions[cell.column_letter].width = 18
+
+    ws.append([""] * len(headers))
+    for col_idx, label in enumerate(header_labels, start=1):
+        ws.cell(row=2, column=col_idx, value=label)
+        ws.cell(row=2, column=col_idx).font = Font(italic=True, color="666666")
+
+    for w in rows:
+        ws.append([
+            w["telegram_id"],
+            w["last_name"],
+            w["first_name"],
+            w["position"],
+            w["group_id"],
+            w["schedule"],
+            1 if w["needs_daily_fact"] else 0,
+            1 if w["is_active"] else 0,
+            w["sort_order"] or 0,
+            w["object_id"] or "Основной",
+        ])
+
+    ws.delete_rows(2)
+
+    import io
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio.read()
+
 
 def update_worker_field(telegram_id: int, field: str, value):
     allowed = {"last_name", "first_name", "position", "group_id", "schedule", "needs_daily_fact", "sort_order", "is_active", "object_id"}
@@ -2364,13 +2443,49 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def import_workers_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return ConversationHandler.END
-    await update.message.reply_text(
-        "📎 Пожалуйста, отправьте файл Excel (.xlsx) со списком сотрудников.\n\n"
-        "Файл должен содержать заголовки: name (или ФИО), position (или должность), и т.д. "
-        "А также telegram_id (или ID), если хотите связать аккаунты напрямую.",
-        reply_markup=CANCEL_KEYBOARD
+    kbd = ReplyKeyboardMarkup(
+        [["📤 Скачать текущий список сотрудников"], ["📥 Загрузить обновления из файла"], ["❌ Отмена"]],
+        resize_keyboard=True
     )
-    return ASK_IMPORT_FILE
+    await update.message.reply_text(
+        "Выберите действие:",
+        reply_markup=kbd
+    )
+    return ASK_IMPORT_ACTION
+
+
+async def import_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return ConversationHandler.END
+    choice = update.message.text.strip()
+
+    if choice == "📤 Скачать текущий список сотрудников":
+        await update.message.reply_text("⏳ Формирую файл...", reply_markup=CANCEL_KEYBOARD)
+        try:
+            data = await asyncio.to_thread(export_workers_to_excel)
+            import io
+            bio = io.BytesIO(data)
+            bio.name = "workers.xlsx"
+            await update.message.reply_document(
+                document=bio,
+                filename="workers.xlsx",
+                caption="📋 Текущий список сотрудников.\n\nВнесите изменения и отправьте файл обратно через «📥 Импорт сотрудников».",
+                reply_markup=MAIN_MENU
+            )
+        except Exception as e:
+            logging.error(f"export_workers error: {e}")
+            await update.message.reply_text(f"❌ Ошибка при формировании файла: {e}", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+
+    if choice == "📥 Загрузить обновления из файла":
+        await update.message.reply_text(
+            "📎 Отправьте файл Excel (.xlsx) со списком сотрудников.\n\n"
+            "Строки с существующим telegram_id будут обновлены, новые — добавлены.",
+            reply_markup=CANCEL_KEYBOARD
+        )
+        return ASK_IMPORT_FILE
+
+    await update.message.reply_text("Пожалуйста, выберите один из вариантов.", reply_markup=MAIN_MENU)
+    return ConversationHandler.END
 
 async def import_workers_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return ConversationHandler.END
@@ -2409,7 +2524,9 @@ async def import_workers_file(update: Update, context: ContextTypes.DEFAULT_TYPE
                     group_id=w["group_id"],
                     schedule=w["schedule"],
                     needs_daily_fact=w["needs_daily_fact"],
-                    object_id=w.get("object_id", "Основной")
+                    object_id=w.get("object_id", "Основной"),
+                    is_active=1 if w.get("is_active", True) else 0,
+                    sort_order=w.get("sort_order", 0),
                 )
                 success_count += 1
             except Exception as ex:
@@ -6943,6 +7060,7 @@ def main():
     import_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📥 Импорт сотрудников$"), import_workers_start)],
         states={
+            ASK_IMPORT_ACTION: [MessageHandler(DIALOG_TEXT, import_workers_action)],
             ASK_IMPORT_FILE: [MessageHandler(filters.Document.ALL, import_workers_file)],
             ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conversation_timeout_callback)],
         },
