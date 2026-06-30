@@ -6622,6 +6622,42 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             "date_str": date_str,
         })
 
+        # Оценка отправляется сразу после видео, не в конце батча
+        if is_addon_item:
+            old_eval = await run_db(get_report_group_message, report_id)
+            if old_eval and old_eval["group_chat_id"] and old_eval["group_message_id"]:
+                try:
+                    await context.bot.delete_message(chat_id=old_eval["group_chat_id"], message_id=old_eval["group_message_id"])
+                except Exception as e:
+                    logger.warning(f"Не удалось удалить старую оценку {old_eval['group_message_id']}: {e}")
+        notify_text = (
+            f"{w_name}\n"
+            f"{format_status_or_fact_line(report_type, slot_time, date_str)}\n"
+            f"Оценка ИИ: {'ОК' if ai_res['is_ok'] else 'НЕ ОК'}\n"
+            f"Комментарий ИИ: {ai_res['format_comment']}\n\n"
+            f"📝 Официальный отчет:\n\"{cleaned_text}\"\n\n"
+            f"🗣 Оригинальный текст:\n\"{raw_text_final}\""
+        )
+        inline_kbd = make_report_keyboard(report_id, report_type)
+        try:
+            if copied_msg_id:
+                sent_notify_msg = await context.bot.send_message(
+                    chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd,
+                    reply_to_message_id=copied_msg_id
+                )
+            else:
+                sent_notify_msg = await context.bot.send_message(
+                    chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd
+                )
+            await run_db(set_report_group_message, report_id, dest_chat, sent_notify_msg.message_id)
+        except Exception as e:
+            logger.error(f"Ошибка отправки оценки для видео {idx} в чат {dest_chat}: {e}")
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=notify_text, reply_markup=inline_kbd)
+            except Exception:
+                pass
+
         time_str = now.strftime("%H:%M")
         suffix_tail = f" (видео {idx} из {len(items)})" if len(items) > 1 else ""
         if report_type == "status" and slot_time:
@@ -6644,51 +6680,6 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
 
     if not results:
         return
-
-    # Удаляем старые сообщения-оценки (если это обновление существующего отчёта)
-    old_messages_to_delete = set()
-    for r in results:
-        if r["is_addon"]:
-            row = await run_db(get_report_group_message, r["report_id"])
-            if row and row["group_chat_id"] and row["group_message_id"]:
-                old_messages_to_delete.add((row["group_chat_id"], row["group_message_id"]))
-    for chat_id, msg_id in old_messages_to_delete:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-        except Exception as e:
-            logger.warning(f"Не удалось удалить старое сообщение-оценку {msg_id} в чате {chat_id}: {e}")
-
-    # Каждое видео получает своё сообщение с оценкой ниже
-    for r in results:
-        notify_text = (
-            f"{w_name}\n"
-            f"{format_status_or_fact_line(r['report_type'], r['slot_time'], r['date_str'])}\n"
-            f"Оценка ИИ: {'ОК' if r['ai_res']['is_ok'] else 'НЕ ОК'}\n"
-            f"Комментарий ИИ: {r['ai_res']['format_comment']}\n\n"
-            f"📝 Официальный отчет:\n\"{r['cleaned_text']}\"\n\n"
-            f"🗣 Оригинальный текст:\n\"{r['raw_text']}\""
-        )
-        inline_kbd = make_report_keyboard(r["report_id"], r["report_type"])
-        try:
-            if r["copied_msg_id"]:
-                sent_notify_msg = await context.bot.send_message(
-                    chat_id=dest_chat,
-                    text=notify_text,
-                    reply_markup=inline_kbd,
-                    reply_to_message_id=r["copied_msg_id"]
-                )
-            else:
-                sent_notify_msg = await context.bot.send_message(
-                    chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd
-                )
-            await run_db(set_report_group_message, r["report_id"], dest_chat, sent_notify_msg.message_id)
-        except Exception as e:
-            logger.error(f"Ошибка отправки оценки для видео {r['idx']} в чат {dest_chat}: {e}")
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(chat_id=admin_id, text=notify_text, reply_markup=inline_kbd)
-            except Exception:
-                pass
 
 
 async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
