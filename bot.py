@@ -6528,10 +6528,16 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         else:
             slot_time, is_late = None, False
 
-        existing = await run_db(get_existing_report_row, user_id, date_str, report_type, slot_time)
+        # daily_fact — всегда новый отдельный отчёт, статусы склеиваются
+        if report_type == "daily_fact":
+            existing = None
+        else:
+            existing = await run_db(get_existing_report_row, user_id, date_str, report_type, slot_time)
         use_label = len(items) > 1 or existing is not None
 
+        # для статуса: проверяем можно ли полностью переснять видео в одном блоке
         do_full_merge = False
+        old_media_rows = []
         if existing and report_type == "status":
             try:
                 prev_h, prev_m, prev_s = map(int, existing["received_at"].split(":"))
@@ -6539,16 +6545,13 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 do_full_merge = 0 <= elapsed_minutes <= MEDIA_MERGE_WINDOW_MINUTES
             except Exception:
                 do_full_merge = False
-
-        old_media_rows = []
-        if do_full_merge:
-            old_media_rows = await run_db(get_report_media, existing["id"])
+            if do_full_merge:
+                old_media_rows = await run_db(get_report_media, existing["id"])
 
         if existing:
-            merged_raw = build_addon_text(existing["raw_text"], text_content, use_video_label=True)
-            ai_res = await check_status_async(merged_raw, report_type_override=report_type)
-            cleaned_text = await clean_report_async(merged_raw)
-            raw_text_final = merged_raw
+            ai_res = await check_status_async(text_content, report_type_override=report_type)
+            cleaned_text = await clean_report_async(text_content)
+            raw_text_final = text_content
             report_id = existing["id"]
             await run_db(
                 update_report_text_and_ai,
@@ -6578,20 +6581,18 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 raw_text=raw_text_final
             )
             is_addon_item = False
-        # save_report/update_report_text_and_ai сами пытаются запланировать фоновую синхронизацию,
-        # но изнутри run_db (отдельный поток) у них нет доступа к event loop — запускаем явно здесь.
         asyncio.create_task(async_sync_gsheets_background())
 
         copied_msg_id = None
         if do_full_merge and old_media_rows:
+            # Статус: удаляем старые видео, пересылаем все вместе (старые + новое)
             for m in old_media_rows:
                 if m["group_message_id"]:
                     try:
                         await context.bot.delete_message(chat_id=dest_chat, message_id=m["group_message_id"])
                     except Exception as e:
-                        logger.warning(f"Не удалось удалить старое видео {m['group_message_id']} в чате {dest_chat}: {e}")
+                        logger.warning(f"Не удалось удалить старое видео {m['group_message_id']}: {e}")
             await run_db(delete_report_media_rows, report_id)
-
             media_sources = [(m["source_chat_id"], m["source_message_id"]) for m in old_media_rows]
             media_sources.append((upd.effective_chat.id, upd.message.message_id))
             for pos, (src_chat, src_msg) in enumerate(media_sources, start=1):
@@ -6601,7 +6602,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                     if pos == 1:
                         copied_msg_id = copied_msg.message_id
                 except Exception as e:
-                    logger.error(f"Ошибка повторной пересылки видео {pos} в чат {dest_chat}: {e}")
+                    logger.error(f"Ошибка повторной пересылки видео {pos}: {e}")
         else:
             try:
                 copied_msg = await context.bot.copy_message(
@@ -6645,39 +6646,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
     if not results:
         return
 
-    if len(results) == 1:
-        r = results[0]
-        notify_text = (
-            f"{w_name}\n"
-            f"{format_status_or_fact_line(r['report_type'], r['slot_time'], r['date_str'])}\n"
-            f"Оценка ИИ: {'ОК' if r['ai_res']['is_ok'] else 'НЕ ОК'}\n"
-            f"Комментарий ИИ: {r['ai_res']['format_comment']}\n\n"
-            f"📝 Официальный отчет:\n\"{r['cleaned_text']}\"\n\n"
-            f"🗣 Оригинальный текст:\n\"{r['raw_text']}\""
-        )
-        inline_kbd = make_report_keyboard(r["report_id"], r["report_type"])
-    else:
-        lines = []
-        for r in results:
-            label = f"Статус {r['slot_time']}" if r["report_type"] == "status" else "Итог дня"
-            icon = "✅" if r["ai_res"]["is_ok"] else "⚠️"
-            lines.append(f"🎬 Видео {r['idx']} — {label}: {icon} {r['ai_res']['format_comment']}")
-        overall_ok = all(r["ai_res"]["is_ok"] for r in results)
-        overall_line = "Все видео приняты без замечаний." if overall_ok else "Есть замечания — см. видео выше."
-        notify_text = (
-            f"{w_name}\n"
-            f"📦 Отчёт из {len(results)} видео за {results[0]['date_str']}:\n\n"
-            + "\n".join(lines) +
-            f"\n\nОбщий итог: {overall_line}"
-        )
-        kbd_rows = []
-        for r in results:
-            kbd_rows.append([
-                InlineKeyboardButton(f"✏️ Видео {r['idx']}: комментарий", callback_data=f"edit_comment_{r['report_id']}"),
-                InlineKeyboardButton(f"🔄 Видео {r['idx']}: оценка", callback_data=f"fix_toggle_{r['report_id']}")
-            ])
-        inline_kbd = InlineKeyboardMarkup(kbd_rows)
-
+    # Удаляем старые сообщения-оценки (если это обновление существующего отчёта)
     old_messages_to_delete = set()
     for r in results:
         if r["is_addon"]:
@@ -6690,18 +6659,32 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         except Exception as e:
             logger.warning(f"Не удалось удалить старое сообщение-оценку {msg_id} в чате {chat_id}: {e}")
 
-    first_copied_msg_id = next((r["copied_msg_id"] for r in results if r["copied_msg_id"]), None)
-    try:
-        if first_copied_msg_id:
-            sent_notify_msg = await context.bot.send_message(
-                chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd, reply_to_message_id=first_copied_msg_id
-            )
-        else:
-            sent_notify_msg = await context.bot.send_message(chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd)
-        for r in results:
+    # Каждое видео получает своё сообщение с оценкой ниже
+    for r in results:
+        notify_text = (
+            f"{w_name}\n"
+            f"{format_status_or_fact_line(r['report_type'], r['slot_time'], r['date_str'])}\n"
+            f"Оценка ИИ: {'ОК' if r['ai_res']['is_ok'] else 'НЕ ОК'}\n"
+            f"Комментарий ИИ: {r['ai_res']['format_comment']}\n\n"
+            f"📝 Официальный отчет:\n\"{r['cleaned_text']}\"\n\n"
+            f"🗣 Оригинальный текст:\n\"{r['raw_text']}\""
+        )
+        inline_kbd = make_report_keyboard(r["report_id"], r["report_type"])
+        try:
+            if r["copied_msg_id"]:
+                sent_notify_msg = await context.bot.send_message(
+                    chat_id=dest_chat,
+                    text=notify_text,
+                    reply_markup=inline_kbd,
+                    reply_to_message_id=r["copied_msg_id"]
+                )
+            else:
+                sent_notify_msg = await context.bot.send_message(
+                    chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd
+                )
             await run_db(set_report_group_message, r["report_id"], dest_chat, sent_notify_msg.message_id)
-    except Exception as e:
-        logger.error(f"Ошибка отправки общей оценки по пачке из {len(results)} видео в чат {dest_chat}: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка отправки оценки для видео {r['idx']} в чат {dest_chat}: {e}")
         for admin_id in ADMIN_IDS:
             try:
                 await context.bot.send_message(chat_id=admin_id, text=notify_text, reply_markup=inline_kbd)
