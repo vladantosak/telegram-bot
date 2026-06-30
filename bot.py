@@ -1144,8 +1144,6 @@ async def send_report_instruction(update: Update, context: ContextTypes.DEFAULT_
 
     "⚠️ Исправляйте замечания по прошлым статусам. если бам делают замчания в противном случае.\n"
     "При повторном несоблюдении требований информация передаётся руководству для принятия дальнейшего решения.\n",
-
-parse_mode="Markdown",
     
     parse_mode="Markdown",
     reply_markup=menu_for_user(user_id, chat_type)
