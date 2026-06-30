@@ -4003,6 +4003,7 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
     curr_row = 1
     new_dept_rows = {}
     new_worker_rows = {}
+    db_updated_cells = set()
     
     for dept_name in sorted_depts:
         dept_workers = workers_by_dept[dept_name]
@@ -4148,48 +4149,49 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
                     else:
                         rep_key = (w["telegram_id"], date, slot)
                         sheet_key = (worker_full_name, date, slot)
-                        existing_val = existing_map.get(sheet_key, "")
-                        
-                        if existing_val != "":
-                            if existing_val == "TRUE":
+
+                        if rep_key in reports_map:
+                            rep = reports_map[rep_key]
+                            is_ok = bool(rep["is_ok"])
+                            if is_ok:
                                 row_vals.append(True)
-                            elif existing_val == "FALSE":
-                                row_vals.append(False)
                             else:
-                                row_vals.append(existing_val)
+                                row_vals.append(False)
+
+                                comment_str = rep["format_comment"] or "В отчете есть замечания"
+                                if comment_str.startswith("не ОК, "):
+                                    comment_str = comment_str[len("не ОК, "):]
+                                elif comment_str.startswith("не ОК: "):
+                                    comment_str = comment_str[len("не ОК: "):]
+
+                                requests.append({
+                                    "repeatCell": {
+                                        "range": {
+                                            "sheetId": ws_id,
+                                            "startRowIndex": r_idx,
+                                            "endRowIndex": r_idx + 1,
+                                            "startColumnIndex": d_idx,
+                                            "endColumnIndex": d_idx + 1
+                                        },
+                                        "cell": {
+                                            "userEnteredFormat": {
+                                                "backgroundColor": COLOR_FAIL
+                                            },
+                                            "note": comment_str
+                                        },
+                                        "fields": "userEnteredFormat.backgroundColor,note"
+                                    }
+                                })
+                            db_updated_cells.add(sheet_key)
                         else:
-                            if rep_key in reports_map:
-                                rep = reports_map[rep_key]
-                                is_ok = bool(rep["is_ok"])
-                                if is_ok:
+                            existing_val = existing_map.get(sheet_key, "")
+                            if existing_val != "":
+                                if existing_val == "TRUE":
                                     row_vals.append(True)
-                                else:
+                                elif existing_val == "FALSE":
                                     row_vals.append(False)
-                                    
-                                    comment_str = rep["format_comment"] or "В отчете есть замечания"
-                                    if comment_str.startswith("не ОК, "):
-                                        comment_str = comment_str[len("не ОК, "):]
-                                    elif comment_str.startswith("не ОК: "):
-                                        comment_str = comment_str[len("не ОК: "):]
-                                        
-                                    requests.append({
-                                        "repeatCell": {
-                                            "range": {
-                                                "sheetId": ws_id,
-                                                "startRowIndex": r_idx,
-                                                "endRowIndex": r_idx + 1,
-                                                "startColumnIndex": d_idx,
-                                                "endColumnIndex": d_idx + 1
-                                            },
-                                            "cell": {
-                                                "userEnteredFormat": {
-                                                    "backgroundColor": COLOR_FAIL
-                                                },
-                                                "note": comment_str
-                                            },
-                                            "fields": "userEnteredFormat.backgroundColor,note"
-                                        }
-                                    })
+                                else:
+                                    row_vals.append(existing_val)
                             else:
                                 is_hyphen = False
                                 if slot == "Факт":
@@ -4199,7 +4201,7 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
                                     else:
                                         if date < cur_date_str:
                                             is_hyphen = True
-                                
+
                                 if is_hyphen:
                                     row_vals.append("-")
                                     requests.append({
@@ -4513,6 +4515,8 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
                 })
         else:
             if (w_name, slot) in new_worker_rows and date_str in new_date_cols:
+                if (w_name, date_str, slot) in db_updated_cells:
+                    continue
                 r_idx = new_worker_rows[(w_name, slot)]
                 col_idx = new_date_cols[date_str]
                 restore_requests.append({
@@ -4532,8 +4536,10 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
                         "fields": "userEnteredFormat.backgroundColor"
                     }
                 })
-                
+
     for (w_name, date_str, slot), note in existing_notes_map.items():
+        if (w_name, date_str, slot) in db_updated_cells:
+            continue
         if (w_name, slot) in new_worker_rows and date_str in new_date_cols:
             r_idx = new_worker_rows[(w_name, slot)]
             col_idx = new_date_cols[date_str]
