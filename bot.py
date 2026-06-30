@@ -518,19 +518,21 @@ def read_excel(file_path: str):
             idx_firstname = idx
         elif h in ("name", "фио", "сотрудник", "имя фамилия"):
             idx_name = idx
-        elif h in ("position", "должность", "отдел", "специальность"):
+        elif h in ("position", "должность", "отдел", "специальность", "должность / отдел"):
             idx_position = idx
-        elif h in ("group_id", "группа", "id группы", "чат", "чат id", "brigade"):
+        elif h in ("group_id", "группа", "id группы", "чат", "чат id", "brigade", "id чата (уведомления)", "id чата"):
             idx_group = idx
-        elif h in ("schedule", "график", "расписание"):
+        elif h in ("schedule", "график", "расписание", "график (а или б)"):
             idx_schedule = idx
-        elif h in ("needs_daily_fact", "факт дня", "ежедневный факт"):
+        elif h in ("needs_daily_fact", "факт дня", "ежедневный факт", "итоговый отчёт за день", "итоговый отчет за день"):
             idx_daily_fact = idx
         elif h in ("object", "объект"):
             idx_object = idx
-        elif h in ("is_active", "активен", "статус"):
+        elif h in ("is_active", "активен"):
             idx_is_active = idx
-        elif h in ("sort_order", "порядок", "order"):
+        elif h in ("status", "статус"):
+            idx_is_active = idx
+        elif h in ("sort_order", "порядок", "order", "номер в списке"):
             idx_sort_order = idx
             
     for row_idx in range(2, sheet.max_row + 1):
@@ -564,7 +566,8 @@ def read_excel(file_path: str):
         is_active = True
         if is_active_val is not None:
             s = str(is_active_val).strip().lower()
-            if s in ("0", "false", "нет", "no", "неактивен"):
+            # "работает" = активен; всё остальное (отпуск, больничный, 0, нет...) = неактивен
+            if s and s not in ("работает", "1", "true", "да", "yes", "активен"):
                 is_active = False
 
         sort_order_val = row_values[idx_sort_order] if idx_sort_order != -1 and idx_sort_order < len(row_values) else None
@@ -619,7 +622,7 @@ def read_excel(file_path: str):
         needs_daily_fact = True
         if daily_fact_val is not None:
             df_str = str(daily_fact_val).strip().lower()
-            if df_str in ("0", "false", "нет", "no"):
+            if df_str in ("0", "false", "нет", "no", "нет"):
                 needs_daily_fact = False
                 
         if tg_id is None:
@@ -643,8 +646,11 @@ def read_excel(file_path: str):
     return workers
 
 def export_workers_to_excel() -> bytes:
+    import io
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.comments import Comment
+
     conn = get_db()
     rows = conn.execute(
         "SELECT * FROM workers ORDER BY position, sort_order, last_name, first_name"
@@ -655,42 +661,81 @@ def export_workers_to_excel() -> bytes:
     ws = wb.active
     ws.title = "Сотрудники"
 
-    headers = ["telegram_id", "last_name", "first_name", "position", "group_id", "schedule", "needs_daily_fact", "is_active", "sort_order", "object_id"]
-    header_labels = ["Telegram ID", "Фамилия", "Имя", "Должность", "ID группы", "График", "Факт дня", "Активен", "Порядок", "Объект"]
+    # (внутреннее_имя, русский заголовок, подсказка, ширина)
+    COLS = [
+        ("telegram_id",      "Telegram ID",           "Числовой ID аккаунта в Telegram.\nНе трогать — по нему бот узнаёт сотрудника.\nЕсли добавляете нового без аккаунта — оставьте пустым.", 18),
+        ("last_name",        "Фамилия",               "Фамилия сотрудника.", 18),
+        ("first_name",       "Имя",                   "Имя сотрудника.", 16),
+        ("position",         "Должность / Отдел",     "Название отдела или должности.\nСотрудники с одинаковым значением группируются вместе.", 24),
+        ("group_id",         "ID чата (уведомления)", "ID Telegram-группы, куда бот отправляет сводки.\nЕсли не знаете — оставьте как есть.", 22),
+        ("schedule",         "График (А или Б)",      "А — отчёты в 10:00, 12:00, 15:00, 17:00\nБ — отчёты в 11:00, 13:00, 16:00, 18:00\nПишите только букву А или Б.", 18),
+        ("needs_daily_fact", "Итоговый отчёт за день","Да — сотрудник сдаёт вечерний итоговый отчёт по всему дню.\nНет — только статусы в течение дня.", 22),
+        ("status",           "Статус",                "Работает — сотрудник на месте.\nЛюбой другой текст (Отпуск, Больничный и т.д.) — сотрудник помечается как неактивный и не получает напоминаний.", 22),
+        ("sort_order",       "Номер в списке",        "Порядок отображения внутри отдела.\n1 — первый сверху, 2 — второй и т.д.\nМожно менять.", 16),
+        ("object_id",        "Объект",                "Название строительного объекта.\nЕсли один объект — оставьте «Основной».", 20),
+    ]
 
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    hint_fill   = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    hint_font   = Font(italic=True, color="555555", size=9)
+    center      = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin        = Side(style="thin", color="AAAAAA")
+    border      = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    for col_idx, (h, label) in enumerate(zip(headers, header_labels), start=1):
-        cell = ws.cell(row=1, column=col_idx, value=h)
+    # Строка 1 — заголовки
+    for col_idx, (_, label, hint, width) in enumerate(COLS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=label)
         cell.font = header_font
         cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
-        ws.cell(row=1, column=col_idx).comment = None
-        ws.column_dimensions[cell.column_letter].width = 18
+        cell.alignment = center
+        cell.border = border
+        ws.column_dimensions[cell.column_letter].width = width
+        c = Comment(hint, "Бот")
+        c.width = 280
+        c.height = 80
+        cell.comment = c
 
-    ws.append([""] * len(headers))
-    for col_idx, label in enumerate(header_labels, start=1):
-        ws.cell(row=2, column=col_idx, value=label)
-        ws.cell(row=2, column=col_idx).font = Font(italic=True, color="666666")
+    ws.row_dimensions[1].height = 28
 
+    # Строка 2 — подсказка коротко
+    hints_short = [
+        "не менять", "фамилия", "имя", "отдел", "чат id",
+        "А или Б", "Да / Нет", "Работает / Отпуск / Больничный", "число", "объект"
+    ]
+    for col_idx, hint_s in enumerate(hints_short, start=1):
+        cell = ws.cell(row=2, column=col_idx, value=hint_s)
+        cell.font = hint_font
+        cell.fill = hint_fill
+        cell.alignment = center
+        cell.border = border
+    ws.row_dimensions[2].height = 16
+
+    ws.freeze_panes = "A3"
+
+    # Данные начиная со строки 3
     for w in rows:
+        if w["is_active"]:
+            status_val = "Работает"
+        else:
+            status_val = "Не работает"
+
         ws.append([
             w["telegram_id"],
             w["last_name"],
             w["first_name"],
             w["position"],
             w["group_id"],
-            w["schedule"],
-            1 if w["needs_daily_fact"] else 0,
-            1 if w["is_active"] else 0,
+            w["schedule"] or "A",
+            "Да" if w["needs_daily_fact"] else "Нет",
+            status_val,
             w["sort_order"] or 0,
             w["object_id"] or "Основной",
         ])
+        data_row = ws.max_row
+        for col_idx in range(1, len(COLS) + 1):
+            ws.cell(row=data_row, column=col_idx).border = border
 
-    ws.delete_rows(2)
-
-    import io
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
