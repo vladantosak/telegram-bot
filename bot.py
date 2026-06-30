@@ -673,6 +673,22 @@ def delete_worker(telegram_id: int) -> bool:
         pass
     return deleted
 
+def cleanup_orphaned_reports() -> int:
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            "DELETE FROM reports WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)"
+        )
+        deleted = cur.rowcount
+        conn.commit()
+    except Exception as e:
+        logger.error(f"cleanup_orphaned_reports error: {e}")
+        conn.rollback()
+        deleted = 0
+    finally:
+        conn.close()
+    return deleted
+
 def save_group_name(group_id: int, group_name: str):
     conn = get_db()
     conn.execute(
@@ -2917,6 +2933,20 @@ async def delete_worker_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
+async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update):
+        return
+    deleted = await asyncio.to_thread(cleanup_orphaned_reports)
+    if deleted:
+        await update.message.reply_text(
+            f"🗑 Удалено {deleted} записей отчётов от сотрудников, которых больше нет в базе.",
+            reply_markup=MAIN_MENU
+        )
+        asyncio.create_task(async_sync_gsheets_background())
+    else:
+        await update.message.reply_text("✅ Нет лишних записей — база чистая.", reply_markup=MAIN_MENU)
+
+
 async def department_workers_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return ConversationHandler.END
     rows = get_all_workers()
@@ -3302,9 +3332,9 @@ def fetch_export_data(dept: str = None, only_facts: bool = False):
     conn = get_db()
     try:
         if dept is not None:
-            workers = conn.execute("SELECT * FROM workers WHERE lower(position) = lower(?)", (dept,)).fetchall()
+            workers = conn.execute("SELECT * FROM workers WHERE is_active = 1 AND lower(position) = lower(?)", (dept,)).fetchall()
         else:
-            workers = conn.execute("SELECT * FROM workers").fetchall()
+            workers = conn.execute("SELECT * FROM workers WHERE is_active = 1").fetchall()
             
         conditions = []
         params = []
@@ -3372,20 +3402,6 @@ def fetch_export_data(dept: str = None, only_facts: bool = False):
             "sort_order": w["sort_order"] or 0,
         }
         
-    for r in reports:
-        tid = r["telegram_id"]
-        if tid not in workers_dict:
-            workers_dict[tid] = {
-                "telegram_id": tid,
-                "last_name": "Удаленный",
-                "first_name": f"Сотрудник (ID {tid})",
-                "position": "Не указано",
-                "schedule": "A",
-                "needs_daily_fact": True,
-                "is_active": True,
-                "sort_order": 99999,
-            }
-            
     workers_by_dept = {}
     for tid, w in workers_dict.items():
         lastname_lower = (w["last_name"] or "").lower()
@@ -6816,6 +6832,7 @@ def main():
 
     application.add_handler(CommandHandler("myreports", myreports))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("cleanup", cleanup_command))
     application.add_handler(CommandHandler("threshold", set_threshold_command))
     application.add_handler(CommandHandler("top", top_command))
     application.add_handler(CommandHandler("set_object_group", set_object_group_command))
