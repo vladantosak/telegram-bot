@@ -3351,6 +3351,7 @@ def fetch_export_data(dept: str = None, only_facts: bool = False):
             "last_name": w["last_name"],
             "first_name": w["first_name"],
             "position": w["position"] or "Не указано",
+            "object_id": w["object_id"] if "object_id" in w.keys() and w["object_id"] else "Основной",
             "schedule": w["schedule"] or "A",
             "needs_daily_fact": bool(w["needs_daily_fact"]),
             "is_active": bool(w["is_active"]),
@@ -5937,6 +5938,10 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     required_action="Не работает",
                     raw_text=f"Не работает сегодня. Причина: {reason}"
                 )
+                # save_report пытается сам запланировать фоновую синхронизацию через
+                # asyncio.get_running_loop(), но внутри run_db (отдельный поток) такого loop нет —
+                # запускаем синхронизацию явно здесь, где event loop точно доступен.
+                asyncio.create_task(async_sync_gsheets_background())
                 
                 await update.message.reply_text(
                     f"✅ Статус 'Не работаю' успешно сохранен.\nПричина: {reason}",
@@ -6061,6 +6066,9 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 required_action=ai_res["required_action"],
                 raw_text=text_content
             )
+        # save_report/update_report_text_and_ai сами пытаются запланировать фоновую синхронизацию,
+        # но изнутри run_db (отдельный поток) у них нет доступа к event loop — запускаем явно здесь.
+        asyncio.create_task(async_sync_gsheets_background())
 
         w_name = f"{worker['last_name']} {worker['first_name']}"
         
@@ -6325,6 +6333,9 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 raw_text=raw_text_final
             )
             is_addon_item = False
+        # save_report/update_report_text_and_ai сами пытаются запланировать фоновую синхронизацию,
+        # но изнутри run_db (отдельный поток) у них нет доступа к event loop — запускаем явно здесь.
+        asyncio.create_task(async_sync_gsheets_background())
 
         copied_msg_id = None
         if do_full_merge and old_media_rows:
