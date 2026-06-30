@@ -4634,20 +4634,6 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
             }
         },
         {
-            "updateSheetProperties": {
-                "properties": {
-                    "sheetId": ws_id,
-                    "gridProperties": {
-                        "frozenRowCount": 1,
-                        "frozenColumnCount": 2,
-                        "hideGridlines": False
-                    },
-                    "index": 0
-                },
-                "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount,gridProperties.hideGridlines,index"
-            }
-        },
-        {
             "updateDimensionProperties": {
                 "range": {
                     "sheetId": ws_id,
@@ -4689,7 +4675,22 @@ def run_gsheets_sync(spreadsheet_id: str, service_account_str: str, dept: str, o
                 "fields": "pixelSize"
             }
         }
-    ] + requests
+    ] + requests + [
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": ws_id,
+                    "gridProperties": {
+                        "frozenRowCount": 1,
+                        "frozenColumnCount": 2,
+                        "hideGridlines": False
+                    },
+                    "index": 0
+                },
+                "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount,gridProperties.hideGridlines,index"
+            }
+        }
+    ]
 
     restore_requests = []
     new_date_cols = {d: idx for idx, d in enumerate(unique_dates, start=2)}
