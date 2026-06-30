@@ -3558,19 +3558,20 @@ def fetch_export_data(dept: str = None, only_facts: bool = False):
         dept_lower = (w["position"] or "").lower()
         if any(x in lastname_lower or x in firstname_lower or x in dept_lower for x in ("отмена", "test", "тест")):
             continue
-        
-        dept_name = w["position"]
-        if dept_name not in workers_by_dept:
-            workers_by_dept[dept_name] = []
-        workers_by_dept[dept_name].append(w)
-        
+
+        # Группируем по объекту (object_id), а не по должности
+        group_key = w.get("object_id") or "Основной"
+        if group_key not in workers_by_dept:
+            workers_by_dept[group_key] = []
+        workers_by_dept[group_key].append(w)
+
     sorted_depts = sorted(workers_by_dept.keys())
     for dept_name in sorted_depts:
         workers_by_dept[dept_name] = sorted(
             workers_by_dept[dept_name],
             key=lambda item: (item["sort_order"], (item["last_name"] or "").lower(), (item["first_name"] or "").lower())
         )
-        
+
     return unique_dates, reports_map, sorted_depts, workers_by_dept, first_fact_dates
 
 
@@ -7142,4 +7143,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
