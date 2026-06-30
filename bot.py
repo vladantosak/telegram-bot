@@ -2126,10 +2126,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=menu_for_user(update.effective_user.id, chat_type)
         )
 
-async def get_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"ID чата: {update.effective_chat.id}", reply_markup=menu_for_user(update.effective_user.id, update.effective_chat.type))
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Настройки бота (ID чата, Google Таблица) — собраны под одной компактной кнопкой,
 # чтобы не загромождать главное меню
@@ -2139,7 +2135,7 @@ async def settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update):
         return ConversationHandler.END
     kbd = ReplyKeyboardMarkup(
-        [["🆔 ID чата"], ["📊 Настроить Google Таблицу"], ["❌ Назад"]],
+        [["📊 Настроить Google Таблицу"], ["❌ Назад"]],
         resize_keyboard=True
     )
     await update.message.reply_text("⚙️ Настройки бота. Выберите действие:", reply_markup=kbd)
@@ -2151,14 +2147,6 @@ async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if choice == "❌ Назад":
         await update.message.reply_text("Главное меню.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
-
-    if choice == "🆔 ID чата":
-        kbd = ReplyKeyboardMarkup(
-            [["🆔 ID чата"], ["📊 Настроить Google Таблицу"], ["❌ Назад"]],
-            resize_keyboard=True
-        )
-        await update.message.reply_text(f"ID чата: {update.effective_chat.id}", reply_markup=kbd)
-        return ASK_SETTINGS_ACTION
 
     if choice == "📊 Настроить Google Таблицу":
         spreadsheet_id = get_setting("google_spreadsheet_id", "Не задан")
@@ -2277,8 +2265,8 @@ async def find_worker_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         info = (
             f"🔍 Найден сотрудник:\n\n"
             f"👤 {worker['last_name']} {worker['first_name']}\n"
-            f"Объект: {object_name}\n"
-            f"Отдел: {worker['position']}\n"
+            f"Отдел: {object_name}\n"
+            f"Должность: {worker['position']}\n"
             f"График: {worker['schedule']} ({schedule_str})\n"
             f"Группа: {gname}\n"
             f"Факт дня: {fact}\n"
@@ -2288,13 +2276,11 @@ async def find_worker_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         kbd = ReplyKeyboardMarkup(
             [
-                ["📅 История за неделю", "✏️ Номер в списке"],
                 ["✏️ Изменить фамилию", "✏️ Изменить имя"],
-                ["✏️ Изменить отдел", "✏️ Изменить график"],
-                ["✏️ Изменить группу", "✏️ Изменить объект"],
-                ["✏️ Факт дня", "✏️ Статус работы"],
-                ["🔼 Вверх в списке", "🔽 Вниз в списке"],
-                ["↩️ Отменить 'Не работаю'"],
+                ["✏️ Изменить отдел", "✏️ Изменить должность"],
+                ["✏️ Изменить график", "✏️ Факт дня"],
+                ["✏️ Изменить номер в таблице"],
+                ["✅ Сотрудник вернулся на работу"],
                 ["❌ Отмена"]
             ],
             resize_keyboard=True,
@@ -2449,17 +2435,15 @@ async def list_workers_select(update: Update, context: ContextTypes.DEFAULT_TYPE
     gname = await get_group_name_async(context.bot, worker["group_id"])
     active_str = "Активен" if worker["is_active"] else "В отпуске / на больничном"
     object_name = worker.get("object_id", "Основной")
-    info = f"👤 {worker['last_name']} {worker['first_name']}\nОбъект: {object_name}\nОтдел: {worker['position']}\nГрафик: {worker['schedule']} ({schedule_str})\nГруппа: {gname}\nФакт дня: {fact}\nСтатус работы: {active_str}\n\nЧто хотите сделать?"
+    info = f"👤 {worker['last_name']} {worker['first_name']}\nОтдел: {object_name}\nДолжность: {worker['position']}\nГрафик: {worker['schedule']} ({schedule_str})\nГруппа: {gname}\nФакт дня: {fact}\nСтатус работы: {active_str}\n\nЧто хотите сделать?"
 
     kbd = ReplyKeyboardMarkup(
         [
-            ["📅 История за неделю", "✏️ Номер в списке"],
             ["✏️ Изменить фамилию", "✏️ Изменить имя"],
-            ["✏️ Изменить отдел", "✏️ Изменить график"],
-            ["✏️ Изменить группу", "✏️ Изменить объект"],
-            ["✏️ Факт дня", "✏️ Статус работы"],
-            ["🔼 Вверх в списке", "🔽 Вниз в списке"],
-            ["↩️ Отменить 'Не работаю'"],
+            ["✏️ Изменить отдел", "✏️ Изменить должность"],
+            ["✏️ Изменить график", "✏️ Факт дня"],
+            ["✏️ Изменить номер в таблице"],
+            ["✅ Сотрудник вернулся на работу"],
             ["❌ Отмена"]
         ],
         resize_keyboard=True,
@@ -2477,13 +2461,7 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Ошибка состояния. Начните сначала.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
 
-    if action == "📅 История за неделю":
-        history_text = get_worker_history_last_week(worker["telegram_id"])
-        await update.message.reply_text(history_text, reply_markup=MAIN_MENU)
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    if action == "✏️ Номер в списке":
+    if action == "✏️ Изменить номер в таблице":
         await update.message.reply_text(
             f"Введите новый порядковый номер для {worker['last_name']} {worker['first_name']}\n"
             f"(сейчас он под номером {idx + 1}, всего в отделе {len(rows)} сотрудников):",
@@ -2491,17 +2469,7 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return ASK_EDIT_SORT_ORDER
 
-    if action in ("🔼 Вверх в списке", "🔽 Вниз в списке"):
-        target_idx = idx - 1 if action == "🔼 Вверх в списке" else idx + 1
-        if target_idx < 0 or target_idx >= len(rows):
-            await update.message.reply_text("Сотрудник уже на краю списка.", reply_markup=MAIN_MENU)
-            return ConversationHandler.END
-        swap_sort_order(worker["telegram_id"], rows[target_idx]["telegram_id"])
-        await update.message.reply_text(f"Порядок изменен для {worker['last_name']}.", reply_markup=MAIN_MENU)
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    if action == "↩️ Отменить 'Не работаю'":
+    if action == "✅ Сотрудник вернулся на работу":
         date_str = now_local().strftime("%Y-%m-%d")
         existing = await run_db(get_existing_report_row, worker["telegram_id"], date_str, "not_working", None)
         if not existing:
@@ -2532,12 +2500,10 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     field_map = {
         "✏️ Изменить фамилию": ("last_name", "Введите новую фамилию:"),
         "✏️ Изменить имя": ("first_name", "Введите новое имя:"),
-        "✏️ Изменить отдел": ("position", "Введите новое название отдела:"),
-        "✏️ Изменить группу": ("group_id", "Введите новый ID группы Telegram (0 = по умолчанию):"),
-        "✏️ Изменить объект": ("object_id", "Введите название объекта для сотрудника (например: Основной, Северный):"),
+        "✏️ Изменить отдел": ("object_id", "Введите название отдела для сотрудника (например: Основной, Северный):"),
+        "✏️ Изменить должность": ("position", "Введите новую должность:"),
         "✏️ Изменить график": ("schedule", None),
         "✏️ Факт дня": ("needs_daily_fact", None),
-        "✏️ Статус работы": ("is_active", None),
     }
 
     if action not in field_map:
@@ -2547,27 +2513,12 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     field, prompt = field_map[action]
     context.user_data["edit_field"] = field
 
-    if field == "position":
-        await update.message.reply_text(
-            "Выберите существующий отдел из списка ниже или введите новое название отдела:",
-            reply_markup=departments_reply_keyboard(context)
-        )
-        return ASK_EDIT_VALUE
     if field == "schedule":
         await update.message.reply_text("Выберите новый график:", reply_markup=SCHEDULE_KEYBOARD)
         return ASK_EDIT_SCHEDULE
     if field == "needs_daily_fact":
         await update.message.reply_text("Нужен ли ежедневный факт дня?", reply_markup=YES_NO_KEYBOARD)
         return ASK_EDIT_DAILY_FACT
-    if field == "is_active":
-        await update.message.reply_text(
-            "Выберите новый статус работы:",
-            reply_markup=ReplyKeyboardMarkup([["Активен", "В отпуске / на больничном"], ["❌ Отмена"]], resize_keyboard=True)
-        )
-        return ASK_EDIT_STATUS_WORK
-    if field == "group_id":
-        await update.message.reply_text(prompt, reply_markup=CANCEL_KEYBOARD)
-        return ASK_EDIT_GROUP_VALUE
 
     await update.message.reply_text(prompt, reply_markup=CANCEL_KEYBOARD)
     return ASK_EDIT_VALUE
@@ -2591,9 +2542,9 @@ async def edit_value_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         kbd = ReplyKeyboardMarkup([["Оставить в конце"], ["❌ Отмена"]], resize_keyboard=True)
         await update.message.reply_text(
-            f"✅ Сотрудник {worker['last_name']} {worker['first_name']} успешно переведен в отдел «{new_dept}».\n"
+            f"✅ Должность сотрудника {worker['last_name']} {worker['first_name']} изменена на «{new_dept}».\n"
             f"Сейчас он находится в конце списка (под номером {num_workers}).\n\n"
-            f"Вы можете изменить его порядковый номер в новом отделе.\n"
+            f"Вы можете изменить его порядковый номер в новом списке.\n"
             f"Введите порядковый номер (число от 1 до {num_workers}) или нажмите кнопку «Оставить в конце»:",
             reply_markup=kbd
         )
@@ -2831,8 +2782,8 @@ async def add_worker_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def add_worker_firstname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["first_name"] = update.message.text.strip()
     await update.message.reply_text(
-        "Выберите существующий отдел из списка ниже или введите новое название отдела:",
-        reply_markup=departments_reply_keyboard(context)
+        "Введите должность сотрудника:",
+        reply_markup=CANCEL_KEYBOARD
     )
     return ASK_POSITION
 
