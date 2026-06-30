@@ -200,6 +200,23 @@ def get_db():
         pass
     return conn
 
+
+async def run_db(func, *args, **kwargs):
+    """Выполняет блокирующую функцию работы с БД в отдельном потоке.
+
+    Любая существующая синхронная функция (get_worker, save_report, calculate_worker_stats и т.д.)
+    использует sqlite3 синхронно. Вызванная напрямую из async-хендлера, она блокирует event loop
+    на время диска I/O — при нескольких пользователях бот начинает "подвисать" на сообщениях.
+
+    Использование: вместо
+        worker = get_worker(telegram_id)
+    в async-функции пишем:
+        worker = await run_db(get_worker, telegram_id)
+
+    Это не требует переписывать сами DB-функции — только точки их вызова из async-хендлеров.
+    """
+    return await asyncio.to_thread(func, *args, **kwargs)
+
 def init_db():
     conn = get_db()
     conn.execute(
@@ -268,6 +285,13 @@ def init_db():
     cols_reports = {row["name"] for row in conn.execute("PRAGMA table_info(reports)").fetchall()}
     if "raw_text" not in cols_reports:
         conn.execute("ALTER TABLE reports ADD COLUMN raw_text TEXT NOT NULL DEFAULT ''")
+    # Колонки для отслеживания текстового сообщения-оценки в группе: при дополнении статуса
+    # старое текстовое сообщение удаляется и пересоздаётся, а пересланные медиа (видео/голос)
+    # остаются как есть и не трогаются.
+    if "group_chat_id" not in cols_reports:
+        conn.execute("ALTER TABLE reports ADD COLUMN group_chat_id INTEGER")
+    if "group_message_id" not in cols_reports:
+        conn.execute("ALTER TABLE reports ADD COLUMN group_message_id INTEGER")
 
     # Таблица для настроек (для сохранения расписания сводок)
     conn.execute(
@@ -751,6 +775,89 @@ def update_report_text_and_ai(report_id: int, is_ok: bool, format_comment: str, 
     except RuntimeError:
         pass
 
+def set_report_group_message(report_id: int, chat_id: int, message_id: int):
+    """Сохраняет id текстового сообщения-оценки в группе, чтобы при следующем дополнении
+    к этому же отчёту можно было удалить старое сообщение и отправить новое.
+    Сообщения с пересланными медиа (видео/голос) сюда не относятся — они не трогаются."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE reports SET group_chat_id = ?, group_message_id = ? WHERE id = ?",
+        (chat_id, message_id, report_id)
+    )
+    conn.commit()
+    conn.close()
+
+def get_report_group_message(report_id: int):
+    """Возвращает (group_chat_id, group_message_id) ранее сохраненного сообщения-оценки в группе."""
+    conn = get_db()
+    row = conn.execute("SELECT group_chat_id, group_message_id FROM reports WHERE id = ?", (report_id,)).fetchone()
+    conn.close()
+    return row
+
+def get_submitted_status_slots(telegram_id: int, report_date: str) -> set:
+    """Слоты, по которым на сегодня у сотрудника уже есть отчет-статус."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT DISTINCT slot_time FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = 'status'",
+        (telegram_id, report_date)
+    ).fetchall()
+    conn.close()
+    return {r["slot_time"] for r in rows}
+
+def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots: set):
+    """Выбирает слот, к которому нужно отнести статус-отчет.
+
+    Если есть уже прошедшие, но ещё не сданные слоты — берём САМЫЙ РАННИЙ из них.
+    Это нужно, чтобы несколько видео/сообщений подряд (например, вечером, когда сотрудник
+    "догоняется" по пропущенным статусам) последовательно закрывали пропуски по порядку,
+    а не все скидывались в один и тот же (последний) слот.
+
+    Если пропущенных слотов нет — обычная логика "ближайший по времени слот"
+    (стандартная сдача отчета в реальном времени)."""
+    current_mins = now.hour * 60 + now.minute
+    missing_passed = []
+    for slot in schedule:
+        if slot in submitted_slots:
+            continue
+        h, m = map(int, slot.split(":"))
+        if h * 60 + m <= current_mins:
+            missing_passed.append(slot)
+    if missing_passed:
+        missing_passed.sort(key=lambda s: tuple(map(int, s.split(":"))))
+        return missing_passed[0], True
+    return find_nearest_slot(schedule, now)
+
+def get_existing_report_row(telegram_id: int, report_date: str, report_type: str, slot_time: str | None = None):
+    """Находит уже существующий отчет за слот (status) или за день (daily_fact), если он есть."""
+    conn = get_db()
+    if report_type == "status":
+        row = conn.execute(
+            "SELECT * FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = 'status' AND slot_time = ?",
+            (telegram_id, report_date, slot_time)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = 'daily_fact'",
+            (telegram_id, report_date)
+        ).fetchone()
+    conn.close()
+    return row
+
+def build_addon_text(existing_raw: str, new_text: str, use_video_label: bool) -> str:
+    """Склеивает текст дополнения со старым текстом отчета, нумеруя видео ("[Видео N]")
+    или помечая текстовое дополнение ("[Дополнение]"), чтобы и в чате, и для самого ИИ
+    было понятно, что это N-я по счету запись, а не разрозненный текст."""
+    existing_raw = existing_raw or ""
+    if use_video_label:
+        idx = existing_raw.count("[Видео ") + 1
+        if "[Видео " not in existing_raw and existing_raw:
+            existing_raw = f"[Видео 1]: {existing_raw}"
+            idx = 2
+        label = f"[Видео {idx}]"
+    else:
+        label = "[Дополнение]"
+    return f"{existing_raw}\n{label}: {new_text}" if existing_raw else new_text
+
 def get_worker_history_last_week(telegram_id: int) -> str:
     """Решение проблемы 6: Логирование истории отчетов сотрудника за неделю."""
     conn = get_db()
@@ -1020,19 +1127,14 @@ def get_next_sort_order(position: str) -> int:
 # Работа с ИИ (Groq / Whisper / Llama)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def normalize_ai_result(data: dict, source_text: str) -> dict:
-    text_lower = source_text.lower()
-    report_type = str(data.get("report_type", "status")).strip().lower()
-
-    fact_words = ("факт", "факт дня", "за день", "итог дня", "итоги дня", "сегодня за день", "дневной отчет")
-    status_words = ("статус", "сейчас", "на данный момент", "за 10", "за 11", "за 12", "за 13", "за 15", "за 16", "за 17", "за 18")
-
-    if any(word in text_lower for word in fact_words):
-        report_type = "daily_fact"
-    elif any(word in text_lower for word in status_words):
-        report_type = "status"
-    elif report_type not in ("status", "daily_fact"):
-        report_type = "status"
+def normalize_ai_result(data: dict, source_text: str, report_type: str | None = "status") -> dict:
+    # report_type="status"/"daily_fact" — тип жёстко задан системой по времени (днём это всегда так).
+    # report_type=None — "авто"-режим: вечером система не может заранее сказать, статус это или факт,
+    # поэтому доверяем выбору модели из её собственного ответа (data["report_type"]).
+    if report_type not in ("status", "daily_fact"):
+        report_type = str(data.get("report_type", "status")).strip().lower()
+        if report_type not in ("status", "daily_fact"):
+            report_type = "status"
 
     raw_ok = data.get("is_ok", False)
     if isinstance(raw_ok, str):
@@ -1104,6 +1206,8 @@ CHECK_PROMPT_TEMPLATE = """
 
 Главный вопрос:
 СДЕЛАЛ ЛИ ЧЕЛОВЕК РАБОТУ ИЛИ НЕТ?
+
+{mode_instruction}
 
 
 =====================
@@ -1214,9 +1318,7 @@ CHECK_PROMPT_TEMPLATE = """
 Ответь только JSON:
 
 {{
-"report_type": "status" или "daily_fact",
-
-"is_ok": true или false,
+{json_type_field}"is_ok": true или false,
 
 "issue": "что не так",
 
@@ -1224,7 +1326,6 @@ CHECK_PROMPT_TEMPLATE = """
 
 "employee_message": "короткое сообщение сотруднику"
 }}
-
 
 Отчёт:
 
@@ -1318,10 +1419,38 @@ def clean_report(text: str) -> str:
         logger.error(f"Ошибка при очистке отчета: {e}")
         return text
 
-def check_status(text: str) -> dict:
+def check_status(text: str, report_type: str | None = "status") -> dict:
+    is_forced = report_type in ("status", "daily_fact")
+
+    if is_forced:
+        report_type_label = "СТАТУС (отчёт о текущей работе в течение дня)" if report_type == "status" else "ИТОГ ДНЯ / ФАКТ (финальный отчёт о всей проделанной за день работе)"
+        report_type_hint = (
+            "Оценивай как промежуточный отчёт о том, чем человек занимается прямо сейчас."
+            if report_type == "status"
+            else "Оценивай как итоговый отчёт за весь рабочий день — ожидай более полного описания того, что было сделано в течение дня."
+        )
+        mode_instruction = (
+            f"ВАЖНО: тип отчёта уже точно определён системой по времени отправки — это {report_type_label}.\n"
+            f"Не пытайся определить тип отчёта сам, просто оцени содержание с учётом этого контекста:\n{report_type_hint}"
+        )
+        json_type_field = ""
+        cache_key_prefix = report_type
+    else:
+        # Авто-режим: используется ВЕЧЕРОМ, когда система не может заранее сказать,
+        # это запоздавший статус по конкретному времени или итог за весь день — решает сама модель по смыслу.
+        mode_instruction = (
+            "ВАЖНО: сейчас вечер, и система НЕ может заранее определить тип отчёта — сотрудник может присылать как\n"
+            "запоздавший СТАТУС о конкретном моменте/периоде работы, так и ИТОГ ДНЯ (финальное подведение итогов за весь день).\n"
+            "Определи тип САМ по смыслу сообщения:\n"
+            "- если текст описывает, что человек делал в какой-то конкретный момент или период работы (похоже на обычный текущий статус) — это \"status\"\n"
+            "- если текст звучит как ОБЩЕЕ подведение итогов за ВЕСЬ рабочий день целиком (что в сумме сделано за день) — это \"daily_fact\""
+        )
+        json_type_field = '"report_type": "status" или "daily_fact",\n\n'
+        cache_key_prefix = "auto"
+
     if groq_client is None:
-        return normalize_ai_result({"report_type": "status", "is_ok": False, "issue": "GROQ_API_KEY не задан"}, text)
-    h = get_md5(text)
+        return normalize_ai_result({"is_ok": False, "issue": "GROQ_API_KEY не задан"}, text, report_type if is_forced else None)
+    h = get_md5(f"{cache_key_prefix}:{text}")
     if h in _ai_status_cache:
         logger.info("check_status: cache hit!")
         return _ai_status_cache[h]
@@ -1331,18 +1460,18 @@ def check_status(text: str) -> dict:
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "Отвечай только валидным JSON без Markdown."},
-                {"role": "user", "content": CHECK_PROMPT_TEMPLATE.format(text=text)},
+                {"role": "user", "content": CHECK_PROMPT_TEMPLATE.format(text=text, mode_instruction=mode_instruction, json_type_field=json_type_field)},
             ],
             max_tokens=400,
             temperature=0,
             response_format={"type": "json_object"},
         )
         raw = response.choices[0].message.content.strip()
-        res = normalize_ai_result(json.loads(raw), text)
+        res = normalize_ai_result(json.loads(raw), text, report_type if is_forced else None)
         _ai_status_cache[h] = res
         return res
     except Exception as e:
-        return normalize_ai_result({"report_type": "status", "is_ok": False, "issue": f"Ошибка ИИ: {e}"}, text)
+        return normalize_ai_result({"is_ok": False, "issue": f"Ошибка ИИ: {e}"}, text, report_type if is_forced else None)
 
 
 async def transcribe_audio_async(file_path: str) -> str:
@@ -1354,9 +1483,11 @@ async def clean_report_async(text: str) -> str:
 
 
 async def check_status_async(text: str, report_type_override: str | None = None) -> dict:
-    res = await asyncio.to_thread(check_status, text)
-    if report_type_override:
-        res["report_type"] = report_type_override
+    # report_type_override="status" или "daily_fact" — тип жёстко задан системой (днём всегда так,
+    # факт дня физически не может прийти раньше последнего слота статуса).
+    # report_type_override=None — "авто"-режим (только вечером): тип определяет сама модель по смыслу,
+    # это позволяет различить, например, 2 видео "на статус" и 1 "на факт", присланные в одно и то же время.
+    res = await asyncio.to_thread(check_status, text, report_type_override)
     return res
 
 
@@ -3231,18 +3362,71 @@ def format_time_no_seconds(time_str) -> str:
             return time_str
 
 
+# ── Шифрование чувствительных настроек ───────────────────────────────────────
+# Ключи, которые нельзя хранить в settings открытым текстом (секреты, токены доступа).
+ENCRYPTED_SETTING_KEYS = {"google_service_account"}
+
+_fernet = None
+
+def _get_fernet():
+    """Возвращает Fernet-инстанс для шифрования/расшифровки настроек.
+
+    Ключ берётся из переменной окружения SETTINGS_ENCRYPTION_KEY (сгенерировать через
+    `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
+    и сохранить в .env). Если ключ не задан — шифрование выключено (с предупреждением в лог),
+    чтобы не потерять доступ к существующим данным при первом запуске без настройки.
+    """
+    global _fernet
+    if _fernet is not None:
+        return _fernet
+    key = os.environ.get("SETTINGS_ENCRYPTION_KEY")
+    if not key:
+        logger.warning(
+            "SETTINGS_ENCRYPTION_KEY не задан — чувствительные настройки (%s) "
+            "будут храниться БЕЗ шифрования. Задайте переменную окружения для продакшена.",
+            ", ".join(ENCRYPTED_SETTING_KEYS),
+        )
+        _fernet = False
+        return _fernet
+    try:
+        from cryptography.fernet import Fernet
+        _fernet = Fernet(key.encode())
+    except Exception:
+        logger.exception("Не удалось инициализировать шифрование настроек, ключ SETTINGS_ENCRYPTION_KEY некорректен")
+        _fernet = False
+    return _fernet
+
+
 def get_setting(key: str, default: str = None) -> str:
     conn = get_db()
     row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
     conn.close()
-    return row["value"] if row else default
+    if not row:
+        return default
+    value = row["value"]
+    if key in ENCRYPTED_SETTING_KEYS:
+        fernet = _get_fernet()
+        if fernet:
+            try:
+                return fernet.decrypt(value.encode()).decode()
+            except Exception:
+                # Значение могло быть сохранено до включения шифрования — отдаём как есть,
+                # но логируем, чтобы было видно, что есть незашифрованные legacy-данные.
+                logger.warning("Настройка %s не расшифрована (возможно, сохранена без шифрования)", key)
+                return value
+    return value
 
 
 def set_setting(key: str, value: str):
+    stored_value = value
+    if key in ENCRYPTED_SETTING_KEYS:
+        fernet = _get_fernet()
+        if fernet:
+            stored_value = fernet.encrypt(value.encode()).decode()
     conn = get_db()
     conn.execute(
         "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value)
+        (key, stored_value)
     )
     conn.commit()
     conn.close()
@@ -5302,6 +5486,12 @@ async def export_department_selected(update: Update, context: ContextTypes.DEFAU
 
 async def check_missing_reports_job(context: ContextTypes.DEFAULT_TYPE):
     now = now_local()
+
+    # Напоминания о статусах нужны только в будние дни (пн-пт).
+    # weekday(): 0=понедельник ... 5=субота, 6=воскресенье
+    if now.weekday() >= 5:
+        return
+
     date_str = now.strftime("%Y-%m-%d")
     current_mins = now.hour * 60 + now.minute
     
@@ -5587,7 +5777,7 @@ async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Привет! Выберите действие кнопкой ниже.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
         
-    worker = get_worker(user_id)
+    worker = await run_db(get_worker, user_id)
     if worker:
         await update.message.reply_text(
             f"Привет! Отправьте видеоотчет, когда он будет готов.",
@@ -5765,7 +5955,7 @@ async def register_firstname_received(update: Update, context: ContextTypes.DEFA
 
 async def vacation_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    worker = get_worker(user_id)
+    worker = await run_db(get_worker, user_id)
     if not worker:
         await update.message.reply_text("Вы не зарегистрированы в системе. Оформление отпуска невозможно.")
         return ConversationHandler.END
@@ -5831,7 +6021,7 @@ async def vacation_reason_received(update: Update, context: ContextTypes.DEFAULT
         return ConversationHandler.END
     
     user_id = update.effective_user.id
-    worker = get_worker(user_id)
+    worker = await run_db(get_worker, user_id)
     if not worker:
         await update.message.reply_text("Сотрудник не найден.")
         return ConversationHandler.END
@@ -5988,7 +6178,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lock = get_user_lock(user_id)
     await lock.acquire()
 
-    worker = get_worker(user_id)
+    worker = await run_db(get_worker, user_id)
     
     text_content = ""
     # Решение проблемы 2: Обеспечение гарантированного создания каталога tmp/ и очистки через try/finally
@@ -6121,7 +6311,8 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conn.commit()
                 conn.close()
                 
-                save_report(
+                await run_db(
+                    save_report,
                     telegram_id=user_id,
                     report_date=date_str,
                     report_type="not_working",
@@ -6190,51 +6381,54 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         now = now_local()
+
+        # Видео/голосовые отчеты теперь обрабатываются пачкой (см. enqueue_media_report_item):
+        # если сотрудник пришлет несколько видео подряд, бот подождет немного, соберет их вместе
+        # и сформирует ОДНО общее сообщение-оценку в группе вместо нескольких разрозненных.
+        if is_media:
+            await enqueue_media_report_item(user_id, context, update, text_content, now)
+            return
+
         date_str = now.strftime("%Y-%m-%d")
         sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
         
-        # Автоматическое определение: если отчет прислан после последнего слота + порог, то это daily_fact
+        # Определение типа отчёта по времени: факт дня физически не может прийти раньше
+        # последнего слота статуса — днём тип всегда "статус". Вечером же тип не фиксируем
+        # жёстко, а даём ИИ самому решить по смыслу (см. check_status: режим "авто") —
+        # это нужно, чтобы отличить запоздавший статус по конкретному времени от итога дня.
         last_slot_time_str = sched_list[-1]
         last_hour, last_minute = map(int, last_slot_time_str.split(":"))
         last_slot_time = now.replace(hour=last_hour, minute=last_minute, second=0, microsecond=0)
         last_slot_limit = last_slot_time + dt_module.timedelta(minutes=LATE_THRESHOLD_MIN)
-        
-        report_type_override = None
-        if now > last_slot_limit:
-            report_type_override = "daily_fact"
+
+        report_type_override = "status" if now <= last_slot_limit else None
 
         # Анализ промптом Llama для определения типа отчета
         ai_res_pre = await check_status_async(text_content, report_type_override=report_type_override)
         report_type = ai_res_pre["report_type"]
-        nearest_slot, is_late = find_nearest_slot(sched_list, now)
 
-        # Проверяем, существует ли отчет у этого сотрудника за этот слот (status) или день (daily_fact)
-        conn = get_db()
         if report_type == "status":
-            existing_report = conn.execute(
-                "SELECT * FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = 'status' AND slot_time = ?",
-                (user_id, date_str, nearest_slot)
-            ).fetchone()
+            submitted_slots = await run_db(get_submitted_status_slots, user_id, date_str)
+            nearest_slot, is_late = pick_target_status_slot(sched_list, now, submitted_slots)
         else:
-            existing_report = conn.execute(
-                "SELECT * FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = 'daily_fact'",
-                (user_id, date_str)
-            ).fetchone()
-        conn.close()
+            nearest_slot, is_late = None, False
+
+        existing_report = await run_db(get_existing_report_row, user_id, date_str, report_type, nearest_slot)
 
         is_addon = False
         if existing_report:
             is_addon = True
-            existing_raw = existing_report["raw_text"] or ""
-            # Склеиваем предыдущий текст и новое дополнение
-            text_content = f"{existing_raw}\n[Дополнение]: {text_content}" if existing_raw else text_content
-            # Прогоняем КЛАССИФИКАЦИЮ и АНАЛИЗ заново для объединенного контента
-            ai_res = await check_status_async(text_content, report_type_override=report_type_override)
+            # Склеиваем предыдущий текст и новое текстовое дополнение.
+            text_content = build_addon_text(existing_report["raw_text"], text_content, use_video_label=False)
+            # Прогоняем КЛАССИФИКАЦИЮ и АНАЛИЗ заново для объединенного контента.
+            # Тип отчета при дополнении не пересматриваем — он уже закреплен за этой записью.
+            ai_res = await check_status_async(text_content, report_type_override=report_type)
             cleaned_text = await clean_report_async(text_content)
             report_id = existing_report["id"]
             
             # Обновляем существующий отчет в БД
-            update_report_text_and_ai(
+            await run_db(
+                update_report_text_and_ai,
                 report_id=report_id,
                 is_ok=ai_res["is_ok"],
                 format_comment=ai_res["format_comment"],
@@ -6245,7 +6439,8 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             ai_res = ai_res_pre
             cleaned_text = await clean_report_async(text_content)
-            report_id = save_report(
+            report_id = await run_db(
+                save_report,
                 telegram_id=user_id,
                 report_date=date_str,
                 report_type=ai_res["report_type"],
@@ -6320,7 +6515,19 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         inline_kbd = make_report_keyboard(report_id, ai_res["report_type"])
-        
+
+        # При дополнении удаляем СТАРОЕ текстовое сообщение-оценку в группе (если оно есть),
+        # чтобы не плодить дубли. Пересланные медиа (видео/голосовые) НЕ трогаем — они остаются
+        # в группе как и были, новое медиа (если есть) просто добавляется отдельным сообщением ниже.
+        if is_addon and existing_report and existing_report["group_chat_id"] and existing_report["group_message_id"]:
+            try:
+                await context.bot.delete_message(
+                    chat_id=existing_report["group_chat_id"],
+                    message_id=existing_report["group_message_id"]
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось удалить старое сообщение-оценку {existing_report['group_message_id']} в чате {existing_report['group_chat_id']}: {e}")
+
         copied_msg_id = None
         if is_media:
             try:
@@ -6333,20 +6540,24 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Ошибка копирования медиа в чат {dest_chat}: {e}")
 
+        sent_notify_msg = None
         try:
             if copied_msg_id:
-                await context.bot.send_message(
+                sent_notify_msg = await context.bot.send_message(
                     chat_id=dest_chat,
                     text=notify_text,
                     reply_markup=inline_kbd,
                     reply_to_message_id=copied_msg_id
                 )
             else:
-                await context.bot.send_message(
+                sent_notify_msg = await context.bot.send_message(
                     chat_id=dest_chat,
                     text=notify_text,
                     reply_markup=inline_kbd
                 )
+            # Запоминаем id этого сообщения, чтобы следующее дополнение к этому отчету
+            # могло его удалить и заменить новым (а не плодить дубли в группе).
+            await run_db(set_report_group_message, report_id, dest_chat, sent_notify_msg.message_id)
         except Exception as e:
             # Предохранитель: если отправка в группу сломалась, дублируем всем админам
             logger.error(f"Ошибка отправки оценки в чат {dest_chat}: {e}")
@@ -6393,11 +6604,243 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Ошибка удаления файла {tmp_path}: {rm_e}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Пачковая обработка видео/голосовых отчетов
+# ══════════════════════════════════════════════════════════════════════════════
+# Если сотрудник присылает несколько видео подряд (например, 3 видео вечером, из которых
+# 2 на самом деле статус по конкретному времени, а 1 — итог дня), бот не обрабатывает их
+# по одному, а ждет короткую паузу, собирает все пришедшие видео вместе и:
+#   1) пересылает их все в группу по порядку (как и раньше);
+#   2) классифицирует КАЖДОЕ видео отдельно (статус/факт — по смыслу, если вечер);
+#   3) создает/дополняет правильные строки в БД для каждого видео отдельно;
+#   4) публикует ОДНО общее сообщение под всеми видео с разбивкой "Видео 1 / 2 / 3"
+#      и общим итогом, вместо нескольких разрозненных сообщений.
+
+MEDIA_BATCH_BUFFERS: dict[int, dict] = {}
+MEDIA_BATCH_DEBOUNCE_SECONDS = 8
+
+
+async def enqueue_media_report_item(user_id: int, context: ContextTypes.DEFAULT_TYPE, update: Update, text_content: str, now: datetime):
+    """Добавляет видео/голосовое сообщение в буфер пользователя и (пере)запускает таймер ожидания.
+    Если в течение MEDIA_BATCH_DEBOUNCE_SECONDS придет еще одно видео — таймер сбрасывается,
+    и все видео будут обработаны вместе одной пачкой."""
+    buf = MEDIA_BATCH_BUFFERS.setdefault(user_id, {"items": [], "task": None})
+    buf["items"].append({"update": update, "text_content": text_content, "now": now})
+
+    old_task = buf.get("task")
+    if old_task and not old_task.done():
+        old_task.cancel()
+    buf["task"] = asyncio.create_task(_flush_media_batch(user_id, context))
+
+
+async def _flush_media_batch(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await asyncio.sleep(MEDIA_BATCH_DEBOUNCE_SECONDS)
+    except asyncio.CancelledError:
+        # Пришло новое видео, таймер был перезапущен — эта задача больше не нужна
+        return
+
+    buf = MEDIA_BATCH_BUFFERS.pop(user_id, None)
+    if not buf or not buf["items"]:
+        return
+
+    lock = get_user_lock(user_id)
+    await lock.acquire()
+    try:
+        await process_media_batch(user_id, buf["items"], context)
+    except Exception:
+        logger.exception(f"Ошибка обработки пачки видео-отчетов пользователя {user_id}")
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            pass
+
+
+async def process_media_batch(user_id: int, items: list[dict], context: ContextTypes.DEFAULT_TYPE):
+    worker = await run_db(get_worker, user_id)
+    if not worker:
+        return  # незарегистрированный сотрудник уже обработан на этапе приёма каждого видео
+
+    sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
+    w_name = f"{worker['last_name']} {worker['first_name']}"
+    dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
+
+    last_slot_time_str = sched_list[-1]
+    last_hour, last_minute = map(int, last_slot_time_str.split(":"))
+
+    results = []
+    for idx, item in enumerate(items, start=1):
+        text_content = item["text_content"]
+        now = item["now"]
+        upd = item["update"]
+        date_str = now.strftime("%Y-%m-%d")
+
+        last_slot_time = now.replace(hour=last_hour, minute=last_minute, second=0, microsecond=0)
+        last_slot_limit = last_slot_time + dt_module.timedelta(minutes=LATE_THRESHOLD_MIN)
+
+        # Днём факт дня в принципе невозможен — это всегда статус.
+        # Вечером даём ИИ решить по смыслу каждого видео отдельно — так бот различает
+        # видео "на статус" и видео "на факт", даже если все они присланы в одно и то же время.
+        forced_type = "status" if now <= last_slot_limit else None
+
+        ai_res_pre = await check_status_async(text_content, report_type_override=forced_type)
+        report_type = ai_res_pre["report_type"]
+
+        if report_type == "status":
+            submitted_slots = await run_db(get_submitted_status_slots, user_id, date_str)
+            slot_time, is_late = pick_target_status_slot(sched_list, now, submitted_slots)
+        else:
+            slot_time, is_late = None, False
+
+        existing = await run_db(get_existing_report_row, user_id, date_str, report_type, slot_time)
+        use_label = len(items) > 1 or existing is not None
+
+        if existing:
+            merged_raw = build_addon_text(existing["raw_text"], text_content, use_video_label=True)
+            ai_res = await check_status_async(merged_raw, report_type_override=report_type)
+            cleaned_text = await clean_report_async(merged_raw)
+            raw_text_final = merged_raw
+            report_id = existing["id"]
+            await run_db(
+                update_report_text_and_ai,
+                report_id=report_id,
+                is_ok=ai_res["is_ok"],
+                format_comment=ai_res["format_comment"],
+                required_action=ai_res["required_action"],
+                raw_text=raw_text_final,
+                received_at=now.strftime("%H:%M:%S")
+            )
+            is_addon_item = True
+        else:
+            ai_res = ai_res_pre
+            raw_text_final = f"[Видео {idx}]: {text_content}" if use_label else text_content
+            cleaned_text = await clean_report_async(raw_text_final)
+            report_id = await run_db(
+                save_report,
+                telegram_id=user_id,
+                report_date=date_str,
+                report_type=report_type,
+                slot_time=slot_time,
+                received_at=now.strftime("%H:%M:%S"),
+                is_ok=ai_res["is_ok"],
+                is_late=is_late if report_type == "status" else 0,
+                format_comment=ai_res["format_comment"],
+                required_action=ai_res["required_action"],
+                raw_text=raw_text_final
+            )
+            is_addon_item = False
+
+        # Пересылаем видео в группу, сохраняя порядок отправки
+        copied_msg_id = None
+        try:
+            copied_msg = await context.bot.copy_message(
+                chat_id=dest_chat,
+                from_chat_id=upd.effective_chat.id,
+                message_id=upd.message.message_id
+            )
+            copied_msg_id = copied_msg.message_id
+        except Exception as e:
+            logger.error(f"Ошибка копирования видео {idx} в чат {dest_chat}: {e}")
+
+        results.append({
+            "idx": idx, "report_type": report_type, "slot_time": slot_time,
+            "ai_res": ai_res, "report_id": report_id, "copied_msg_id": copied_msg_id,
+            "is_addon": is_addon_item, "cleaned_text": cleaned_text, "raw_text": raw_text_final,
+            "date_str": date_str,
+        })
+
+        # Личный фидбек сотруднику по каждому видео отдельно (как и раньше)
+        time_str = now.strftime("%H:%M")
+        suffix_tail = f" (видео {idx} из {len(items)})" if len(items) > 1 else ""
+        if report_type == "status" and slot_time:
+            info_suffix = f" за слот *{slot_time}*{suffix_tail}"
+        else:
+            info_suffix = f" (Итог дня){suffix_tail}"
+        try:
+            if ai_res["is_ok"]:
+                await upd.message.reply_text(f"✅ Отчёт{info_suffix} принят без замечаний!", parse_mode="Markdown")
+            else:
+                await upd.message.reply_text(f"⚠️ Отчёт{info_suffix}.\n{ai_res['employee_message']}", parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Не удалось отправить личный фидбек по видео {idx} пользователю {user_id}: {e}")
+
+    if not results:
+        return
+
+    # Формируем ОДНО общее сообщение-оценку в группу под всеми видео этой пачки
+    if len(results) == 1:
+        r = results[0]
+        notify_text = (
+            f"{w_name}\n"
+            f"{format_status_or_fact_line(r['report_type'], r['slot_time'], r['date_str'])}\n"
+            f"Оценка ИИ: {'ОК' if r['ai_res']['is_ok'] else 'НЕ ОК'}\n"
+            f"Комментарий ИИ: {r['ai_res']['format_comment']}\n\n"
+            f"📝 Официальный отчет:\n\"{r['cleaned_text']}\"\n\n"
+            f"🗣 Оригинальный текст:\n\"{r['raw_text']}\""
+        )
+        inline_kbd = make_report_keyboard(r["report_id"], r["report_type"])
+    else:
+        lines = []
+        for r in results:
+            label = f"Статус {r['slot_time']}" if r["report_type"] == "status" else "Итог дня"
+            icon = "✅" if r["ai_res"]["is_ok"] else "⚠️"
+            lines.append(f"🎬 Видео {r['idx']} — {label}: {icon} {r['ai_res']['format_comment']}")
+        overall_ok = all(r["ai_res"]["is_ok"] for r in results)
+        overall_line = "Все видео приняты без замечаний." if overall_ok else "Есть замечания — см. видео выше."
+        notify_text = (
+            f"{w_name}\n"
+            f"📦 Отчёт из {len(results)} видео за {results[0]['date_str']}:\n\n"
+            + "\n".join(lines) +
+            f"\n\nОбщий итог: {overall_line}"
+        )
+        kbd_rows = []
+        for r in results:
+            kbd_rows.append([
+                InlineKeyboardButton(f"✏️ Видео {r['idx']}: комментарий", callback_data=f"edit_comment_{r['report_id']}"),
+                InlineKeyboardButton(f"🔄 Видео {r['idx']}: оценка", callback_data=f"fix_toggle_{r['report_id']}")
+            ])
+        inline_kbd = InlineKeyboardMarkup(kbd_rows)
+
+    # Если для какого-то из обновленных отчетов уже было своё предыдущее сообщение-оценка в группе —
+    # удаляем его, чтобы не плодить дубли. Сами видео (медиа-сообщения) НИКОГДА не удаляются —
+    # удаляется только текстовое сообщение-оценка под ними.
+    old_messages_to_delete = set()
+    for r in results:
+        if r["is_addon"]:
+            row = await run_db(get_report_group_message, r["report_id"])
+            if row and row["group_chat_id"] and row["group_message_id"]:
+                old_messages_to_delete.add((row["group_chat_id"], row["group_message_id"]))
+    for chat_id, msg_id in old_messages_to_delete:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить старое сообщение-оценку {msg_id} в чате {chat_id}: {e}")
+
+    first_copied_msg_id = next((r["copied_msg_id"] for r in results if r["copied_msg_id"]), None)
+    try:
+        if first_copied_msg_id:
+            sent_notify_msg = await context.bot.send_message(
+                chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd, reply_to_message_id=first_copied_msg_id
+            )
+        else:
+            sent_notify_msg = await context.bot.send_message(chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd)
+        for r in results:
+            await run_db(set_report_group_message, r["report_id"], dest_chat, sent_notify_msg.message_id)
+    except Exception as e:
+        logger.error(f"Ошибка отправки общей оценки по пачке из {len(results)} видео в чат {dest_chat}: {e}")
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=notify_text, reply_markup=inline_kbd)
+            except Exception:
+                pass
+
+
 # ── Новые функции для Прораб-Бот ──
 
 async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_admin(user_id) and get_worker(user_id) is None:
+    if not is_admin(user_id) and await run_db(get_worker, user_id) is None:
         await update.message.reply_text("Эта команда доступна только сотрудникам и администраторам.")
         return
         
