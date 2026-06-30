@@ -143,6 +143,15 @@ MAIN_MENU = ReplyKeyboardMarkup(
 
 CANCEL_KEYBOARD = ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True)
 SCHEDULE_KEYBOARD = ReplyKeyboardMarkup([["A", "B"], ["❌ Отмена"]], resize_keyboard=True)
+
+def schedule_description_text() -> str:
+    """Текстовое описание периодов сдачи статусов для графиков A и B, чтобы при выборе
+    было сразу понятно, в какое время сотрудник должен отправлять статусы."""
+    lines = []
+    for key in sorted(SCHEDULES.keys()):
+        times_str = ", ".join(SCHEDULES[key])
+        lines.append(f"{key} — {times_str}")
+    return "\n".join(lines)
 YES_NO_KEYBOARD = ReplyKeyboardMarkup([["Да", "Нет"], ["❌ Отмена"]], resize_keyboard=True)
 CANCEL_TEXT = "❌ Отмена"
 DIALOG_TEXT = filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{CANCEL_TEXT}$")
@@ -2278,7 +2287,7 @@ async def find_worker_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             [
                 ["✏️ Изменить фамилию", "✏️ Изменить имя"],
                 ["✏️ Изменить отдел", "✏️ Изменить должность"],
-                ["✏️ Изменить график", "✏️ Факт дня"],
+                ["✏️ Изменить график сдачи статусов", "✏️ Факт дня"],
                 ["✏️ Изменить номер в таблице"],
                 ["✅ Сотрудник вернулся на работу"],
                 ["❌ Отмена"]
@@ -2441,7 +2450,7 @@ async def list_workers_select(update: Update, context: ContextTypes.DEFAULT_TYPE
         [
             ["✏️ Изменить фамилию", "✏️ Изменить имя"],
             ["✏️ Изменить отдел", "✏️ Изменить должность"],
-            ["✏️ Изменить график", "✏️ Факт дня"],
+            ["✏️ Изменить график сдачи статусов", "✏️ Факт дня"],
             ["✏️ Изменить номер в таблице"],
             ["✅ Сотрудник вернулся на работу"],
             ["❌ Отмена"]
@@ -2502,7 +2511,7 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         "✏️ Изменить имя": ("first_name", "Введите новое имя:"),
         "✏️ Изменить отдел": ("object_id", "Введите название отдела для сотрудника (например: Основной, Северный):"),
         "✏️ Изменить должность": ("position", "Введите новую должность:"),
-        "✏️ Изменить график": ("schedule", None),
+        "✏️ Изменить график сдачи статусов": ("schedule", None),
         "✏️ Факт дня": ("needs_daily_fact", None),
     }
 
@@ -2514,7 +2523,10 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["edit_field"] = field
 
     if field == "schedule":
-        await update.message.reply_text("Выберите новый график:", reply_markup=SCHEDULE_KEYBOARD)
+        await update.message.reply_text(
+            f"Выберите новый график сдачи статусов:\n{schedule_description_text()}",
+            reply_markup=SCHEDULE_KEYBOARD
+        )
         return ASK_EDIT_SCHEDULE
     if field == "needs_daily_fact":
         await update.message.reply_text("Нужен ли ежедневный факт дня?", reply_markup=YES_NO_KEYBOARD)
@@ -2796,7 +2808,10 @@ async def add_worker_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
     if not raw.lstrip("-").isdigit(): return ASK_GROUP
     context.user_data["group_id"] = DEFAULT_GROUP_ID if int(raw) == 0 else int(raw)
-    await update.message.reply_text("Выберите график отчетов (A или B):", reply_markup=SCHEDULE_KEYBOARD)
+    await update.message.reply_text(
+        f"Выберите график сдачи статусов:\n{schedule_description_text()}",
+        reply_markup=SCHEDULE_KEYBOARD
+    )
     return ASK_SCHEDULE
 
 async def add_worker_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5797,7 +5812,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif update.message.video_note: file_obj = update.message.video_note
 
             if file_obj:
-                await update.message.reply_text("🎙 Отчет получен и отправлен на транскрибацию ИИ, ожидайте оценки...")
+                await update.message.reply_text("📹 Видео получено, ожидайте оценки:")
                 tg_file = await context.bot.get_file(file_obj.file_id)
                 ext = "mp4" if update.message.video or update.message.video_note else "ogg"
                 
@@ -6062,9 +6077,9 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     late_str = f" (вовремя, +{diff_mins} мин)"
             else:
                 late_str = f" (раньше на {abs(diff_mins)} мин)"
-            info_suffix = f" за слот *{nearest_slot}* принят в *{time_str}*{late_str}"
+            info_suffix = f" за статус *{nearest_slot}* принят в *{time_str}*{late_str}"
         else:
-            info_suffix = f" (Итог дня) принят в *{time_str}*"
+            info_suffix = f" — факт получен в *{time_str}*"
 
         if ai_res["is_ok"]:
             if is_addon:
@@ -6354,14 +6369,20 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         time_str = now.strftime("%H:%M")
         suffix_tail = f" (видео {idx} из {len(items)})" if len(items) > 1 else ""
         if report_type == "status" and slot_time:
-            info_suffix = f" за слот *{slot_time}*{suffix_tail}"
+            info_suffix = f" за статус *{slot_time}*{suffix_tail}"
         else:
-            info_suffix = f" (Итог дня){suffix_tail}"
+            info_suffix = f"{suffix_tail}"
         try:
-            if ai_res["is_ok"]:
-                await upd.message.reply_text(f"✅ Отчёт{info_suffix} принят без замечаний!", parse_mode="Markdown")
+            if report_type == "status":
+                if ai_res["is_ok"]:
+                    await upd.message.reply_text(f"✅ Отчёт{info_suffix} принят без замечаний!", parse_mode="Markdown")
+                else:
+                    await upd.message.reply_text(f"⚠️ Отчёт{info_suffix}.\n{ai_res['employee_message']}", parse_mode="Markdown")
             else:
-                await upd.message.reply_text(f"⚠️ Отчёт{info_suffix}.\n{ai_res['employee_message']}", parse_mode="Markdown")
+                if ai_res["is_ok"]:
+                    await upd.message.reply_text(f"✅ Факт получен{info_suffix} и принят без замечаний!", parse_mode="Markdown")
+                else:
+                    await upd.message.reply_text(f"⚠️ Факт получен{info_suffix}.\n{ai_res['employee_message']}", parse_mode="Markdown")
         except Exception as e:
             logger.warning(f"Не удалось отправить личный фидбек по видео {idx} пользователю {user_id}: {e}")
 
