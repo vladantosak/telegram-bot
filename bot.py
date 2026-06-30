@@ -6281,11 +6281,11 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_addon = False
         if existing_report:
             is_addon = True
-            text_content = build_addon_text(existing_report["raw_text"], text_content, use_video_label=False)
+            # Текстовые отчёты заменяют старый текст, а не склеиваются
             ai_res = await check_status_async(text_content, report_type_override=report_type)
             cleaned_text = await clean_report_async(text_content)
             report_id = existing_report["id"]
-            
+
             await run_db(
                 update_report_text_and_ai,
                 report_id=report_id,
@@ -6337,7 +6337,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ai_res["is_ok"]:
             if is_addon:
                 await update.message.reply_text(
-                    f"🔄 Дополнение к отчёту{info_suffix}. Успешно проверено ИИ и принято без замечаний! Спасибо.",
+                    f"🔄 Отчёт обновлён{info_suffix}. Успешно проверено ИИ и принято без замечаний! Спасибо.",
                     parse_mode="Markdown"
                 )
             else:
@@ -6348,7 +6348,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             if is_addon:
                 await update.message.reply_text(
-                    f"⚠️ Дополнение к отчёту{info_suffix}.\nОценка дополненного отчета: {ai_res['employee_message']}",
+                    f"⚠️ Отчёт обновлён{info_suffix}.\nОценка: {ai_res['employee_message']}",
                     parse_mode="Markdown"
                 )
             else:
@@ -6358,12 +6358,12 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
         dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
-        
-        gname = await get_group_name_async(context.bot, dest_chat)
-        
-        title_text = f"Дополнение к отчету (отчет обновлен): {w_name}" if is_addon else w_name
 
-        orig_label = "🗣 Оригинальный текст (объединенный):" if is_addon else "🗣 Оригинальный текст:"
+        gname = await get_group_name_async(context.bot, dest_chat)
+
+        title_text = f"Отчет обновлен: {w_name}" if is_addon else w_name
+
+        orig_label = "🗣 Оригинальный текст:"
         notify_text = (
             f"{title_text}\n"
             f"{format_status_or_fact_line(ai_res['report_type'], nearest_slot if ai_res['report_type'] == 'status' else None, date_str)}\n"
