@@ -129,12 +129,9 @@ SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
     ASK_SUMMARY_DATE,
     ASK_EDIT_SCHEDULE_DEPT,
     ASK_DEPT_SCHEDULE_VAL,
-    ASK_VACATION_START,
-    ASK_VACATION_END,
-    ASK_VACATION_REASON,
     ASK_REG_LAST_NAME,
     ASK_REG_FIRST_NAME,
-) = range(37)
+) = range(34)
 
 # Клавиатуры
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -1079,7 +1076,7 @@ def menu_for_user(user_id: int, chat_type: str = "private"):
     if get_worker(user_id) is not None:
         return ReplyKeyboardMarkup(
             [
-                ["📝 Сдать отчет", "📅 Запланировать отсутствие"],
+                ["📝 Сдать отчет"],
                 ["🛌 Не работаю сегодня"]
             ],
             resize_keyboard=True
@@ -5741,7 +5738,6 @@ async def summary_time_del_finish(update: Update, context: ContextTypes.DEFAULT_
 async def conversation_timeout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keys_to_clear = [
         "awaiting_not_working_confirm", "not_working_reason", "awaiting_not_working_reason",
-        "vacation_start_date", "vacation_end_date",
         "depts_cache", "editing_comment_report_id", "editing_comment_chat_id", 
         "editing_comment_message_id", "editing_comment_original_text", "editing_comment_prompt_message_id",
         "add_worker_telegram_id", "add_worker_last_name", "add_worker_first_name", 
@@ -5948,144 +5944,6 @@ async def register_firstname_received(update: Update, context: ContextTypes.DEFA
     context.user_data.pop("candidate_workers", None)
     return ConversationHandler.END
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Оформление отпуска / больничного (Диапазон дат)
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def vacation_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    worker = await run_db(get_worker, user_id)
-    if not worker:
-        await update.message.reply_text("Вы не зарегистрированы в системе. Оформление отпуска невозможно.")
-        return ConversationHandler.END
-    
-    await update.message.reply_text(
-        "📅 *Оформление отпуска / больничного (массовая установка 'Не работаю')*\n\n"
-        "Пожалуйста, введите дату начала отсутствия в формате *ДД.ММ.ГГГГ* (например, 26.06.2026):",
-        parse_mode="Markdown",
-        reply_markup=CANCEL_KEYBOARD
-    )
-    return ASK_VACATION_START
-
-async def vacation_start_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == "❌ Отмена":
-        await update.message.reply_text("Оформление отменено.", reply_markup=menu_for_user(update.effective_user.id))
-        return ConversationHandler.END
-    
-    try:
-        start_date = datetime.strptime(text, "%d.%m.%Y").date()
-    except ValueError:
-        await update.message.reply_text("❌ Неверный формат даты. Пожалуйста, используйте формат ДД.ММ.ГГГГ (например, 26.06.2026):")
-        return ASK_VACATION_START
-    
-    context.user_data["vacation_start_date"] = start_date.strftime("%Y-%m-%d")
-    await update.message.reply_text(
-        "Введите дату окончания отсутствия в формате *ДД.ММ.ГГГГ* (например, 05.07.2026):",
-        parse_mode="Markdown",
-        reply_markup=CANCEL_KEYBOARD
-    )
-    return ASK_VACATION_END
-
-async def vacation_end_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == "❌ Отмена":
-        await update.message.reply_text("Оформление отменено.", reply_markup=menu_for_user(update.effective_user.id))
-        return ConversationHandler.END
-    
-    try:
-        end_date = datetime.strptime(text, "%d.%m.%Y").date()
-    except ValueError:
-        await update.message.reply_text("❌ Неверный формат даты. Пожалуйста, используйте формат ДД.ММ.ГГГГ (например, 05.07.2026):")
-        return ASK_VACATION_END
-    
-    start_date_str = context.user_data["vacation_start_date"]
-    start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
-    
-    if end_date < start_date:
-        await update.message.reply_text("❌ Дата окончания не может быть раньше даты начала отпуска. Пожалуйста, введите дату окончания заново:")
-        return ASK_VACATION_END
-    
-    context.user_data["vacation_end_date"] = end_date.strftime("%Y-%m-%d")
-    await update.message.reply_text(
-        "Укажите причину отсутствия (например: Отпуск, Больничный, Семейные обстоятельства):",
-        reply_markup=CANCEL_KEYBOARD
-    )
-    return ASK_VACATION_REASON
-
-async def vacation_reason_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == "❌ Отмена":
-        await update.message.reply_text("Оформление отменено.", reply_markup=menu_for_user(update.effective_user.id))
-        return ConversationHandler.END
-    
-    user_id = update.effective_user.id
-    worker = await run_db(get_worker, user_id)
-    if not worker:
-        await update.message.reply_text("Сотрудник не найден.")
-        return ConversationHandler.END
-    
-    start_date_str = context.user_data.pop("vacation_start_date")
-    end_date_str = context.user_data.pop("vacation_end_date")
-    reason = text
-    
-    start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
-    end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
-    
-    conn = get_db()
-    curr = start_date
-    dates_added = []
-    
-    while curr <= end_date:
-        curr_str = curr.strftime("%Y-%m-%d")
-        
-        # Удаляем существующие отчеты за этот день
-        conn.execute(
-            "DELETE FROM reports WHERE telegram_id = ? AND report_date = ?",
-            (user_id, curr_str)
-        )
-        # Вставляем отчет о нерабочем дне
-        conn.execute(
-            """
-            INSERT INTO reports (telegram_id, report_date, report_type, slot_time, received_at, is_ok, is_late, format_comment, required_action, raw_text)
-            VALUES (?, ?, 'not_working', NULL, ?, 1, 0, ?, 'Не работает', ?)
-            """,
-            (user_id, curr_str, "00:00:00", reason, f"Не работает сегодня (запланировано). Причина: {reason}")
-        )
-        dates_added.append(curr.strftime("%d.%m.%Y"))
-        curr += dt_module.timedelta(days=1)
-        
-    conn.commit()
-    conn.close()
-    asyncio.create_task(async_sync_gsheets_background())
-    
-    await update.message.reply_text(
-        f"✅ Отпуск успешно оформлен на период с {start_date.strftime('%d.%m.%Y')} по {end_date.strftime('%d.%m.%Y')} ({len(dates_added)} дн.).\n"
-        f"Причина: {reason}",
-        reply_markup=menu_for_user(user_id)
-    )
-    
-    # Уведомление в группу
-    w_name = f"{worker['last_name']} {worker['first_name']}"
-    dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
-    notify_text = (
-        f"📅 {w_name} запланировал отсутствие:\n"
-        f"Период: {start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}\n"
-        f"Причина: {reason}"
-    )
-    try:
-        await context.bot.send_message(chat_id=dest_chat, text=notify_text)
-    except Exception as e:
-        logger.error(f"Ошибка отправки уведомления об отпуске в группу: {e}")
-        
-    for admin_id in ADMIN_IDS:
-        try:
-            await context.bot.send_message(chat_id=admin_id, text=notify_text)
-        except Exception:
-            pass
-            
-    return ConversationHandler.END
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -7286,21 +7144,6 @@ def main():
         conversation_timeout=300,
     )
 
-    vacation_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("vacation", vacation_start),
-            MessageHandler(filters.Regex("^📅 Запланировать отсутствие$"), vacation_start)
-        ],
-        states={
-            ASK_VACATION_START: [MessageHandler(DIALOG_TEXT, vacation_start_received)],
-            ASK_VACATION_END: [MessageHandler(DIALOG_TEXT, vacation_end_received)],
-            ASK_VACATION_REASON: [MessageHandler(DIALOG_TEXT, vacation_reason_received)],
-            ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conversation_timeout_callback)]
-        },
-        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
-        conversation_timeout=300,
-    )
-
     registration_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", register_start),
@@ -7326,7 +7169,6 @@ def main():
     application.add_handler(import_handler)
     application.add_handler(summary_date_handler)
     application.add_handler(dept_schedule_handler)
-    application.add_handler(vacation_handler)
 
     # Дополнительные хэндлеры для меню обычных сотрудников
     application.add_handler(MessageHandler(filters.Regex("^📝 Сдать отчет$"), send_report_instruction))
