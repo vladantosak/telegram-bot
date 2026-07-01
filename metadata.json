@@ -1,6 +1,6 @@
 {
-  "name": "Прораб-Бот",
-  "description": "Telegram-бот контроля дисциплины отчётов на стройплощадке с веб-панелью администратора",
+  "name": "Панель управления Прораб-Ботом",
+  "description": "Панель управления Telegram ботом для контроля видеоотчетов и фактов о выполненной работе строительной бригады с помощью ИИ.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
