@@ -1,795 +1,1206 @@
 import os
-import json
-import logging
-import re
 import html
-import io
+import re
+import asyncio
+import logging
 from datetime import datetime
 import datetime as dt_module
-from openpyxl import load_workbook
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
+from telegram import ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply, Update
 from telegram.ext import ContextTypes, ConversationHandler
 
+def parse_video_comments(format_comment_str: str) -> list[dict]:
+    items = []
+    if not format_comment_str:
+        return items
+    parts = format_comment_str.split("; ")
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r"^Видео\s+(\d+):\s*(ОК|не\s+ОК|НЕ\s+ОК)(?:\s*-\s*|\s+)?(.*)$", part, re.IGNORECASE)
+        if m:
+            num = int(m.group(1))
+            status_str = m.group(2).strip().lower()
+            is_ok = "не" not in status_str
+            comment = m.group(3).strip()
+            items.append({
+                "num": num,
+                "is_ok": is_ok,
+                "comment": comment,
+                "full": part
+            })
+        else:
+            items.append({
+                "num": len(items) + 1,
+                "is_ok": "не ок" not in part.lower(),
+                "comment": part,
+                "full": part
+            })
+    return items
+
+def rebuild_format_comment(video_items: list[dict]) -> str:
+    parts = []
+    for item in video_items:
+        status_label = "ОК" if item["is_ok"] else "не ОК"
+        comment_part = f" - {item['comment']}" if item["comment"] else ""
+        parts.append(f"Видео {item['num']}: {status_label}{comment_part}")
+    return "; ".join(parts)
+
 from db import (
-    get_db, run_db, get_worker, get_all_workers, get_workers_by_position, get_workers_by_object_id,
-    find_unregistered_workers_by_lastname, bind_worker_id, upsert_worker,
-    delete_worker, update_worker_field, get_object_group, save_object_group,
-    get_group_name, get_group_name_async, fetch_and_save_group_name, get_all_group_names,
-    get_setting, set_setting, calculate_worker_stats, SCHEDULES, SCHEDULE_A, DEFAULT_GROUP_ID,
-    is_admin, ADMIN_IDS, get_pending_unregistered_user, delete_pending_unregistered_user,
-    export_workers_to_excel, read_excel, get_next_sort_order, fetch_export_data,
-    generate_and_send_excel, generate_and_send_gsheets, get_violators_threshold,
-    save_violators_threshold, now_local, set_quiet_mode, is_quiet_mode_enabled,
-    save_scheduled_times, get_scheduled_times, sync_gsheets_task
+    get_worker, get_submitted_status_slots, get_existing_report_row,
+    save_report, update_report_text_and_ai, set_report_group_message,
+    get_report_group_message, add_report_media, get_report_media,
+    delete_report_media_rows, get_group_name_async, cancel_not_working,
+    get_pending_unregistered_user, save_pending_unregistered_user,
+    delete_pending_unregistered_user, bind_worker_id, async_sync_gsheets_background,
+    get_db, run_db, is_admin, ADMIN_IDS, DEFAULT_GROUP_ID, SCHEDULES, SCHEDULE_A,
+    LATE_THRESHOLD_MIN, now_local, is_quiet_mode_enabled, get_worker_target_group,
+    get_group_name
 )
 
-from report_handlers import menu_for_user
+from ai import (
+    transcribe_audio, clean_report, check_status
+)
 
 logger = logging.getLogger(__name__)
 
-MAIN_MENU = ReplyKeyboardMarkup(
-    [
-        ["📋 Сотрудники", "➕ Добавить сотрудника", "➖ Удалить сотрудника"],
-        ["🏢 Сотрудники отдела", "⏰ Время оповещений о статусах", "📣 Напомнить всем"],
-        ["📥 Выгрузить отчеты", "📥 Импорт сотрудников", "⚙️ Настройки бота"],
-    ],
-    resize_keyboard=True,
-)
+MEDIA_BATCH_BUFFERS = {}
+MEDIA_BATCH_DEBOUNCE_SECONDS = 8
+MEDIA_MERGE_WINDOW_MINUTES = 20
 
-CANCEL_KEYBOARD = ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True)
-SCHEDULE_KEYBOARD = ReplyKeyboardMarkup([["A", "B"], ["❌ Отмена"]], resize_keyboard=True)
-YES_NO_KEYBOARD = ReplyKeyboardMarkup([["Да", "Нет"], ["❌ Отмена"]], resize_keyboard=True)
-CANCEL_TEXT = "❌ Отмена"
+def format_show_date(date_str: str) -> str:
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return dt.strftime("%d.%m")
+    except Exception:
+        return date_str
 
-# Dialog States
-(
-    ASK_WORKER_ID,
-    ASK_LASTNAME,
-    ASK_FIRSTNAME,
-    ASK_POSITION,
-    ASK_GROUP,
-    ASK_SCHEDULE,
-    ASK_NEEDS_DAILY_FACT,
-    ASK_REMOVE_DEPARTMENT,
-    ASK_REMOVE_WORKER,
-    ASK_DEPARTMENT,
-    ASK_REPORT_TIME,
-    ASK_LIST_DEPARTMENT,
-    ASK_LIST_WORKER,
-    ASK_EDIT_FIELD,
-    ASK_EDIT_VALUE,
-    ASK_EDIT_SCHEDULE,
-    ASK_EDIT_DAILY_FACT,
-    ASK_EDIT_GROUP_VALUE,
-    ASK_ORDER_DEPARTMENT,
-    ASK_EDIT_SORT_ORDER,
-    ASK_CONFIRM_DELETE,
-    ASK_EDIT_STATUS_WORK,
-    ASK_EXPORT_TYPE,
-    ASK_EXPORT_DEPARTMENT,
-    ASK_EXPORT_FORMAT,
-    ASK_GSHEETS_URL,
-    ASK_GSHEETS_CREDS,
-    ASK_IMPORT_FILE,
-    ASK_MOVE_POSITION_ORDER,
-    ASK_REG_LAST_NAME,
-    ASK_REG_FIRST_NAME,
-    ASK_SETTINGS_ACTION,
-    ASK_IMPORT_ACTION,
-    ASK_CONFIRM_REMIND,
-) = range(34)
+def format_status_or_fact_line(report_type: str, slot_time: str | None, report_date: str) -> str:
+    formatted_date = format_show_date(report_date)
+    if report_type == "daily_fact":
+        return f"Факт за {formatted_date}"
+    else:
+        slot_str = slot_time or "Неизвестно"
+        return f"Статус за {slot_str} за {formatted_date}"
 
-def schedule_description_text() -> str:
-    lines = []
-    for key in sorted(SCHEDULES.keys()):
-        times_str = ", ".join(SCHEDULES[key])
-        lines.append(f"{key} — {times_str}")
+def update_message_metadata(original_text: str, is_ok: bool | None = None, comment: str | None = None, status_val: str | None = None, is_manual: bool = False) -> str:
+    lines = original_text.split("\n")
+    for i, line in enumerate(lines):
+        if (line.startswith("Статус:") or line.startswith("Статус за") or line.startswith("Факт за")) and status_val is not None:
+            lines[i] = status_val
+        elif (line.startswith("Оценка ИИ:") or line.startswith("Оценка:")) and is_ok is not None:
+            label = "Оценка" if (is_manual or line.startswith("Оценка:")) else "Оценка ИИ"
+            lines[i] = f"{label}: {'ОК' if is_ok else 'НЕ ОК'}"
+        elif (line.startswith("Комментарий ИИ:") or line.startswith("Комментарий:")) and comment is not None:
+            label = "Комментарий" if (is_manual or line.startswith("Комментарий:")) else "Комментарий ИИ"
+            lines[i] = f"{label}: {comment}"
     return "\n".join(lines)
 
-def positions_keyboard(rows):
-    departments = sorted({row["object_id"] or "Основной" for row in rows})
-    keyboard = [[d] for d in departments]
-    keyboard.append(["❌ Отмена"])
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True), departments
+def update_message_text_fields(original_text: str, is_ok: bool, new_comment: str) -> str:
+    return update_message_metadata(original_text, is_ok=is_ok, comment=new_comment, is_manual=True)
 
-def numbered_workers_keyboard(rows):
-    keyboard = []
-    for i, row in enumerate(rows, 1):
-        keyboard.append([f"{i}. {row['last_name']} {row['first_name']} ({row['position'] or 'Не указано'})"])
-    keyboard.append(["❌ Отмена"])
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-async def require_admin_check(update: Update) -> bool:
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("Эта функция доступна только администраторам.", reply_markup=ReplyKeyboardRemove())
-        return False
-    if update.effective_chat.type != "private":
+def make_report_keyboard(report_id: int, report_type: str | None = None) -> InlineKeyboardMarkup:
+    if report_type is None:
         try:
-            await update.message.reply_text("⚠️ Эта функция доступна только в личных сообщениях с ботом.", reply_markup=ReplyKeyboardRemove())
+            conn = get_db()
+            row = conn.execute("SELECT report_type FROM reports WHERE id = ?", (report_id,)).fetchone()
+            conn.close()
+            report_type = row["report_type"] if row else "status"
+        except Exception:
+            report_type = "status"
+            
+    type_btn_text = "📋 Сделать Итогом дня" if report_type == "status" else "⏱ Сделать Статусом"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Изменить оценку (ОК / НЕ ОК)", callback_data=f"fix_toggle_{report_id}"),
+            InlineKeyboardButton("✏️ Изменить комментарий", callback_data=f"edit_comment_{report_id}")
+        ],
+        [
+            InlineKeyboardButton(type_btn_text, callback_data=f"toggle_type_{report_id}")
+        ]
+    ])
+
+def make_video_selection_keyboard(report_id: int, action_type: str, video_items: list[dict]) -> InlineKeyboardMarkup:
+    prefix = "tg" if action_type == "toggle" else "ed"
+    buttons = []
+    
+    if action_type == "toggle":
+        buttons.append([InlineKeyboardButton("🔄 Общая оценка", callback_data=f"{prefix}_overall_{report_id}")])
+    else:
+        buttons.append([InlineKeyboardButton("✏️ Общий комментарий", callback_data=f"{prefix}_overall_{report_id}")])
+        
+    for item in video_items:
+        num = item["num"]
+        if action_type == "toggle":
+            status_emoji = "✅ ОК" if item["is_ok"] else "⚠️ НЕ ОК"
+            btn_text = f"📹 Видео {num}: {status_emoji}"
+        else:
+            btn_text = f"📹 Видео {num}"
+        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"{prefix}_vid_{report_id}_{num}")])
+        
+    buttons.append([InlineKeyboardButton("❌ Назад", callback_data=f"back_to_main_{report_id}")])
+    return InlineKeyboardMarkup(buttons)
+
+async def render_report_message_from_row(report: dict, worker_name: str) -> tuple[str, InlineKeyboardMarkup]:
+    report_id = report["id"]
+    report_type = report["report_type"]
+    slot_time = report["slot_time"]
+    report_date = report["report_date"]
+    is_ok = bool(report["is_ok"])
+    format_comment = report["format_comment"] or ""
+    raw_text = report["raw_text"] or ""
+    
+    cleaned_text = await clean_report_async(raw_text)
+
+    status_line = format_status_or_fact_line(report_type, slot_time, report_date)
+    status_emoji = "✅" if is_ok else "⚠️"
+    
+    notify_lines = [
+        f"👤 <b>{html.escape(worker_name)}</b>",
+        f"📍 {html.escape(status_line)}",
+        f"Оценка: {status_emoji} {'ОК' if is_ok else 'НЕ ОК'}",
+    ]
+    
+    is_status_with_videos = (report_type == "status" and ("Видео" in format_comment or ";" in format_comment))
+    
+    if is_status_with_videos:
+        notify_lines.append("")
+        notify_lines.append("📹 <b>Детали по видео-статусам:</b>")
+        for comment_item in format_comment.split("; "):
+            if comment_item.strip():
+                notify_lines.append(f"  • {html.escape(comment_item.strip())}")
+    else:
+        notify_lines.append(f"Комментарий: {html.escape(format_comment)}")
+        
+    notify_lines.append("")
+    notify_lines.append("📝 <b>Официальный отчет:</b>")
+    notify_lines.append(f"\"{html.escape(cleaned_text)}\"")
+    notify_lines.append("")
+    notify_lines.append("🗣 <b>Оригинальный текст:</b>")
+    notify_lines.append(f"\"{html.escape(raw_text)}\"")
+    
+    notify_text = "\n".join(notify_lines)
+    inline_kbd = make_report_keyboard(report_id, report_type)
+    
+    return notify_text, inline_kbd
+
+def menu_for_user(user_id: int, chat_type: str = "private"):
+    if is_admin(user_id) and chat_type == "private":
+        # Note: MAIN_MENU is imported dynamically from bot main entry
+        from bot import MAIN_MENU
+        return MAIN_MENU
+    if chat_type != "private":
+        return ReplyKeyboardMarkup([], remove_keyboard=True)
+    if get_worker(user_id) is not None:
+        return ReplyKeyboardMarkup(
+            [
+                ["📋 Инструкция по сдаче видео-статуса"],
+                ["🛌 Не работаю сегодня"]
+            ],
+            resize_keyboard=True
+        )
+    return ReplyKeyboardMarkup([["🔑 Начать регистрацию"]], resize_keyboard=True)
+
+async def transcribe_audio_async(file_path: str) -> str:
+    return await asyncio.to_thread(transcribe_audio, file_path)
+
+async def clean_report_async(text: str) -> str:
+    return await asyncio.to_thread(clean_report, text)
+
+async def check_status_async(text: str, report_type_override: str | None = None) -> dict:
+    return await asyncio.to_thread(check_status, text, report_type_override)
+
+async def enqueue_media_report_item(user_id: int, context: ContextTypes.DEFAULT_TYPE, update: Update, text_content: str, now: datetime):
+    buf = MEDIA_BATCH_BUFFERS.setdefault(user_id, {"items": [], "task": None})
+    buf["items"].append({"update": update, "text_content": text_content, "now": now})
+
+    old_task = buf.get("task")
+    if old_task and not old_task.done():
+        old_task.cancel()
+    buf["task"] = asyncio.create_task(_flush_media_batch(user_id, context))
+
+async def _flush_media_batch(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await asyncio.sleep(MEDIA_BATCH_DEBOUNCE_SECONDS)
+    except asyncio.CancelledError:
+        return
+
+    buf = MEDIA_BATCH_BUFFERS.pop(user_id, None)
+    if not buf or not buf["items"]:
+        return
+
+    lock = asyncio.Lock() # Lock per flush or use user_locks dynamically
+    from bot import get_user_lock
+    user_lock = get_user_lock(user_id)
+    await user_lock.acquire()
+    try:
+        logger.info(f"[media_batch] Начало обработки {len(buf['items'])} видео от пользователя {user_id}")
+        await process_media_batch(user_id, buf["items"], context)
+        logger.info(f"[media_batch] Обработка завершена для пользователя {user_id}")
+    except Exception as exc:
+        logger.exception(f"Ошибка обработки пачки видео-отчетов пользователя {user_id}")
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Ошибка при обработке видео: {exc}\n\nПопробуйте отправить ещё раз."
+            )
         except Exception:
             pass
-        return False
-    return True
+    finally:
+        try:
+            user_lock.release()
+        except Exception:
+            pass
 
-async def settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin_check(update): return ConversationHandler.END
-    kbd = ReplyKeyboardMarkup(
-        [["📊 Настроить Google Таблицу", "🔗 Получить ссылку на таблицу"], ["🗑 Очистить базу от удалённых сотрудников"], ["❌ Назад"]],
-        resize_keyboard=True
-    )
-    await update.message.reply_text("⚙️ Настройки бота. Выберите действие:", reply_markup=kbd)
-    return ASK_SETTINGS_ACTION
+def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots: set):
+    current_mins = now.hour * 60 + now.minute
+    missing_passed = []
+    for slot in schedule:
+        if slot in submitted_slots:
+            continue
+        h, m = map(int, slot.split(":"))
+        if h * 60 + m <= current_mins:
+            missing_passed.append(slot)
+    if missing_passed:
+        missing_passed.sort(key=lambda s: tuple(map(int, s.split(":"))))
+        target_slot = missing_passed[0]
+        h, m = map(int, target_slot.split(":"))
+        is_late = current_mins > h * 60 + m + LATE_THRESHOLD_MIN
+        return target_slot, is_late
 
-async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    choice = update.message.text.strip()
-    kbd = ReplyKeyboardMarkup(
-        [["📊 Настроить Google Таблицу", "🔗 Получить ссылку на таблицу"], ["🗑 Очистить базу от удалённых сотрудников"], ["❌ Назад"]],
-        resize_keyboard=True
-    )
-    if choice == "❌ Назад":
-        await update.message.reply_text("Главное меню.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
+    # Otherwise find nearest
+    from bot import find_nearest_slot
+    return find_nearest_slot(schedule, now)
 
-    if choice == "🗑 Очистить базу от удалённых сотрудников":
-        # Cleanup orphaned reports
+async def process_media_batch(user_id: int, items: list[dict], context: ContextTypes.DEFAULT_TYPE):
+    worker = await run_db(get_worker, user_id)
+    if not worker:
+        return
+
+    sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
+    w_name = f"{worker['last_name']} {worker['first_name']}"
+    dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
+
+    last_slot_time_str = sched_list[-1]
+    last_hour, last_minute = map(int, last_slot_time_str.split(":"))
+
+    evaluated_items = []
+    for idx, item in enumerate(items, start=1):
+        text_content = item["text_content"]
+        now = item["now"]
+        upd = item["update"]
+        date_str = now.strftime("%Y-%m-%d")
+
+        logger.info(f"[process_media_batch] Видео {idx}/{len(items)} пользователя {user_id}: текст='{text_content[:80]}'")
+
+        last_slot_time = now.replace(hour=last_hour, minute=last_minute, second=0, microsecond=0)
+        last_slot_limit = last_slot_time + dt_module.timedelta(minutes=LATE_THRESHOLD_MIN)
+        forced_type = "status" if now <= last_slot_limit else None
+
+        ai_res_pre = await check_status_async(text_content, report_type_override=forced_type)
+        report_type = ai_res_pre["report_type"]
+
+        evaluated_items.append({
+            "item": item,
+            "ai_res": ai_res_pre,
+            "report_type": report_type,
+            "text_content": text_content,
+            "now": now,
+            "upd": upd,
+            "date_str": date_str
+        })
+
+    # Separate status items and daily facts
+    status_items = [x for x in evaluated_items if x["report_type"] == "status"]
+    fact_items = [x for x in evaluated_items if x["report_type"] == "daily_fact"]
+
+    # 1. Process daily_fact items individually
+    for f_item in fact_items:
+        text_content = f_item["text_content"]
+        now = f_item["now"]
+        upd = f_item["upd"]
+        date_str = f_item["date_str"]
+        ai_res = f_item["ai_res"]
+
+        cleaned_text = await clean_report_async(text_content)
+        report_id = await run_db(
+            save_report,
+            telegram_id=user_id,
+            report_date=date_str,
+            report_type="daily_fact",
+            slot_time=None,
+            received_at=now.strftime("%H:%M:%S"),
+            is_ok=ai_res["is_ok"],
+            is_late=0,
+            format_comment=ai_res["format_comment"],
+            required_action=ai_res["required_action"],
+            raw_text=text_content
+        )
+        async_sync_gsheets_background()
+
+        copied_msg_id = None
+        try:
+            copied_msg = await context.bot.copy_message(
+                chat_id=dest_chat,
+                from_chat_id=upd.effective_chat.id,
+                message_id=upd.message.message_id
+            )
+            copied_msg_id = copied_msg.message_id
+            await run_db(add_report_media, report_id, upd.effective_chat.id, upd.message.message_id, copied_msg_id, 1, now.strftime("%H:%M:%S"))
+        except Exception as e:
+            logger.error(f"Ошибка копирования видео факта дня в чат {dest_chat}: {e}")
+
+        # Fact reports CAN be notified to admins (only status notifications are restricted to group chat)
         conn = get_db()
-        cur = conn.execute("DELETE FROM reports WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)")
-        deleted = cur.rowcount
+        report_row = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        conn.close()
+
+        notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name)
+
+        try:
+            if copied_msg_id:
+                sent_notify_msg = await context.bot.send_message(
+                    chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd,
+                    reply_to_message_id=copied_msg_id, parse_mode="HTML"
+                )
+            else:
+                sent_notify_msg = await context.bot.send_message(
+                    chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd, parse_mode="HTML"
+                )
+            await run_db(set_report_group_message, report_id, dest_chat, sent_notify_msg.message_id)
+        except Exception as e:
+            logger.error(f"Ошибка отправки оценки факта в чат {dest_chat}: {e}")
+
+        try:
+            if ai_res["is_ok"]:
+                await upd.message.reply_text(f"✅ Факт получен и принят без замечаний!", parse_mode="Markdown")
+            else:
+                await upd.message.reply_text(f"⚠️ Факт получен.\n{ai_res['employee_message']}", parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Не удалось отправить личный фидбек по факту пользователю {user_id}: {e}")
+
+    # 2. Process all status items TOGETHER as a single status report
+    if status_items:
+        status_now = status_items[0]["now"]
+        date_str = status_items[0]["date_str"]
+
+        submitted_slots = await run_db(get_submitted_status_slots, user_id, date_str)
+        slot_time, is_late = pick_target_status_slot(sched_list, status_now, submitted_slots)
+
+        existing = await run_db(get_existing_report_row, user_id, date_str, "status", slot_time)
+
+        do_full_merge = False
+        old_media_rows = []
+        if existing:
+            try:
+                prev_h, prev_m, prev_s = map(int, existing["received_at"].split(":"))
+                elapsed_minutes = (status_now.hour * 60 + status_now.minute) - (prev_h * 60 + prev_m)
+                do_full_merge = 0 <= elapsed_minutes <= MEDIA_MERGE_WINDOW_MINUTES
+            except Exception:
+                do_full_merge = False
+            if do_full_merge:
+                old_media_rows = await run_db(get_report_media, existing["id"])
+
+        if existing:
+            existing_media_count = len(old_media_rows) if old_media_rows else 0
+            raw_text_parts = []
+            for idx, s_item in enumerate(status_items, start=1 + existing_media_count):
+                raw_text_parts.append(f"[Видео {idx}]: {s_item['text_content']}")
+            combined_raw_text = existing["raw_text"].strip() + "\n" + "\n".join(raw_text_parts)
+
+            new_comments = []
+            for idx, s_item in enumerate(status_items, start=1 + existing_media_count):
+                res = s_item["ai_res"]
+                new_comments.append(f"Видео {idx}: {res['format_comment']}")
+
+            if existing["format_comment"] and existing["format_comment"] != "всё ОК":
+                overall_format_comment = existing["format_comment"] + "; " + "; ".join(new_comments)
+            else:
+                overall_format_comment = "; ".join(new_comments)
+
+            overall_is_ok = bool(existing["is_ok"]) or any(x["ai_res"]["is_ok"] for x in status_items)
+            cleaned_text = await clean_report_async(combined_raw_text)
+            report_id = existing["id"]
+
+            required_actions = []
+            for idx, s_item in enumerate(status_items, start=1 + existing_media_count):
+                if not s_item["ai_res"]["is_ok"]:
+                    required_actions.append(f"Видео {idx}: {s_item['ai_res']['required_action']}")
+            overall_required_action = (existing["required_action"] or "") + " " + " ".join(required_actions)
+
+            await run_db(
+                update_report_text_and_ai,
+                report_id=report_id,
+                is_ok=overall_is_ok,
+                format_comment=overall_format_comment,
+                required_action=overall_required_action,
+                raw_text=combined_raw_text,
+                received_at=status_now.strftime("%H:%M:%S")
+            )
+        else:
+            raw_text_parts = []
+            for idx, s_item in enumerate(status_items, start=1):
+                raw_text_parts.append(f"[Видео {idx}]: {s_item['text_content']}")
+            combined_raw_text = "\n".join(raw_text_parts)
+
+            new_comments = []
+            for idx, s_item in enumerate(status_items, start=1):
+                res = s_item["ai_res"]
+                new_comments.append(f"Видео {idx}: {res['format_comment']}")
+            overall_format_comment = "; ".join(new_comments)
+
+            overall_is_ok = any(x["ai_res"]["is_ok"] for x in status_items)
+            cleaned_text = await clean_report_async(combined_raw_text)
+
+            required_actions = []
+            for idx, s_item in enumerate(status_items, start=1):
+                if not s_item["ai_res"]["is_ok"]:
+                    required_actions.append(f"Видео {idx}: {s_item['ai_res']['required_action']}")
+            overall_required_action = "; ".join(required_actions) if required_actions else "всё ОК"
+
+            report_id = await run_db(
+                save_report,
+                telegram_id=user_id,
+                report_date=date_str,
+                report_type="status",
+                slot_time=slot_time,
+                received_at=status_now.strftime("%H:%M:%S"),
+                is_ok=overall_is_ok,
+                is_late=is_late,
+                format_comment=overall_format_comment,
+                required_action=overall_required_action,
+                raw_text=combined_raw_text
+            )
+        async_sync_gsheets_background()
+
+        copied_msg_ids = []
+        if do_full_merge and old_media_rows:
+            # Delete old forwarded video messages from group
+            for m in old_media_rows:
+                if m["group_message_id"]:
+                    try:
+                        await context.bot.delete_message(chat_id=dest_chat, message_id=m["group_message_id"])
+                    except Exception as e:
+                        logger.warning(f"Не удалось удалить старое видео {m['group_message_id']}: {e}")
+            await run_db(delete_report_media_rows, report_id)
+
+            # Re-forward all media files
+            media_sources = [(m["source_chat_id"], m["source_message_id"]) for m in old_media_rows]
+            for s_item in status_items:
+                media_sources.append((s_item["upd"].effective_chat.id, s_item["upd"].message.message_id))
+
+            for pos, (src_chat, src_msg) in enumerate(media_sources, start=1):
+                try:
+                    copied_msg = await context.bot.copy_message(chat_id=dest_chat, from_chat_id=src_chat, message_id=src_msg)
+                    await run_db(add_report_media, report_id, src_chat, src_msg, copied_msg.message_id, pos, status_now.strftime("%H:%M:%S"))
+                    copied_msg_ids.append(copied_msg.message_id)
+                except Exception as e:
+                    logger.error(f"Ошибка повторной пересылки видео {pos}: {e}")
+        else:
+            # Forward only new videos
+            existing_media_count = len(old_media_rows) if old_media_rows else 0
+            for idx, s_item in enumerate(status_items, start=1):
+                upd = s_item["upd"]
+                try:
+                    copied_msg = await context.bot.copy_message(
+                        chat_id=dest_chat,
+                        from_chat_id=upd.effective_chat.id,
+                        message_id=upd.message.message_id
+                    )
+                    copied_msg_ids.append(copied_msg.message_id)
+                    next_pos = existing_media_count + idx
+                    await run_db(add_report_media, report_id, upd.effective_chat.id, upd.message.message_id, copied_msg.message_id, next_pos, status_now.strftime("%H:%M:%S"))
+                except Exception as e:
+                    logger.error(f"Ошибка копирования видео в чат {dest_chat}: {e}")
+
+        # Delete old evaluation comment if it exists
+        old_eval = await run_db(get_report_group_message, report_id)
+        if old_eval and old_eval["group_chat_id"] and old_eval["group_message_id"]:
+            try:
+                await context.bot.delete_message(chat_id=old_eval["group_chat_id"], message_id=old_eval["group_message_id"])
+            except Exception as e:
+                logger.warning(f"Не удалось удалить старую оценку {old_eval['group_message_id']}: {e}")
+
+        # Construct beautiful general comment for the group!
+        conn = get_db()
+        report_row = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        conn.close()
+
+        notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name)
+
+        # Send replying to the last forwarded video
+        last_copied_msg_id = copied_msg_ids[-1] if copied_msg_ids else None
+        try:
+            if last_copied_msg_id:
+                sent_notify_msg = await context.bot.send_message(
+                    chat_id=dest_chat,
+                    text=notify_text,
+                    reply_markup=inline_kbd,
+                    reply_to_message_id=last_copied_msg_id,
+                    parse_mode="HTML"
+                )
+            else:
+                sent_notify_msg = await context.bot.send_message(
+                    chat_id=dest_chat,
+                    text=notify_text,
+                    reply_markup=inline_kbd,
+                    parse_mode="HTML"
+                )
+            await run_db(set_report_group_message, report_id, dest_chat, sent_notify_msg.message_id)
+        except Exception as e:
+            logger.error(f"Ошибка отправки оценки в чат {dest_chat}: {e}")
+
+        # CRITICAL REQ: Why does the status comment go to the admin's chat? It must ONLY go to the group chat!
+        # So we DO NOT forward the evaluation text of "status" reports to admins in their personal chats!
+        # Status reports won't spam admins anymore.
+
+        # Reply directly to the employee in their DM for each video
+        employee_messages = []
+        for idx, s_item in enumerate(status_items, start=1):
+            res = s_item["ai_res"]
+            if not res["is_ok"]:
+                employee_messages.append(f"Видео {idx}: {res['employee_message']}")
+
+        suffix_tail = f" (видео 1-{len(status_items)})" if len(status_items) > 1 else ""
+        info_suffix = f" за статус *{slot_time}*{suffix_tail}"
+
+        for s_item in status_items:
+            upd = s_item["upd"]
+            try:
+                if overall_is_ok:
+                    await upd.message.reply_text(f"✅ Отчёт{info_suffix} принят без замечаний!", parse_mode="Markdown")
+                else:
+                    msg = "Есть замечания по видео-статусам:\n" + "\n".join(employee_messages)
+                    await upd.message.reply_text(f"⚠️ Отчёт{info_suffix}.\n{msg}", parse_mode="Markdown")
+            except Exception as e:
+                logger.warning(f"Не удалось отправить личный фидбек по статусу пользователю {user_id}: {e}")
+
+
+async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if is_admin(user_id) and context.user_data.get("editing_comment_report_id"):
+        report_id = context.user_data["editing_comment_report_id"]
+        video_num = context.user_data.get("editing_comment_video_num")
+        original_chat_id = context.user_data.get("editing_comment_chat_id")
+        original_msg_id = context.user_data.get("editing_comment_message_id")
+        original_text = context.user_data.get("editing_comment_original_text", "")
+        
+        context.user_data.pop("editing_comment_report_id", None)
+        context.user_data.pop("editing_comment_video_num", None)
+        context.user_data.pop("editing_comment_chat_id", None)
+        context.user_data.pop("editing_comment_message_id", None)
+        context.user_data.pop("editing_comment_original_text", None)
+        prompt_message_id = context.user_data.pop("editing_comment_prompt_message_id", None)
+        
+        if prompt_message_id and original_chat_id:
+            try:
+                await context.bot.delete_message(chat_id=original_chat_id, message_id=prompt_message_id)
+            except Exception:
+                pass
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+            
+        new_comment = update.message.text.strip() if update.message.text else ""
+        if not new_comment or new_comment.lower() in ("отмена", "❌ отмена"):
+            return
+            
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        if not report:
+            conn.close()
+            return
+            
+        if video_num is not None:
+            # We are editing a specific video's comment!
+            video_items = parse_video_comments(report["format_comment"])
+            for item in video_items:
+                if item["num"] == video_num:
+                    cleaned_comment = new_comment.strip()
+                    if cleaned_comment.lower().startswith("ок"):
+                        item["is_ok"] = True
+                        item["comment"] = cleaned_comment[2:].strip().lstrip("-").strip()
+                    elif cleaned_comment.lower().startswith("не ок"):
+                        item["is_ok"] = False
+                        item["comment"] = cleaned_comment[5:].strip().lstrip("-").strip()
+                    else:
+                        item["comment"] = cleaned_comment
+                        
+            new_format_comment = rebuild_format_comment(video_items)
+            new_overall_ok = all(item["is_ok"] for item in video_items)
+            new_action = f"Комментарий видео {video_num} изменен администратором вручную: {new_comment}"
+            conn.execute(
+                "UPDATE reports SET format_comment = ?, is_ok = ?, required_action = ? WHERE id = ?",
+                (new_format_comment, 1 if new_overall_ok else 0, new_action, report_id)
+            )
+        else:
+            # We are editing the overall / general comment!
+            new_action = f"Комментарий изменен администратором вручную: {new_comment}"
+            conn.execute(
+                "UPDATE reports SET format_comment = ?, required_action = ? WHERE id = ?",
+                (new_comment, new_action, report_id)
+            )
+            
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
         conn.commit()
         conn.close()
+        
         async_sync_gsheets_background()
-        await update.message.reply_text(f"✅ Удалено {deleted} лишних записей отчетов.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
+        
+        worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+        text, kbd = await render_report_message_from_row(report, worker_name)
+        
+        if original_chat_id and original_msg_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=original_chat_id,
+                    message_id=original_msg_id,
+                    text=text,
+                    reply_markup=kbd,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Ошибка при обновлении сообщения после редактирования комментария: {e}")
+        return
 
-    if choice == "🔗 Получить ссылку на таблицу":
-        spreadsheet_id = get_setting("google_spreadsheet_id")
-        if not spreadsheet_id:
+    if is_admin(user_id):
+        return
+
+    from bot import get_user_lock
+    lock = get_user_lock(user_id)
+    await lock.acquire()
+
+    worker = await run_db(get_worker, user_id)
+    text_content = ""
+    tmp_path = None
+    
+    try:
+        if update.message.text:
+            text_content = update.message.text.strip()
+        else:
+            file_obj = None
+            if update.message.voice: file_obj = update.message.voice
+            elif update.message.video: file_obj = update.message.video
+            elif update.message.video_note: file_obj = update.message.video_note
+
+            if file_obj:
+                await update.message.reply_text("📹 Видео получено, ожидайте оценки:")
+                tg_file = await context.bot.get_file(file_obj.file_id)
+                ext = "mp4" if update.message.video or update.message.video_note else "ogg"
+                
+                os.makedirs("tmp", exist_ok=True)
+                tmp_path = f"tmp/file_{user_id}_{int(datetime.now().timestamp())}.{ext}"
+                
+                await tg_file.download_to_drive(tmp_path)
+                logger.info(f"[handler] Начало транскрипции файла {tmp_path} для пользователя {user_id}")
+                text_content = await transcribe_audio_async(tmp_path)
+                logger.info(f"[handler] Транскрипция завершена: '{text_content[:80]}'")
+
+        if not text_content:
+            await update.message.reply_text("Ошибка: Не удалось распознать аудио или медиа отчета.")
+            return
+
+        if text_content.startswith("Ошибка распознавания аудио"):
+            await update.message.reply_text("❌ При распознавании аудио произошла ошибка. Пожалуйста, отправьте текстовый отчет или попробуйте перезаписать.")
+            return
+
+        is_media = bool(update.message.voice or update.message.video or update.message.video_note)
+
+        if not worker:
+            user_info = {
+                "first_name": update.effective_user.first_name or "",
+                "last_name": update.effective_user.last_name or "",
+                "username": update.effective_user.username or "",
+                "timestamp": datetime.now().isoformat(),
+                "text": text_content
+            }
+            save_pending_unregistered_user(
+                telegram_id=user_id,
+                first_name=user_info["first_name"],
+                last_name=user_info["last_name"],
+                username=user_info["username"],
+                timestamp=user_info["timestamp"],
+                text_content=user_info["text"]
+            )
+            
+            admin_msg = (
+                f"👤 Обнаружен отчет от незарегистрированного сотрудника!\n"
+                f"TG ID: {user_id}\n"
+                f"Имя в Telegram: {user_info['first_name']} {user_info['last_name']} (@{user_info['username']})\n"
+                f"Текст:\n\"{text_content[:300]}\"\n\n"
+                f"Вы можете добавить его в базу через меню, указав ID."
+            )
+            for admin_id in ADMIN_IDS:
+                try:
+                    admin_copied_msg_id = None
+                    if is_media:
+                        try:
+                            admin_copied = await context.bot.copy_message(
+                                chat_id=admin_id,
+                                from_chat_id=update.effective_chat.id,
+                                message_id=update.message.message_id
+                            )
+                            admin_copied_msg_id = admin_copied.message_id
+                        except Exception as copy_err:
+                            logger.error(f"Ошибка копирования медиа незарегистрированного пользователя администратору {admin_id}: {copy_err}")
+                    
+                    if admin_copied_msg_id:
+                        await context.bot.send_message(
+                            chat_id=admin_id,
+                            text=admin_msg,
+                            reply_to_message_id=admin_copied_msg_id
+                        )
+                    else:
+                        await context.bot.send_message(chat_id=admin_id, text=admin_msg)
+                except Exception:
+                    pass
+
             await update.message.reply_text(
-                "❌ Google Таблица не настроена. Пожалуйста, настройте её с помощью кнопки «📊 Настроить Google Таблицу».",
+                "Ошибка: Вы не зарегистрированы в системе авторизации бота.\n"
+                "Ваш отчет отправлен администраторам как временный.\n\n"
+                "Нажмите кнопку ниже, чтобы зарегистрироваться:",
+                reply_markup=ReplyKeyboardMarkup([["🔑 Начать регистрацию"]], resize_keyboard=True)
+            )
+            return
+
+        if context.user_data.get("awaiting_not_working_reason"):
+            reason = text_content
+            if reason.lower() in ("отмена", "❌ отмена"):
+                context.user_data.pop("awaiting_not_working_reason", None)
+                await update.message.reply_text("Отменено.", reply_markup=menu_for_user(user_id, update.effective_chat.type))
+                return
+            
+            context.user_data["not_working_reason"] = reason
+            context.user_data.pop("awaiting_not_working_reason", None)
+            context.user_data["awaiting_not_working_confirm"] = True
+            
+            kbd = ReplyKeyboardMarkup([["Да, я уверен", "❌ Отмена"]], resize_keyboard=True)
+            await update.message.reply_text(
+                f"Уже сданные сегодня отчёты (если были) сохранятся — статус «Не работаю» просто добавится к ним.\n\n"
+                f"Подтвердите: причина — {reason}",
                 reply_markup=kbd
             )
-        else:
-            link = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+            return
+
+        if context.user_data.get("awaiting_not_working_confirm"):
+            confirm = text_content
+            if confirm == "Да, я уверен":
+                reason = context.user_data.pop("not_working_reason", "Без причины")
+                context.user_data.pop("awaiting_not_working_confirm", None)
+                
+                now = now_local()
+                date_str = now.strftime("%Y-%m-%d")
+                
+                await run_db(
+                    save_report,
+                    telegram_id=user_id,
+                    report_date=date_str,
+                    report_type="not_working",
+                    slot_time=None,
+                    received_at=now.strftime("%H:%M:%S"),
+                    is_ok=True,
+                    is_late=False,
+                    format_comment=reason,
+                    required_action="Не работает",
+                    raw_text=f"Не работает сегодня. Причина: {reason}"
+                )
+                async_sync_gsheets_background()
+                
+                await update.message.reply_text(
+                    f"✅ Статус 'Не работаю' успешно сохранен.\nПричина: {reason}",
+                    reply_markup=menu_for_user(user_id, update.effective_chat.type)
+                )
+                
+                w_name = f"{worker['last_name']} {worker['first_name']}"
+                dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
+                notify_text = f"🛌 {w_name} сегодня не работает.\nПричина: {reason}"
+                try:
+                    await context.bot.send_message(chat_id=dest_chat, text=notify_text)
+                except Exception as e:
+                    logger.error(f"Ошибка отправки уведомления в группу: {e}")
+                return
+            else:
+                context.user_data.pop("not_working_reason", None)
+                context.user_data.pop("awaiting_not_working_confirm", None)
+                await update.message.reply_text("Действие отменено.", reply_markup=menu_for_user(user_id, update.effective_chat.type))
+                return
+
+        if text_content in ("🛌 Не работаю сегодня", "Не работаю сегодня") or text_content.lower() == "не работаю сегодня":
+            now = now_local()
+            date_str = now.strftime("%Y-%m-%d")
+            conn = get_db()
+            existing_not_working = conn.execute(
+                "SELECT * FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = 'not_working'",
+                (user_id, date_str)
+            ).fetchone()
+            conn.close()
+            
+            if existing_not_working:
+                await update.message.reply_text("У вас уже установлен статус «Не работаю сегодня» на сегодня.", reply_markup=menu_for_user(user_id, update.effective_chat.type))
+                return
+                
+            context.user_data["awaiting_not_working_reason"] = True
             await update.message.reply_text(
-                f"🔗 **Ссылка на вашу Google Таблицу:**\n{link}",
-                reply_markup=kbd,
-                parse_mode="Markdown",
-                disable_web_page_preview=False
+                "Укажите, пожалуйста, причину, почему вы сегодня не работаете (например: заболел, отпуск, отпросился у прораба):",
+                reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True)
             )
-        return ASK_SETTINGS_ACTION
+            return
 
-    if choice == "📊 Настроить Google Таблицу":
-        spreadsheet_id = get_setting("google_spreadsheet_id", "Не задан")
-        email = "Не задан"
-        service_account_str = get_setting("google_service_account")
-        if service_account_str:
-            try: email = json.loads(service_account_str).get("client_email", "Не задан")
-            except Exception: pass
-        await update.message.reply_text(
-            f"⚙️ **Текущие настройки Google Таблиц:**\n\n"
-            f"🔗 **ID таблицы:** `{spreadsheet_id}`\n"
-            f"📧 **Сервисный аккаунт:** `{email}`\n\n"
-            f"Пришлите ссылку на Google Таблицу или её ID, чтобы настроить интеграцию.",
-            reply_markup=CANCEL_KEYBOARD,
-            parse_mode="Markdown"
-        )
-        return ASK_GSHEETS_URL
-    return ASK_SETTINGS_ACTION
-
-async def add_worker_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin_check(update): return ConversationHandler.END
-    context.user_data.clear()
-    await update.message.reply_text("Введите Telegram ID сотрудника:", reply_markup=CANCEL_KEYBOARD)
-    return ASK_WORKER_ID
-
-async def add_worker_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.strip()
-    if not raw.lstrip("-").isdigit():
-        await update.message.reply_text("Введите числовой ID:")
-        return ASK_WORKER_ID
-    worker_id = int(raw)
-    context.user_data["new_worker_id"] = worker_id
-    
-    pending = get_pending_unregistered_user(worker_id)
-    if pending:
-        context.user_data["pending_last_name"] = pending["last_name"]
-        context.user_data["pending_first_name"] = pending["first_name"]
-        await update.message.reply_text(
-            f"Найден временный отчет сотрудника!\nФИО: {pending['last_name']} {pending['first_name']}\n\n"
-            f"Подтвердите фамилию (нажмите на кнопку ниже) или введите новую:",
-            reply_markup=ReplyKeyboardMarkup([[pending["last_name"]], ["❌ Отмена"]], resize_keyboard=True)
-        )
-    else:
-        await update.message.reply_text("Введите фамилию:", reply_markup=CANCEL_KEYBOARD)
-    return ASK_LASTNAME
-
-async def add_worker_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    val = update.message.text.strip()
-    context.user_data["last_name"] = val
-    pending_first = context.user_data.get("pending_first_name")
-    if pending_first:
-        await update.message.reply_text(
-            "Подтвердите имя (нажмите на кнопку ниже) или введите новое:",
-            reply_markup=ReplyKeyboardMarkup([[pending_first], ["❌ Отмена"]], resize_keyboard=True)
-        )
-    else:
-        await update.message.reply_text("Введите имя:", reply_markup=CANCEL_KEYBOARD)
-    return ASK_FIRSTNAME
-
-async def add_worker_firstname(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["first_name"] = update.message.text.strip()
-    await update.message.reply_text("Введите должность сотрудника:", reply_markup=CANCEL_KEYBOARD)
-    return ASK_POSITION
-
-async def add_worker_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["position"] = update.message.text.strip()
-    await update.message.reply_text("Введите ID группы Telegram (или 0 для группы по умолчанию):", reply_markup=CANCEL_KEYBOARD)
-    return ASK_GROUP
-
-async def add_worker_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.strip()
-    if not raw.lstrip("-").isdigit(): return ASK_GROUP
-    context.user_data["group_id"] = DEFAULT_GROUP_ID if int(raw) == 0 else int(raw)
-    await update.message.reply_text(f"Выберите график сдачи статусов:\n{schedule_description_text()}", reply_markup=SCHEDULE_KEYBOARD)
-    return ASK_SCHEDULE
-
-async def add_worker_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.strip().upper()
-    if raw not in SCHEDULES: return ASK_SCHEDULE
-    context.user_data["schedule"] = raw
-    await update.message.reply_text("Нужно ли присылать ежедневный факт дня? (Да/Нет)", reply_markup=YES_NO_KEYBOARD)
-    return ASK_NEEDS_DAILY_FACT
-
-async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.strip().lower()
-    if raw not in ("да", "нет"): return ASK_NEEDS_DAILY_FACT
-
-    next_order = get_next_sort_order(context.user_data["position"])
-    upsert_worker(
-        telegram_id=context.user_data["new_worker_id"],
-        last_name=context.user_data["last_name"],
-        first_name=context.user_data["first_name"],
-        position=context.user_data["position"],
-        group_id=context.user_data["group_id"],
-        schedule=context.user_data["schedule"],
-        needs_daily_fact=(raw == "да"),
-        sort_order=next_order,
-    )
-    delete_pending_unregistered_user(context.user_data["new_worker_id"])
-    await fetch_and_save_group_name(context.bot, context.user_data["group_id"])
-    
-    target_group_id = context.user_data["group_id"] or DEFAULT_GROUP_ID
-    try:
-        notify_msg = f"👤 {context.user_data['last_name']} {context.user_data['first_name']} добавлен в систему, ID: {context.user_data['new_worker_id']}"
-        await context.bot.send_message(chat_id=target_group_id, text=notify_msg)
-    except Exception:
-        pass
-
-    async_sync_gsheets_background()
-    await update.message.reply_text("Сотрудник успешно добавлен в базу!", reply_markup=MAIN_MENU)
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def delete_worker_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin_check(update): return ConversationHandler.END
-    rows = get_all_workers()
-    if not rows:
-        await update.message.reply_text("В базе нет сотрудников.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
-    kbd, _ = positions_keyboard(rows)
-    await update.message.reply_text("Выберите отдел сотрудника для удаления:", reply_markup=kbd)
-    return ASK_REMOVE_DEPARTMENT
-
-async def delete_worker_department(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    dept = update.message.text.strip()
-    rows = get_workers_by_object_id(dept)
-    if not rows: return ConversationHandler.END
-    context.user_data["remove_rows"] = [dict(r) for r in rows]
-    await update.message.reply_text("Выберите кого удалить:", reply_markup=numbered_workers_keyboard(rows))
-    return ASK_REMOVE_WORKER
-
-async def delete_worker_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.strip()
-    rows = context.user_data.get("remove_rows", [])
-    num_str = raw.split(".")[0].strip()
-    if not num_str.isdigit(): return ASK_REMOVE_WORKER
-    idx = int(num_str) - 1
-    if idx < 0 or idx >= len(rows): return ASK_REMOVE_WORKER
-    worker = rows[idx]
-    context.user_data["worker_to_delete"] = worker
-    kbd = ReplyKeyboardMarkup([["Да, удалить", "Нет, отмена"]], resize_keyboard=True)
-    await update.message.reply_text(
-        f"⚠️ Вы уверены, что хотите удалить сотрудника {worker['last_name']} {worker['first_name']} ({worker['position'] or 'Не указано'}) (ID: {worker['telegram_id']})?",
-        reply_markup=kbd
-    )
-    return ASK_CONFIRM_DELETE
-
-async def delete_worker_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    choice = update.message.text.strip()
-    if choice == "Да, удалить":
-        worker = context.user_data.get("worker_to_delete")
-        if worker:
-            delete_worker(worker["telegram_id"])
-            async_sync_gsheets_background()
-            await update.message.reply_text(f"✅ Сотрудник {worker['last_name']} {worker['first_name']} успешно удален.", reply_markup=MAIN_MENU)
-    else:
-        await update.message.reply_text("Удаление сотрудника отменено.", reply_markup=MAIN_MENU)
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def department_workers_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin_check(update): return ConversationHandler.END
-    rows = get_all_workers()
-    if not rows:
-        await update.message.reply_text("В базе нет сотрудников.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
-    kbd, _ = positions_keyboard(rows)
-    await update.message.reply_text("Выберите отдел для просмотра:", reply_markup=kbd)
-    return ASK_DEPARTMENT
-
-async def department_workers_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    dept = update.message.text.strip()
-    rows = get_workers_by_object_id(dept)
-    if not rows:
-        await update.message.reply_text("Сотрудники не найдены.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
-    lines = [f"📋 Отдел: {dept}"]
-    for i, r in enumerate(rows, 1):
-        lines.append(f"{i}. {r['last_name']} {r['first_name']} ({r['position'] or 'Не указано'})")
-    await update.message.reply_text("\n".join(lines), reply_markup=MAIN_MENU)
-    return ConversationHandler.END
-
-async def import_workers_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin_check(update): return ConversationHandler.END
-    kbd = ReplyKeyboardMarkup(
-        [["📤 Скачать текущий список сотрудников"], ["📥 Загрузить обновления из файла"], ["❌ Отмена"]],
-        resize_keyboard=True
-    )
-    await update.message.reply_text("Выберите действие:", reply_markup=kbd)
-    return ASK_IMPORT_ACTION
-
-async def import_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    choice = update.message.text.strip()
-    if choice == "📤 Скачать текущий список сотрудников":
-        await update.message.reply_text("⏳ Формирую файл...", reply_markup=CANCEL_KEYBOARD)
-        try:
-            data = export_workers_to_excel()
-            bio = io.BytesIO(data)
-            bio.name = "workers.xlsx"
-            await update.message.reply_document(
-                document=bio,
-                filename="workers.xlsx",
-                caption="📋 Текущий список сотрудников. Внесите изменения и отправьте файл обратно.",
-                reply_markup=MAIN_MENU
+        if not is_media and text_content.strip() in ("❌ Отмена", "Да, я уверен"):
+            await update.message.reply_text(
+                "Это была кнопка диалога, который уже завершился — отчётом она не считается.\n"
+                "Если хотите сдать отчёт, нажмите «📋 Инструкция по сдаче видео-статуса» или просто запишите видео.",
+                reply_markup=menu_for_user(user_id, update.effective_chat.type)
             )
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка при формировании файла: {e}", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
+            return
 
-    if choice == "📥 Загрузить обновления из файла":
-        await update.message.reply_text("📎 Отправьте файл Excel (.xlsx) со списком сотрудников.", reply_markup=CANCEL_KEYBOARD)
-        return ASK_IMPORT_FILE
-    return ConversationHandler.END
+        now = now_local()
 
-async def import_workers_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if not doc or not doc.file_name.lower().endswith(".xlsx"):
-        await update.message.reply_text("❌ Пожалуйста, отправьте файл типа документ (.xlsx).")
-        return ASK_IMPORT_FILE
-    
-    await update.message.reply_text("⏳ Получение файла и импорт данных...")
-    try:
-        tg_file = await context.bot.get_file(doc.file_id)
-        local_path = "workers_temp_import.xlsx"
-        await tg_file.download_to_drive(local_path)
-        workers = read_excel(local_path)
-        if not workers:
-            await update.message.reply_text("⚠️ Не обнаружено записей в файле.", reply_markup=MAIN_MENU)
-            if os.path.exists(local_path): os.remove(local_path)
-            return ConversationHandler.END
+        if is_media:
+            await enqueue_media_report_item(user_id, context, update, text_content, now)
+            return
+
+        # Handle purely text status report (worker typewriting)
+        date_str = now.strftime("%Y-%m-%d")
+        sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
         
-        for w in workers:
-            upsert_worker(
-                telegram_id=w["telegram_id"], last_name=w["last_name"], first_name=w["first_name"],
-                position=w["position"], group_id=w["group_id"], schedule=w["schedule"],
-                needs_daily_fact=w["needs_daily_fact"], object_id=w.get("object_id", "Основной"),
-                is_active=1 if w.get("is_active", True) else 0, sort_order=w.get("sort_order", 0)
+        last_slot_time_str = sched_list[-1]
+        last_hour, last_minute = map(int, last_slot_time_str.split(":"))
+        last_slot_time = now.replace(hour=last_hour, minute=last_minute, second=0, microsecond=0)
+        last_slot_limit = last_slot_time + dt_module.timedelta(minutes=LATE_THRESHOLD_MIN)
+
+        report_type_override = "status" if now <= last_slot_limit else None
+
+        ai_res_pre = await check_status_async(text_content, report_type_override=report_type_override)
+        report_type = ai_res_pre["report_type"]
+
+        if report_type == "status":
+            submitted_slots = await run_db(get_submitted_status_slots, user_id, date_str)
+            nearest_slot, is_late = pick_target_status_slot(sched_list, now, submitted_slots)
+        else:
+            nearest_slot, is_late = None, False
+
+        existing_report = await run_db(get_existing_report_row, user_id, date_str, report_type, nearest_slot)
+
+        is_addon = False
+        if existing_report:
+            is_addon = True
+            ai_res = await check_status_async(text_content, report_type_override=report_type)
+            cleaned_text = await clean_report_async(text_content)
+            report_id = existing_report["id"]
+
+            await run_db(
+                update_report_text_and_ai,
+                report_id=report_id,
+                is_ok=ai_res["is_ok"],
+                format_comment=ai_res["format_comment"],
+                required_action=ai_res["required_action"],
+                raw_text=text_content,
+                received_at=now.strftime("%H:%M:%S")
             )
-        if os.path.exists(local_path): os.remove(local_path)
+        else:
+            ai_res = ai_res_pre
+            cleaned_text = await clean_report_async(text_content)
+            report_id = await run_db(
+                save_report,
+                telegram_id=user_id,
+                report_date=date_str,
+                report_type=ai_res["report_type"],
+                slot_time=nearest_slot if ai_res["report_type"] == "status" else None,
+                received_at=now.strftime("%H:%M:%S"),
+                is_ok=ai_res["is_ok"],
+                is_late=is_late if ai_res["report_type"] == "status" else 0,
+                format_comment=ai_res["format_comment"],
+                required_action=ai_res["required_action"],
+                raw_text=text_content
+            )
         async_sync_gsheets_background()
-        await update.message.reply_text(f"✅ Импорт успешно завершен! Загружено/обновлено: {len(workers)}.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка во время импорта: {e}", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
 
-async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_type = update.effective_chat.type
-    if chat_type != "private": return ConversationHandler.END
-    user_id = update.effective_user.id
-    if is_admin(user_id):
-        await update.message.reply_text("Привет! Выберите действие кнопкой ниже.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
-    worker = get_worker(user_id)
-    if worker:
-        await update.message.reply_text("Привет! Отправьте видеоотчет, когда он будет готов.", reply_markup=menu_for_user(user_id, chat_type))
-        return ConversationHandler.END
-    await update.message.reply_text(
-        "👋 *Добро пожаловать в систему сдачи отчетов!*\n\nПожалуйста, введите вашу **Фамилию** для поиска:",
-        parse_mode="Markdown", reply_markup=CANCEL_KEYBOARD
-    )
-    return ASK_REG_LAST_NAME
+        w_name = f"{worker['last_name']} {worker['first_name']}"
+        time_str = now.strftime("%H:%M")
+        if ai_res["report_type"] == "status" and nearest_slot:
+            sh, sm = map(int, nearest_slot.split(":"))
+            diff_mins = (now.hour * 60 + now.minute) - (sh * 60 + sm)
+            late_str = f" (опоздание {diff_mins} мин)" if diff_mins > LATE_THRESHOLD_MIN else ""
+            info_suffix = f" за статус *{nearest_slot}* принят в *{time_str}*{late_str}"
+        else:
+            info_suffix = f" — факт получен в *{time_str}*"
 
-async def register_lastname_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    user_id = update.effective_user.id
-    if text == CANCEL_TEXT:
-        await update.message.reply_text("Регистрация отменена.", reply_markup=menu_for_user(user_id))
-        return ConversationHandler.END
-    
-    workers = find_unregistered_workers_by_lastname(text)
-    if len(workers) == 0:
-        await update.message.reply_text(f"❌ Сотрудник с фамилией <b>{html.escape(text)}</b> не найден среди незарегистрированных.", parse_mode="HTML", reply_markup=menu_for_user(user_id))
-        return ConversationHandler.END
-    elif len(workers) == 1:
-        candidate = workers[0]
-        bind_worker_id(candidate["telegram_id"], user_id)
-        w_fio = f"{candidate['last_name']} {candidate['first_name']}"
-        await update.message.reply_text(f"🎉 <b>Регистрация успешна!</b>\nВы привязаны к профилю: <b>{html.escape(w_fio)}</b>.", parse_mode="HTML", reply_markup=menu_for_user(user_id))
-        return ConversationHandler.END
-    else:
-        context.user_data["candidate_workers"] = [dict(w) for w in workers]
-        buttons = [[f"{w['last_name']} {w['first_name']}"] for w in workers]
-        buttons.append([CANCEL_TEXT])
-        await update.message.reply_text("🔍 Найдено несколько сотрудников. Выберите ваше имя на клавиатуре:", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True))
-        return ASK_REG_FIRST_NAME
+        if ai_res["is_ok"]:
+            await update.message.reply_text(f"✅ Отчёт{info_suffix} успешно проверен ИИ и принят без замечаний! Спасибо.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"⚠️ Отчёт{info_suffix}.\nОценка отчета: {ai_res['employee_message']}", parse_mode="Markdown")
 
-async def register_firstname_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    user_id = update.effective_user.id
-    if text == CANCEL_TEXT:
-        await update.message.reply_text("Регистрация отменена.", reply_markup=menu_for_user(user_id))
-        return ConversationHandler.END
-    
-    candidates = context.user_data.get("candidate_workers", [])
-    matched_candidate = None
-    for c in candidates:
-        if text.lower() == f"{c['last_name']} {c['first_name']}".lower():
-            matched_candidate = c
-            break
-    if not matched_candidate:
-        await update.message.reply_text("❌ Пожалуйста, выберите имя из списка.")
-        return ASK_REG_FIRST_NAME
-    
-    bind_worker_id(matched_candidate["telegram_id"], user_id)
-    w_fio = f"{matched_candidate['last_name']} {matched_candidate['first_name']}"
-    await update.message.reply_text(f"🎉 <b>Регистрация успешна!</b>\nВы привязаны к профилю: <b>{html.escape(w_fio)}</b>.", parse_mode="HTML", reply_markup=menu_for_user(user_id))
-    return ConversationHandler.END
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip() if update.message.text else ""
-    context.user_data.clear()
-    
-    user_id = update.effective_user.id
-    chat_type = update.effective_chat.type
-    
-    if text in (CANCEL_TEXT, "❌ Отмена", "❌ Назад"):
-        await update.message.reply_text("Действие отменено.", reply_markup=menu_for_user(user_id, chat_type))
-        return ConversationHandler.END
+        dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
+        title_text = f"Отчет обновлен: {w_name}" if is_addon else w_name
+        notify_text = (
+            f"{title_text}\n"
+            f"{format_status_or_fact_line(ai_res['report_type'], nearest_slot if ai_res['report_type'] == 'status' else None, date_str)}\n"
+            f"Оценка ИИ: {'ОК' if ai_res['is_ok'] else 'НЕ ОК'}\n"
+            f"Комментарий ИИ: {ai_res['format_comment']}\n\n"
+            f"📝 Официальный отчет:\n\"{cleaned_text}\"\n\n"
+            f"🗣 Оригинальный текст:\n\"{text_content}\""
+        )
         
-    if text == "📋 Сотрудники":
-        await list_workers_action(update, context)
-        return ConversationHandler.END
-    elif text == "📥 Выгрузить отчеты":
-        await export_reports_action(update, context)
-        return ConversationHandler.END
-        
-    await update.message.reply_text(
-        f"❌ Предыдущее действие отменено.\nПожалуйста, нажмите кнопку <b>«{html.escape(text)}»</b> ещё раз.",
-        reply_markup=menu_for_user(user_id, chat_type),
-        parse_mode="HTML"
-    )
-    return ConversationHandler.END
+        inline_kbd = make_report_keyboard(report_id, ai_res["report_type"])
 
-async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin_check(update): return
-    workers = get_all_workers()
-    if not workers:
-        await update.message.reply_text("В базе данных нет сотрудников.", reply_markup=MAIN_MENU)
+        if is_addon and existing_report and existing_report["group_chat_id"] and existing_report["group_message_id"]:
+            try:
+                await context.bot.delete_message(chat_id=existing_report["group_chat_id"], message_id=existing_report["group_message_id"])
+            except Exception:
+                pass
+
+        try:
+            sent_notify_msg = await context.bot.send_message(
+                chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd, parse_mode="Markdown"
+            )
+            await run_db(set_report_group_message, report_id, dest_chat, sent_notify_msg.message_id)
+        except Exception as e:
+            logger.error(f"Ошибка отправки оценки в чат {dest_chat}: {e}")
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            pass
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await query.answer("У вас нет прав администратора.", show_alert=True)
         return
-    
-    by_obj = {}
-    for w in workers:
-        obj = w["object_id"] or "Основной"
-        by_obj.setdefault(obj, []).append(w)
-    
-    lines = ["📋 <b>Список всех сотрудников по отделам:</b>\n"]
-    for obj, w_list in sorted(by_obj.items()):
-        lines.append(f"🏢 <b>Отдел: {html.escape(obj)}</b>")
-        for i, w in enumerate(w_list, 1):
-            status = "🟢 Акт" if w["is_active"] else "🔴 Неакт"
-            ndf = "Да" if w["needs_daily_fact"] else "Нет"
-            
-            last_name = html.escape(w['last_name'] or '')
-            first_name = html.escape(w['first_name'] or '')
-            position = html.escape(w['position'] or 'Не указано')
-            schedule = html.escape(w['schedule'] or '')
-            
-            lines.append(
-                f"  {i}. {last_name} {first_name} ({position}) (ID: <code>{w['telegram_id']}</code>)\n"
-                f"     График: {schedule} | Факт дня: {ndf} | Статус: {status}"
-            )
-        lines.append("")
         
-    full_text = "\n".join(lines)
-    if len(full_text) > 4000:
-        for i in range(0, len(full_text), 4000):
-            await update.message.reply_text(full_text[i:i+4000], reply_markup=MAIN_MENU, parse_mode="HTML")
-    else:
-        await update.message.reply_text(full_text, reply_markup=MAIN_MENU, parse_mode="HTML")
+    data = query.data
+    logger.info(f"Получен callback_query: {data} от администратора {user_id}")
+    
+    # 1. Back to main menu
+    if data.startswith("back_to_main_"):
+        report_id = int(data.split("_")[-1])
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone() if report else None
+        conn.close()
+        
+        if report and worker:
+            worker_name = f"{worker['last_name']} {worker['first_name']}"
+            text, kbd = await render_report_message_from_row(report, worker_name)
+            try:
+                await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Ошибка при возврате к основному меню: {e}")
+        return
 
-EXPORT_MENU = ReplyKeyboardMarkup(
-    [
-        ["📊 Скачать Excel файл", "🔄 Синхронизировать сейчас"],
-        ["❌ Назад"]
-    ],
-    resize_keyboard=True
-)
-
-async def export_reports_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin_check(update): return ConversationHandler.END
-    await update.message.reply_text(
-        "📥 Выгрузка отчетов и синхронизация.\nВыберите действие:",
-        reply_markup=EXPORT_MENU
-    )
-    return ASK_EXPORT_TYPE
-
-async def export_reports_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    choice = update.message.text.strip()
-    if choice == "❌ Назад":
-        await update.message.reply_text("Главное меню.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
-
-    if choice == "📊 Скачать Excel файл":
-        await update.message.reply_text("⏳ Формирую Excel файл с отчётами...", reply_markup=MAIN_MENU)
+    # 2. Toggle type (status <-> daily_fact)
+    if data.startswith("toggle_type_"):
+        report_id = int(data.split("_")[-1])
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        if not report:
+            conn.close()
+            return
+            
+        new_type = "daily_fact" if report["report_type"] == "status" else "status"
+        new_slot_time = report["slot_time"]
+        if new_type == "status" and not new_slot_time:
+            new_slot_time = "10:00"
+            
+        conn.execute("UPDATE reports SET report_type = ?, slot_time = ? WHERE id = ?", (new_type, new_slot_time, report_id))
+        conn.commit()
+        
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
+        conn.close()
+        
+        async_sync_gsheets_background()
+        
+        worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+        text, kbd = await render_report_message_from_row(report, worker_name)
         try:
-            from db import export_reports_to_excel
-            data = export_reports_to_excel()
-            bio = io.BytesIO(data)
-            bio.name = "reports.xlsx"
-            await update.message.reply_document(
-                document=bio,
-                filename="reports.xlsx",
-                caption="📋 Полная выгрузка отчётов из базы данных.",
-                reply_markup=MAIN_MENU
-            )
+            await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка при формировании файла отчётов: {e}", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
+            logger.error(f"Ошибка при изменении типа отчета: {e}")
+        return
 
-    if choice == "🔄 Синхронизировать сейчас":
-        from db import get_setting, sync_gsheets_task
-        spreadsheet_id = get_setting("google_spreadsheet_id")
-        creds_str = get_setting("google_service_account")
-        if not spreadsheet_id or not creds_str:
-            await update.message.reply_text(
-                "❌ Google Таблица не настроена. Пожалуйста, сначала настройте Google Таблицу в «⚙️ Настройки бота».",
-                reply_markup=MAIN_MENU
-            )
-            return ConversationHandler.END
+    # 3. Main Toggle Button -> Choose overall or video
+    if data.startswith("fix_toggle_"):
+        report_id = int(data.split("_")[-1])
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        conn.close()
+        
+        if not report:
+            return
             
-        await update.message.reply_text("⏳ Запускаю синхронизацию данных с Google Таблицей...", reply_markup=MAIN_MENU)
-        import asyncio
-        success, err = await asyncio.to_thread(sync_gsheets_task)
-        if success:
-            await update.message.reply_text("🎉 **Синхронизация завершена успешно!**\nВсе листы (Сотрудники, Отчеты, Аналитика) обновлены.", reply_markup=MAIN_MENU, parse_mode="Markdown")
+        video_items = parse_video_comments(report["format_comment"])
+        if len(video_items) > 1:
+            kbd = make_video_selection_keyboard(report_id, "toggle", video_items)
+            try:
+                await query.edit_message_reply_markup(reply_markup=kbd)
+            except Exception as e:
+                logger.error(f"Ошибка при показе меню выбора видео для toggling: {e}")
         else:
-            await update.message.reply_text(f"⚠️ **Ошибка синхронизации:**\n`{err}`", reply_markup=MAIN_MENU, parse_mode="Markdown")
-        return ConversationHandler.END
-
-    return ASK_EXPORT_TYPE
-
-async def alert_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin_check(update): return ConversationHandler.END
-    times = get_scheduled_times() or ["19:00"]
-    times_str = ", ".join(times)
-    await update.message.reply_text(
-        f"⏰ **Текущее время авто-сводок:**\n"
-        f"`{times_str}`\n\n"
-        f"Пожалуйста, введите новое время (или список времён через запятую в формате `ЧЧ:ММ`, например: `12:00, 15:00, 19:00`):",
-        reply_markup=CANCEL_KEYBOARD,
-        parse_mode="Markdown"
-    )
-    return ASK_REPORT_TIME
-
-async def alert_time_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.lower() == "отмена" or text == CANCEL_TEXT:
-        await update.message.reply_text("Действие отменено.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
-        
-    parts = [p.strip() for p in text.split(",")]
-    valid_times = []
-    invalid_parts = []
-    
-    import re
-    for p in parts:
-        if re.match(r"^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]$", p):
-            valid_times.append(p)
-        else:
-            invalid_parts.append(p)
+            new_is_ok = 0 if report["is_ok"] == 1 else 1
+            new_format_comment = report["format_comment"] or ""
+            if video_items:
+                video_items[0]["is_ok"] = (new_is_ok == 1)
+                new_format_comment = rebuild_format_comment(video_items)
+                
+            conn = get_db()
+            conn.execute("UPDATE reports SET is_ok = ?, format_comment = ? WHERE id = ?", (new_is_ok, new_format_comment, report_id))
+            conn.commit()
+            report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
+            conn.close()
             
-    if invalid_parts:
-        await update.message.reply_text(
-            f"❌ Неверный формат времени: {', '.join(invalid_parts)}.\n"
-            f"Пожалуйста, введите время в формате `ЧЧ:ММ` (например: `19:00` или `10:00, 15:00`):",
-            reply_markup=CANCEL_KEYBOARD
-        )
-        return ASK_REPORT_TIME
-        
-    save_scheduled_times(valid_times)
-    from bot import reschedule_summary_jobs
-    reschedule_summary_jobs(context.application)
-    
-    times_str = ", ".join(valid_times)
-    await update.message.reply_text(
-        f"✅ Время автоматических сводок успешно обновлено: `{times_str}`!",
-        reply_markup=MAIN_MENU,
-        parse_mode="Markdown"
-    )
-    return ConversationHandler.END
+            async_sync_gsheets_background()
+            
+            worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+            text, kbd = await render_report_message_from_row(report, worker_name)
+            try:
+                await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Ошибка при непосредственном изменении оценки: {e}")
+        return
 
-async def remind_all_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin_check(update): return ConversationHandler.END
-    await update.message.reply_text(
-        "📣 **Рассылка напоминания всем активным сотрудникам**\n\n"
-        "Вы можете отправить текст напоминания по умолчанию:\n"
-        "_«🔔 Напоминание: пожалуйста, не забудьте вовремя отправить ваш видеоотчёт!»_\n\n"
-        "Напишите свой текст напоминания для отправки или введите `Да`, чтобы использовать стандартный:",
-        reply_markup=CANCEL_KEYBOARD,
-        parse_mode="Markdown"
-    )
-    return ASK_CONFIRM_REMIND
-
-async def remind_all_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import asyncio
-    text = update.message.text.strip()
-    if text.lower() == "отмена" or text == CANCEL_TEXT:
-        await update.message.reply_text("Рассылка отменена.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
+    # 4. Toggle Overall
+    if data.startswith("tg_overall_"):
+        report_id = int(data.split("_")[-1])
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        if not report:
+            conn.close()
+            return
+            
+        new_is_ok = 0 if report["is_ok"] == 1 else 1
+        conn.execute("UPDATE reports SET is_ok = ? WHERE id = ?", (new_is_ok, report_id))
+        conn.commit()
         
-    reminder_text = "🔔 Напоминание: пожалуйста, не забудьте вовремя отправить ваш видеоотчёт!"
-    if text.lower() != "да":
-        reminder_text = text
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
+        conn.close()
         
-    workers = get_all_workers()
-    active_workers = [w for w in workers if w["is_active"]]
-    
-    if not active_workers:
-        await update.message.reply_text("Нет активных сотрудников в базе данных.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
+        async_sync_gsheets_background()
         
-    await update.message.reply_text(f"⏳ Отправка сообщения {len(active_workers)} сотрудникам...", reply_markup=MAIN_MENU)
-    
-    success_count = 0
-    fail_count = 0
-    for w in active_workers:
+        worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+        text, kbd = await render_report_message_from_row(report, worker_name)
         try:
-            await context.bot.send_message(chat_id=w["telegram_id"], text=reminder_text)
-            success_count += 1
-            await asyncio.sleep(0.05)
+            await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
         except Exception as e:
-            logger.warning(f"Не удалось отправить напоминание {w['telegram_id']}: {e}")
-            fail_count += 1
+            logger.error(f"Ошибка при изменении общей оценки: {e}")
+        return
+
+    # 5. Toggle Individual Video Assessment
+    if data.startswith("tg_vid_"):
+        parts = data.split("_")
+        report_id = int(parts[2])
+        video_num = int(parts[3])
+        
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        if not report:
+            conn.close()
+            return
             
-    await update.message.reply_text(
-        f"✅ Рассылка завершена!\n"
-        f"Успешно отправлено: {success_count}\n"
-        f"Ошибок отправки: {fail_count}",
-        reply_markup=MAIN_MENU
-    )
-    return ConversationHandler.END
-
-def extract_spreadsheet_id(text: str) -> str:
-    text = text.strip()
-    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", text)
-    if match:
-        return match.group(1)
-    return text
-
-async def save_gsheets_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.lower() == "отмена" or text == CANCEL_TEXT:
-        await update.message.reply_text("Действие отменено.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
+        video_items = parse_video_comments(report["format_comment"])
+        for item in video_items:
+            if item["num"] == video_num:
+                item["is_ok"] = not item["is_ok"]
+                
+        new_overall_ok = all(item["is_ok"] for item in video_items)
+        new_format_comment = rebuild_format_comment(video_items)
         
-    sheet_id = extract_spreadsheet_id(text)
-    if not sheet_id:
-        await update.message.reply_text("❌ Не удалось распознать ID таблицы. Пожалуйста, отправьте корректную ссылку или ID:")
-        return ASK_GSHEETS_URL
-        
-    set_setting("google_spreadsheet_id", sheet_id)
-    
-    await update.message.reply_text(
-        f"✅ ID Google Таблицы сохранен: `{sheet_id}`\n\n"
-        f"Теперь, пожалуйста, **отправьте JSON-файл с ключами сервисного аккаунта** (credentials) как документ.\n"
-        f"Этот файл вы можете скачать из Google Cloud Console при создании ключа сервисного аккаунта.",
-        reply_markup=CANCEL_KEYBOARD,
-        parse_mode="Markdown"
-    )
-    return ASK_GSHEETS_CREDS
-
-async def save_gsheets_creds_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.lower() == "отмена" or text == CANCEL_TEXT:
-        await update.message.reply_text("Действие отменено.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
-    await update.message.reply_text(
-        "❌ Пожалуйста, пришлите JSON-файл ключа сервисного аккаунта Google как документ (или введите «Отмена»):",
-        reply_markup=CANCEL_KEYBOARD
-    )
-    return ASK_GSHEETS_CREDS
-
-async def save_gsheets_creds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if not doc:
-        await update.message.reply_text("❌ Пожалуйста, пришлите JSON-файл ключа сервисного аккаунта Google как документ:")
-        return ASK_GSHEETS_CREDS
-        
-    if not doc.file_name.lower().endswith(".json"):
-        await update.message.reply_text("❌ Файл должен иметь расширение .json. Пожалуйста, отправьте правильный файл:")
-        return ASK_GSHEETS_CREDS
-        
-    try:
-        # Download the file
-        file_obj = await context.bot.get_file(doc.file_id)
-        file_bytes = await file_obj.download_as_bytearray()
-        content = file_bytes.decode("utf-8")
-        
-        # Verify JSON
-        creds_dict = json.loads(content)
-        if "client_email" not in creds_dict or "private_key" not in creds_dict:
-            await update.message.reply_text(
-                "❌ Некорректный формат файла. Убедитесь, что это JSON-файл ключей сервисного аккаунта Google (содержит client_email и private_key):"
-            )
-            return ASK_GSHEETS_CREDS
-            
-        set_setting("google_service_account", content)
-        
-        email = creds_dict.get("client_email")
-        spreadsheet_id = get_setting("google_spreadsheet_id")
-        
-        await update.message.reply_text(
-            f"✅ Ключи сервисного аккаунта успешно сохранены!\n"
-            f"📧 Email сервисного аккаунта: `{email}`\n\n"
-            f"⚠️ **ВАЖНО:** Обязательно откройте доступ к вашей Google Таблице (кнопка 'Поделиться' в правом верхнем углу таблицы) на редактирование для этого email: `{email}`.\n\n"
-            f"Запускаю тестовую синхронизацию...",
-            reply_markup=MAIN_MENU,
-            parse_mode="Markdown"
+        conn.execute(
+            "UPDATE reports SET is_ok = ?, format_comment = ? WHERE id = ?",
+            (1 if new_overall_ok else 0, new_format_comment, report_id)
         )
+        conn.commit()
         
-        # Sync synchronously inside thread pool to verify and report success/failure immediately
-        import asyncio
-        from db import sync_gsheets_task
-        success, err = await asyncio.to_thread(sync_gsheets_task)
-        if success:
-            await update.message.reply_text(
-                "🎉 **Синхронизация с Google Таблицей прошла успешно!**\n"
-                "Данные о сотрудниках, отчетах и вкладка Аналитика обновлены в вашей таблице.",
-                reply_markup=MAIN_MENU,
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(
-                f"⚠️ **Внимание:** Синхронизация завершилась с ошибкой:\n`{err}`\n\n"
-                f"Убедитесь, что вы выдали доступ (Поделиться) на редактирование сервисному аккаунту `{email}` в вашей таблице, после чего попробуйте запустить синхронизацию вручную из настроек.",
-                reply_markup=MAIN_MENU,
-                parse_mode="Markdown"
-            )
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
+        conn.close()
+        
+        async_sync_gsheets_background()
+        
+        worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+        text, kbd = await render_report_message_from_row(report, worker_name)
+        try:
+            await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Ошибка при изменении оценки видео: {e}")
+        return
+
+    # 6. Main Edit Comment Button -> Choose overall or video
+    if data.startswith("edit_comment_"):
+        report_id = int(data.split("_")[-1])
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        conn.close()
+        
+        if not report:
+            return
             
-        return ConversationHandler.END
-    except Exception as e:
-        logger.error(f"Ошибка при обработке файла credentials: {e}")
-        await update.message.reply_text(f"❌ Ошибка при чтении или разборе файла: {e}\nПожалуйста, пришлите корректный файл:")
-        return ASK_GSHEETS_CREDS
+        video_items = parse_video_comments(report["format_comment"])
+        if len(video_items) > 1:
+            kbd = make_video_selection_keyboard(report_id, "edit", video_items)
+            try:
+                await query.edit_message_reply_markup(reply_markup=kbd)
+            except Exception as e:
+                logger.error(f"Ошибка при показе меню выбора видео для editing: {e}")
+        else:
+            context.user_data["editing_comment_report_id"] = report_id
+            context.user_data["editing_comment_video_num"] = None
+            context.user_data["editing_comment_chat_id"] = query.message.chat.id
+            context.user_data["editing_comment_message_id"] = query.message.message_id
+            context.user_data["editing_comment_original_text"] = query.message.text
+            
+            prompt_msg = await query.message.reply_text(
+                "✏️ Введите новый комментарий к отчету:\n(или введите «Отмена»)",
+                reply_markup=ForceReply(selective=True)
+            )
+            context.user_data["editing_comment_prompt_message_id"] = prompt_msg.message_id
+        return
+
+    # 7. Edit Overall Comment
+    if data.startswith("ed_overall_"):
+        report_id = int(data.split("_")[-1])
+        context.user_data["editing_comment_report_id"] = report_id
+        context.user_data["editing_comment_video_num"] = None
+        context.user_data["editing_comment_chat_id"] = query.message.chat.id
+        context.user_data["editing_comment_message_id"] = query.message.message_id
+        context.user_data["editing_comment_original_text"] = query.message.text
+        
+        prompt_msg = await query.message.reply_text(
+            "✏️ Введите новый общий комментарий к отчету:\n(или введите «Отмена»)",
+            reply_markup=ForceReply(selective=True)
+        )
+        context.user_data["editing_comment_prompt_message_id"] = prompt_msg.message_id
+        return
+
+    # 8. Edit Specific Video Comment
+    if data.startswith("ed_vid_"):
+        parts = data.split("_")
+        report_id = int(parts[2])
+        video_num = int(parts[3])
+        
+        context.user_data["editing_comment_report_id"] = report_id
+        context.user_data["editing_comment_video_num"] = video_num
+        context.user_data["editing_comment_chat_id"] = query.message.chat.id
+        context.user_data["editing_comment_message_id"] = query.message.message_id
+        context.user_data["editing_comment_original_text"] = query.message.text
+        
+        prompt_msg = await query.message.reply_text(
+            f"✏️ Введите новый комментарий для Видео {video_num}:\n(или введите «Отмена»)",
+            reply_markup=ForceReply(selective=True)
+        )
+        context.user_data["editing_comment_prompt_message_id"] = prompt_msg.message_id
+        return
