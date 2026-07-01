@@ -409,13 +409,13 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
     
     workers = find_unregistered_workers_by_lastname(text)
     if len(workers) == 0:
-        await update.message.reply_text(f"❌ Сотрудник с фамилией *{text}* не найден среди незарегистрированных.", parse_mode="Markdown", reply_markup=menu_for_user(user_id))
+        await update.message.reply_text(f"❌ Сотрудник с фамилией <b>{html.escape(text)}</b> не найден среди незарегистрированных.", parse_mode="HTML", reply_markup=menu_for_user(user_id))
         return ConversationHandler.END
     elif len(workers) == 1:
         candidate = workers[0]
         bind_worker_id(candidate["telegram_id"], user_id)
         w_fio = f"{candidate['last_name']} {candidate['first_name']}"
-        await update.message.reply_text(f"🎉 *Регистрация успешна!*\nВы привязаны к профилю: *{w_fio}*.", parse_mode="Markdown", reply_markup=menu_for_user(user_id))
+        await update.message.reply_text(f"🎉 <b>Регистрация успешна!</b>\nВы привязаны к профилю: <b>{html.escape(w_fio)}</b>.", parse_mode="HTML", reply_markup=menu_for_user(user_id))
         return ConversationHandler.END
     else:
         context.user_data["candidate_workers"] = [dict(w) for w in workers]
@@ -442,7 +442,8 @@ async def register_firstname_received(update: Update, context: ContextTypes.DEFA
         return ASK_REG_FIRST_NAME
     
     bind_worker_id(matched_candidate["telegram_id"], user_id)
-    await update.message.reply_text(f"🎉 *Регистрация успешна!*\nВы привязаны к профилю: *{matched_candidate['last_name']} {matched_candidate['first_name']}*.", parse_mode="Markdown", reply_markup=menu_for_user(user_id))
+    w_fio = f"{matched_candidate['last_name']} {matched_candidate['first_name']}"
+    await update.message.reply_text(f"🎉 <b>Регистрация успешна!</b>\nВы привязаны к профилю: <b>{html.escape(w_fio)}</b>.", parse_mode="HTML", reply_markup=menu_for_user(user_id))
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -452,14 +453,22 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_type = update.effective_chat.type
     
-    if text in (CANCEL_TEXT, "❌ Отмена"):
+    if text in (CANCEL_TEXT, "❌ Отмена", "❌ Назад"):
         await update.message.reply_text("Действие отменено.", reply_markup=menu_for_user(user_id, chat_type))
-    else:
-        await update.message.reply_text(
-            f"❌ Предыдущее действие отменено.\nПожалуйста, нажмите кнопку *«{text}»* ещё раз для подтверждения.",
-            reply_markup=menu_for_user(user_id, chat_type),
-            parse_mode="Markdown"
-        )
+        return ConversationHandler.END
+        
+    if text == "📋 Сотрудники":
+        await list_workers_action(update, context)
+        return ConversationHandler.END
+    elif text == "📥 Выгрузить отчеты":
+        await export_reports_action(update, context)
+        return ConversationHandler.END
+        
+    await update.message.reply_text(
+        f"❌ Предыдущее действие отменено.\nПожалуйста, нажмите кнопку <b>«{html.escape(text)}»</b> ещё раз.",
+        reply_markup=menu_for_user(user_id, chat_type),
+        parse_mode="HTML"
+    )
     return ConversationHandler.END
 
 async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -474,24 +483,30 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         pos = w["position"] or "Не указано"
         by_pos.setdefault(pos, []).append(w)
     
-    lines = ["📋 **Список всех сотрудников:**\n"]
+    lines = ["📋 <b>Список всех сотрудников:</b>\n"]
     for pos, w_list in sorted(by_pos.items()):
-        lines.append(f"🏢 **Отдел: {pos}**")
+        lines.append(f"🏢 <b>Отдел: {html.escape(pos)}</b>")
         for i, w in enumerate(w_list, 1):
             status = "🟢 Акт" if w["is_active"] else "🔴 Неакт"
             ndf = "Да" if w["needs_daily_fact"] else "Нет"
+            
+            last_name = html.escape(w['last_name'] or '')
+            first_name = html.escape(w['first_name'] or '')
+            schedule = html.escape(w['schedule'] or '')
+            object_id = html.escape(w['object_id'] or '')
+            
             lines.append(
-                f"  {i}. {w['last_name']} {w['first_name']} (ID: `{w['telegram_id']}`)\n"
-                f"     График: {w['schedule']} | Факт дня: {ndf} | Статус: {status} | Объект: {w['object_id']}"
+                f"  {i}. {last_name} {first_name} (ID: <code>{w['telegram_id']}</code>)\n"
+                f"     График: {schedule} | Факт дня: {ndf} | Статус: {status} | Объект: {object_id}"
             )
         lines.append("")
         
     full_text = "\n".join(lines)
     if len(full_text) > 4000:
         for i in range(0, len(full_text), 4000):
-            await update.message.reply_text(full_text[i:i+4000], reply_markup=MAIN_MENU, parse_mode="Markdown")
+            await update.message.reply_text(full_text[i:i+4000], reply_markup=MAIN_MENU, parse_mode="HTML")
     else:
-        await update.message.reply_text(full_text, reply_markup=MAIN_MENU, parse_mode="Markdown")
+        await update.message.reply_text(full_text, reply_markup=MAIN_MENU, parse_mode="HTML")
 
 async def export_reports_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin_check(update): return
