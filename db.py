@@ -789,17 +789,17 @@ def read_excel(file_path: str) -> list[dict]:
             
     return workers
 
-def sync_gsheets_task():
+def sync_gsheets_task() -> tuple[bool, str | None]:
     try:
         import gspread
         from google.oauth2.service_account import Credentials
-    except ImportError:
-        return
+    except ImportError as e:
+        return False, f"Отсутствуют необходимые библиотеки Python: {e}"
 
     spreadsheet_id = get_setting("google_spreadsheet_id")
     creds_str = get_setting("google_service_account")
     if not spreadsheet_id or not creds_str:
-        return
+        return False, "Настройки Google Таблицы или сервисного аккаунта не заданы."
 
     try:
         creds_dict = json.loads(creds_str)
@@ -810,8 +810,23 @@ def sync_gsheets_task():
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         client = gspread.authorize(creds)
         
-        sheet = client.open_by_key(spreadsheet_id)
+        try:
+            sheet = client.open_by_key(spreadsheet_id)
+        except Exception as ex:
+            email = creds_dict.get("client_email", "неизвестный email")
+            return False, f"Не удалось открыть таблицу по ID. Убедитесь, что ID правильный и таблица открыта для редактирования (Поделиться) сервисному аккаунту: {email}. Ошибка: {ex}"
         
+        # Helper to update worksheet compatibly with older/newer gspread versions
+        def safe_update(ws, data):
+            ws.clear()
+            try:
+                ws.update("A1", data)
+            except Exception:
+                try:
+                    ws.update(data, "A1")
+                except Exception:
+                    ws.update(range_name="A1", values=data)
+
         # 1. Sync Workers to "Сотрудники"
         workers = get_all_workers()
         headers_workers = [
@@ -840,13 +855,11 @@ def sync_gsheets_task():
         except gspread.exceptions.WorksheetNotFound:
             ws_workers = sheet.add_worksheet(title="Сотрудники", rows="1000", cols="20")
             
-        ws_workers.clear()
-        ws_workers.update("A1", rows_workers)
+        safe_update(ws_workers, rows_workers)
         
         # 2. Sync Reports to "Отчеты"
         conn = get_db()
         reports = conn.execute("SELECT * FROM reports ORDER BY id DESC").fetchall()
-        conn.close()
         
         headers_reports = [
             "id", "telegram_id", "report_date", "report_type", "slot_time",
@@ -874,12 +887,66 @@ def sync_gsheets_task():
         except gspread.exceptions.WorksheetNotFound:
             ws_reports = sheet.add_worksheet(title="Отчеты", rows="5000", cols="20")
             
-        ws_reports.clear()
-        ws_reports.update("A1", rows_reports)
+        safe_update(ws_reports, rows_reports)
+
+        # 3. Sync Analytics to "Аналитика"
+        try:
+            ws_analytics = sheet.worksheet("Аналитика")
+        except gspread.exceptions.WorksheetNotFound:
+            ws_analytics = sheet.add_worksheet(title="Аналитика", rows="1000", cols="20")
+
+        now = now_local()
+        end_date_str = now.strftime("%Y-%m-%d")
+        
+        # Earliest report date fallback
+        earliest_row = conn.execute("SELECT MIN(report_date) as min_date FROM reports").fetchone()
+        earliest_date_str = (earliest_row["min_date"] if earliest_row and earliest_row["min_date"] else end_date_str) or end_date_str
+        
+        # Start date for last 30 days
+        start_30_days = (now - dt_module.timedelta(days=30)).strftime("%Y-%m-%d")
+        if start_30_days < earliest_date_str:
+            start_30_days = earliest_date_str
+            
+        headers_analytics = [
+            "ФИО сотрудника", "Должность", 
+            "Всего отчетов (за 30 дн)", "Сдано (за 30 дн)", "Опозданий (за 30 дн)", "Замечаний (за 30 дн)", "Пропущено (за 30 дн)", "% Сдачи (за 30 дн)",
+            "Всего отчетов (всё время)", "Сдано (всё время)", "Опозданий (всё время)", "Замечаний (всё время)", "Пропущено (всё время)", "% Сдачи (всё время)"
+        ]
+        
+        rows_analytics = [headers_analytics]
+        for w in workers:
+            if not w["is_active"]:
+                continue
+            
+            stats_30 = calculate_worker_stats(w, start_30_days, end_date_str, conn)
+            stats_all = calculate_worker_stats(w, earliest_date_str, end_date_str, conn)
+            
+            rows_analytics.append([
+                f"{w['last_name']} {w['first_name']}",
+                str(w["position"]),
+                str(stats_30["expected"]),
+                str(stats_30["submitted"]),
+                str(stats_30["lates"]),
+                str(stats_30["remarks"]),
+                str(stats_30["missed"]),
+                f"{stats_30['percent']:.1f}%",
+                str(stats_all["expected"]),
+                str(stats_all["submitted"]),
+                str(stats_all["lates"]),
+                str(stats_all["remarks"]),
+                str(stats_all["missed"]),
+                f"{stats_all['percent']:.1f}%"
+            ])
+            
+        conn.close()
+        safe_update(ws_analytics, rows_analytics)
+        
+        return True, None
         
     except Exception as e:
         import logging
         logging.getLogger(__name__).error(f"[GSheets Sync Error] {e}")
+        return False, str(e)
 
 def async_sync_gsheets_background():
     import threading
