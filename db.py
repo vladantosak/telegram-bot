@@ -66,6 +66,10 @@ def get_db():
 def now_local() -> datetime:
     return datetime.now(LOCAL_TZ)
 
+async def run_db(func, *args, **kwargs):
+    import asyncio
+    return await asyncio.to_thread(func, *args, **kwargs)
+
 def init_db():
     conn = get_db()
     conn.execute(
