@@ -263,8 +263,11 @@ def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots:
             missing_passed.append(slot)
     if missing_passed:
         missing_passed.sort(key=lambda s: tuple(map(int, s.split(":"))))
-        return missing_passed[0], True
-    
+        target_slot = missing_passed[0]
+        h, m = map(int, target_slot.split(":"))
+        is_late = current_mins > h * 60 + m + LATE_THRESHOLD_MIN
+        return target_slot, is_late
+
     # Otherwise find nearest
     from bot import find_nearest_slot
     return find_nearest_slot(schedule, now)
