@@ -190,15 +190,24 @@ def get_worker(telegram_id: int):
 
 def get_all_workers():
     conn = get_db()
-    rows = conn.execute("SELECT * FROM workers ORDER BY position, sort_order, last_name, first_name").fetchall()
+    rows = conn.execute("SELECT * FROM workers ORDER BY object_id, sort_order, last_name, first_name").fetchall()
     conn.close()
     return rows
 
 def get_workers_by_position(position: str):
     conn = get_db()
     rows = conn.execute(
-        "SELECT * FROM workers WHERE lower(position) = lower(?) ORDER BY sort_order, last_name, first_name",
+        "SELECT * FROM workers WHERE lower(position) = lower(?) ORDER BY object_id, sort_order, last_name, first_name",
         (position,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+def get_workers_by_object_id(object_id: str):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM workers WHERE lower(object_id) = lower(?) ORDER BY sort_order, last_name, first_name",
+        (object_id,),
     ).fetchall()
     conn.close()
     return rows
@@ -830,22 +839,20 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
         # 1. Sync Workers to "Сотрудники"
         workers = get_all_workers()
         headers_workers = [
-            "telegram_id", "last_name", "first_name", "position", 
-            "group_id", "schedule", "needs_daily_fact", "object_id", 
-            "is_active", "sort_order"
+            "Отдел", "ФИО сотрудника", "Должность", "Telegram ID",
+            "ID Группы", "График", "Факт дня", "Активен", "Порядок сортировки"
         ]
         
         rows_workers = [headers_workers]
         for w in workers:
             rows_workers.append([
+                str(w["object_id"] or "Основной"),
+                f"{w['last_name']} {w['first_name']}",
+                str(w["position"] or "Не указано"),
                 str(w["telegram_id"]),
-                str(w["last_name"]),
-                str(w["first_name"]),
-                str(w["position"]),
                 str(w["group_id"]),
                 str(w["schedule"]),
                 "Да" if w["needs_daily_fact"] else "Нет",
-                str(w["object_id"]),
                 "Да" if w["is_active"] else "Нет",
                 str(w["sort_order"])
             ])
@@ -859,18 +866,38 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
         
         # 2. Sync Reports to "Отчеты"
         conn = get_db()
-        reports = conn.execute("SELECT * FROM reports ORDER BY id DESC").fetchall()
+        reports = conn.execute("""
+            SELECT r.*, w.last_name, w.first_name, w.position, w.object_id
+            FROM reports r
+            LEFT JOIN workers w ON r.telegram_id = w.telegram_id
+            ORDER BY r.id DESC
+        """).fetchall()
         
         headers_reports = [
-            "id", "telegram_id", "report_date", "report_type", "slot_time",
-            "received_at", "is_ok", "is_late", "format_comment", "required_action", "raw_text"
+            "ID отчета", "Telegram ID", "Отдел", "ФИО сотрудника", "Должность",
+            "Дата отчета", "Тип отчета", "Время слота", "Время получения",
+            "Оценка (ОК)", "Опоздание", "Замечания", "Действия", "Оригинальный текст"
         ]
         
         rows_reports = [headers_reports]
         for r in reports:
+            # Check if unregistered user has pending info
+            fio = ""
+            if r["last_name"] and r["first_name"]:
+                fio = f"{r['last_name']} {r['first_name']}"
+            else:
+                pending = conn.execute("SELECT first_name, last_name FROM pending_unregistered_users WHERE telegram_id = ?", (r["telegram_id"],)).fetchone()
+                if pending:
+                    fio = f"{pending['last_name']} {pending['first_name']} (Временный)"
+                else:
+                    fio = "Неизвестный сотрудник"
+
             rows_reports.append([
                 str(r["id"]),
                 str(r["telegram_id"]),
+                str(r["object_id"] or "Основной"),
+                fio,
+                str(r["position"] or "Не указано"),
                 str(r["report_date"]),
                 str(r["report_type"]),
                 str(r["slot_time"] or ""),
@@ -908,7 +935,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
             start_30_days = earliest_date_str
             
         headers_analytics = [
-            "ФИО сотрудника", "Должность", 
+            "Отдел", "ФИО сотрудника", "Должность", 
             "Всего отчетов (за 30 дн)", "Сдано (за 30 дн)", "Опозданий (за 30 дн)", "Замечаний (за 30 дн)", "Пропущено (за 30 дн)", "% Сдачи (за 30 дн)",
             "Всего отчетов (всё время)", "Сдано (всё время)", "Опозданий (всё время)", "Замечаний (всё время)", "Пропущено (всё время)", "% Сдачи (всё время)"
         ]
@@ -922,6 +949,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
             stats_all = calculate_worker_stats(w, earliest_date_str, end_date_str, conn)
             
             rows_analytics.append([
+                str(w["object_id"] or "Основной"),
                 f"{w['last_name']} {w['first_name']}",
                 str(w["position"]),
                 str(stats_30["expected"]),
