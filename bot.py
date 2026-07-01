@@ -36,14 +36,14 @@ from admin_handlers import (
     import_workers_start, import_workers_action, import_workers_file,
     register_start, register_lastname_received, register_firstname_received,
     settings_start, settings_action, cancel,
-    list_workers_action, export_reports_action, alert_time_start, alert_time_save,
+    list_workers_action, export_reports_start, export_reports_choice, alert_time_start, alert_time_save,
     remind_all_start, remind_all_send,
     save_gsheets_url, save_gsheets_creds, save_gsheets_creds_text,
     ASK_WORKER_ID, ASK_LASTNAME, ASK_FIRSTNAME, ASK_POSITION, ASK_GROUP,
     ASK_SCHEDULE, ASK_NEEDS_DAILY_FACT, ASK_REMOVE_DEPARTMENT, ASK_REMOVE_WORKER,
     ASK_DEPARTMENT, ASK_REG_LAST_NAME, ASK_REG_FIRST_NAME, ASK_SETTINGS_ACTION,
     ASK_CONFIRM_DELETE, ASK_IMPORT_ACTION, ASK_IMPORT_FILE, ASK_GSHEETS_URL,
-    ASK_GSHEETS_CREDS, ASK_REPORT_TIME, ASK_CONFIRM_REMIND
+    ASK_GSHEETS_CREDS, ASK_REPORT_TIME, ASK_CONFIRM_REMIND, ASK_EXPORT_TYPE
 )
 
 # Set up logging
@@ -218,7 +218,16 @@ def main():
 
     # Single-click actions
     application.add_handler(MessageHandler(filters.Regex("^📋 Сотрудники$"), list_workers_action))
-    application.add_handler(MessageHandler(filters.Regex("^📥 Выгрузить отчеты$"), export_reports_action))
+
+    # Export reports and sync ConversationHandler
+    export_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📥 Выгрузить отчеты$"), export_reports_start)],
+        states={
+            ASK_EXPORT_TYPE: [MessageHandler(safe_text_filter, export_reports_choice)],
+        },
+        fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
+    )
+    application.add_handler(export_handler)
 
     # Add worker ConversationHandler
     add_handler = ConversationHandler(
