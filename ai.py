@@ -1,0 +1,203 @@
+import os
+import hashlib
+import json
+import logging
+from groq import Groq
+
+logger = logging.getLogger(__name__)
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+groq_client = Groq(api_key=GROQ_API_KEY, timeout=120.0) if GROQ_API_KEY else None
+
+_ai_status_cache = {}
+_ai_clean_cache = {}
+
+def get_md5(text: str) -> str:
+    return hashlib.md5(text.strip().encode("utf-8")).hexdigest()
+
+def transcribe_audio(file_path: str) -> str:
+    if groq_client is None:
+        return "Не задан GROQ_API_KEY, аудио не распознано."
+    try:
+        with open(file_path, "rb") as f:
+            transcription = groq_client.audio.transcriptions.create(
+                file=(os.path.basename(file_path), f),
+                model="whisper-large-v3",
+                language="ru",
+                response_format="text",
+            )
+        return transcription.strip()
+    except Exception as e:
+        logger.error(f"Ошибка распознавания аудио: {e}")
+        return f"Ошибка распознавания аудио: {e}"
+
+CHECK_PROMPT_TEMPLATE = """
+Ты — опытный прораб строительного объекта.
+Твоя задача — проверить отчёт рабочего.
+Рабочие могут писать коротко, с ошибками, простыми словами.
+Ты должен понимать смысл, а не искать идеальную формулировку.
+
+Главный вопрос: СДЕЛАЛ ЛИ ЧЕЛОВЕК РАБОТУ ИЛИ НЕТ?
+
+{mode_instruction}
+
+=====================
+КАК ОЦЕНИВАТЬ
+=====================
+Отчёт считается ХОРОШИМ, если понятно:
+- какую работу выполнял человек
+- с чем он работал
+- какой процесс выполнялся
+Не требуй обязательно цифры.
+
+Примеры ХОРОШИХ отчётов:
+"работал на дробилке" -> хорошо
+"стоял на кране, подавал материал" -> хорошо
+"делал опалубку" -> хорошо
+
+=====================
+ПЛОХИЕ ОТЧЁТЫ
+=====================
+Отклонять: "работаю", "в процессе", "нормально", "всё сделал", "на объекте", "занимаюсь", если невозможно понять, что именно делал человек.
+
+=====================
+ФОРМАТ
+=====================
+Ответь только JSON:
+{{
+{json_type_field}"is_ok": true или false,
+"issue": "что не так",
+"required_action": "что написать сотруднику",
+"employee_message": "короткое сообщение сотруднику"
+}}
+
+Отчёт:
+{text}
+"""
+
+CLEAN_REPORT_PROMPT = """
+Ты — технический специалист, который оформляет отчёты строительной бригады.
+Тебе дают сообщение рабочего.
+Твоя задача: превратить его сообщение в понятный официальный отчёт.
+
+Правила:
+1. Не придумывай работу, которой не было.
+2. Сохраняй только смысл исходного сообщения.
+3. Исправляй ошибки и убирай слова-паразиты.
+
+Верни только готовый текст отчёта.
+
+Сообщение рабочего:
+{text}
+"""
+
+def clean_report(text: str) -> str:
+    if groq_client is None:
+        return text
+    h = get_md5(text)
+    if h in _ai_clean_cache:
+        return _ai_clean_cache[h]
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "Ты преобразуешь сообщения рабочих в официальные отчеты строительной бригады. Верни только готовый текст отчета без каких-либо комментариев и кавычек."},
+                {"role": "user", "content": CLEAN_REPORT_PROMPT.format(text=text)},
+            ],
+            max_tokens=400,
+            temperature=0,
+        )
+        res = response.choices[0].message.content.strip().strip('"').strip("'")
+        _ai_clean_cache[h] = res
+        return res
+    except Exception as e:
+        logger.error(f"Ошибка при очистке отчета: {e}")
+        return text
+
+def normalize_ai_result(data: dict, source_text: str, report_type: str | None = "status") -> dict:
+    if report_type not in ("status", "daily_fact"):
+        report_type = str(data.get("report_type", "status")).strip().lower()
+        if report_type not in ("status", "daily_fact"):
+            report_type = "status"
+
+    raw_ok = data.get("is_ok", False)
+    if isinstance(raw_ok, str):
+        is_ok = raw_ok.strip().lower() in ("true", "1", "yes", "да")
+    else:
+        is_ok = bool(raw_ok)
+
+    issue = str(data.get("issue") or data.get("format_comment") or "").strip()
+    required_action = str(data.get("required_action") or "").strip()
+    employee_message = str(data.get("employee_message") or "").strip()
+
+    if is_ok:
+        issue = ""
+        format_comment = "всё ОК"
+        required_action = "ничего не предпринимать"
+        employee_message = ""
+    else:
+        if not issue:
+            issue = "есть замечания по отчету"
+        format_comment = f"не ОК, {issue}"
+        required_action = f"сделал замечание сотруднику: {issue}"
+        if not employee_message:
+            employee_message = f"В отчете есть замечание: {issue}. В следующем отчете исправьте это."
+
+    return {
+        "report_type": report_type,
+        "is_ok": is_ok,
+        "format_comment": format_comment,
+        "required_action": required_action,
+        "employee_message": employee_message,
+    }
+
+def check_status(text: str, report_type: str | None = "status") -> dict:
+    is_forced = report_type in ("status", "daily_fact")
+
+    if is_forced:
+        report_type_label = "СТАТУС (отчёт о текущей работе в течение дня)" if report_type == "status" else "ИТОГ ДНЯ / ФАКТ (финальный отчёт о всей проделанной за день работе)"
+        report_type_hint = (
+            "Оценивай как промежуточный отчёт о том, чем человек занимается прямо сейчас."
+            if report_type == "status"
+            else "Оценивай как итоговый отчёт за весь рабочий день — ожидай более полного описания того, что было сделано в течение дня."
+        )
+        mode_instruction = (
+            f"ВАЖНО: тип отчёта уже точно определён системой по времени отправки — это {report_type_label}.\n"
+            f"Не пытайся определить тип отчёта сам, просто оцени содержание с учётом этого контекста:\n{report_type_hint}"
+        )
+        json_type_field = ""
+        cache_key_prefix = report_type
+    else:
+        mode_instruction = (
+            "ВАЖНО: отчёт прислан после окончания рабочего дня.\n"
+            "Определи тип отчёта по смыслу — что именно хотел сказать человек:\n"
+            "СТАТУС (status) — человек сообщает о том, чем он занимался в какой-то конкретный момент или период.\n"
+            "ИТОГ ДНЯ (daily_fact) — человек подводит итоги всего рабочего дня целиком.\n"
+            "Ключевой вопрос: человек описывает МОМЕНТ работы или ИТОГ ДНЯ?\n"
+            "Если по смыслу неясно — считай daily_fact."
+        )
+        json_type_field = '"report_type": "status" или "daily_fact",\n\n'
+        cache_key_prefix = "auto"
+
+    if groq_client is None:
+        return normalize_ai_result({"is_ok": False, "issue": "GROQ_API_KEY не задан"}, text, report_type if is_forced else None)
+    h = get_md5(f"{cache_key_prefix}:{text}")
+    if h in _ai_status_cache:
+        return _ai_status_cache[h]
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "Отвечай только валидным JSON без Markdown."},
+                {"role": "user", "content": CHECK_PROMPT_TEMPLATE.format(text=text, mode_instruction=mode_instruction, json_type_field=json_type_field)},
+            ],
+            max_tokens=400,
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content.strip()
+        res = normalize_ai_result(json.loads(raw), text, report_type if is_forced else None)
+        _ai_status_cache[h] = res
+        return res
+    except Exception as e:
+        return normalize_ai_result({"is_ok": False, "issue": f"Ошибка ИИ: {e}"}, text, report_type if is_forced else None)
