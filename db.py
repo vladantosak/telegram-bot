@@ -2,6 +2,7 @@ import os
 import sqlite3
 import json
 import hashlib
+import itertools
 from datetime import datetime
 import datetime as dt_module
 from zoneinfo import ZoneInfo
@@ -968,7 +969,192 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
             
         conn.close()
         safe_update(ws_analytics, rows_analytics)
-        
+
+        # 4. Sync Summary checkbox grid to "Сводка"
+        try:
+            ws_summary = sheet.worksheet("Сводка")
+        except gspread.exceptions.WorksheetNotFound:
+            ws_summary = sheet.add_worksheet(title="Сводка", rows="2000", cols="60")
+
+        # Clear merges/formatting/checkboxes left over from a previous sync before rebuilding the grid
+        sheet.batch_update({"requests": [
+            {"unmergeCells": {"range": {"sheetId": ws_summary.id}}},
+            {"repeatCell": {"range": {"sheetId": ws_summary.id}, "cell": {"userEnteredFormat": {}}, "fields": "userEnteredFormat"}},
+            {"setDataValidation": {"range": {"sheetId": ws_summary.id}}}
+        ]})
+
+        conn_sum = get_db()
+        SUMMARY_DAYS = 30
+        today_date = now.date()
+        date_list = []
+        d_iter = today_date - dt_module.timedelta(days=SUMMARY_DAYS)
+        while d_iter <= today_date:
+            if d_iter.weekday() < 5:
+                date_list.append(d_iter)
+            d_iter += dt_module.timedelta(days=1)
+
+        headers_summary = ["Сотрудник", "Время"] + [d.strftime("%d.%m") for d in date_list]
+        rows_summary = [headers_summary]
+
+        GREY = {"red": 0.85, "green": 0.85, "blue": 0.85}
+        YELLOW = {"red": 1.0, "green": 0.95, "blue": 0.6}
+        PINK = {"red": 0.96, "green": 0.78, "blue": 0.78}
+        DEPT_BG = {"red": 0.85, "green": 0.82, "blue": 0.93}
+
+        merge_requests = []
+        format_requests = []
+        checkbox_ranges = []
+
+        for dept, dept_workers in itertools.groupby(
+            (w for w in workers if w["is_active"]),
+            key=lambda w: str(w["object_id"] or "Основной")
+        ):
+            dept_row_idx = len(rows_summary)
+            rows_summary.append([dept] + [""] * (len(headers_summary) - 1))
+            merge_requests.append({
+                "mergeCells": {
+                    "range": {"sheetId": ws_summary.id, "startRowIndex": dept_row_idx, "endRowIndex": dept_row_idx + 1,
+                              "startColumnIndex": 0, "endColumnIndex": len(headers_summary)},
+                    "mergeType": "MERGE_ALL"
+                }
+            })
+            format_requests.append({
+                "repeatCell": {
+                    "range": {"sheetId": ws_summary.id, "startRowIndex": dept_row_idx, "endRowIndex": dept_row_idx + 1,
+                              "startColumnIndex": 0, "endColumnIndex": len(headers_summary)},
+                    "cell": {"userEnteredFormat": {"backgroundColor": DEPT_BG, "textFormat": {"bold": True}}},
+                    "fields": "userEnteredFormat(backgroundColor,textFormat)"
+                }
+            })
+
+            for w in dept_workers:
+                slots = SCHEDULES.get(w["schedule"], SCHEDULE_A)
+                join_row = conn_sum.execute(
+                    "SELECT MIN(report_date) as d FROM reports WHERE telegram_id = ?", (w["telegram_id"],)
+                ).fetchone()
+                hire_date = today_date
+                if join_row and join_row["d"]:
+                    try:
+                        hire_date = datetime.strptime(join_row["d"], "%Y-%m-%d").date()
+                    except ValueError:
+                        pass
+
+                start_str = date_list[0].strftime("%Y-%m-%d")
+                end_str = date_list[-1].strftime("%Y-%m-%d")
+                status_rows = conn_sum.execute(
+                    "SELECT report_date, slot_time, is_late, is_ok FROM reports "
+                    "WHERE telegram_id = ? AND report_type = 'status' AND report_date >= ? AND report_date <= ?",
+                    (w["telegram_id"], start_str, end_str)
+                ).fetchall()
+                status_map = {(r["report_date"], r["slot_time"]): r for r in status_rows}
+
+                not_working_dates = {
+                    r["report_date"] for r in conn_sum.execute(
+                        "SELECT report_date FROM reports WHERE telegram_id = ? AND report_type = 'not_working' "
+                        "AND report_date >= ? AND report_date <= ?",
+                        (w["telegram_id"], start_str, end_str)
+                    ).fetchall()
+                }
+
+                worker_start_row = len(rows_summary)
+                first_tracked_col = None
+
+                for slot in slots:
+                    row_cells = ["", slot]
+                    hour, minute = map(int, slot.split(":"))
+                    for col_idx, d in enumerate(date_list):
+                        abs_col = 2 + col_idx
+                        d_str = d.strftime("%Y-%m-%d")
+
+                        if d < hire_date:
+                            row_cells.append("-")
+                            continue
+
+                        if first_tracked_col is None or abs_col < first_tracked_col:
+                            first_tracked_col = abs_col
+
+                        if d_str in not_working_dates:
+                            row_cells.append(False)
+                            format_requests.append({
+                                "repeatCell": {
+                                    "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
+                                              "endRowIndex": len(rows_summary) + 1,
+                                              "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
+                                    "cell": {"userEnteredFormat": {"backgroundColor": GREY}},
+                                    "fields": "userEnteredFormat(backgroundColor)"
+                                }
+                            })
+                            continue
+
+                        if d == today_date:
+                            current_mins_now = now.hour * 60 + now.minute
+                            if current_mins_now <= hour * 60 + minute + LATE_THRESHOLD_MIN:
+                                row_cells.append("")
+                                continue
+
+                        rep = status_map.get((d_str, slot))
+                        if rep is not None:
+                            row_cells.append(True)
+                            if not rep["is_ok"]:
+                                format_requests.append({
+                                    "repeatCell": {
+                                        "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
+                                                  "endRowIndex": len(rows_summary) + 1,
+                                                  "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
+                                        "cell": {"userEnteredFormat": {"backgroundColor": PINK}},
+                                        "fields": "userEnteredFormat(backgroundColor)"
+                                    }
+                                })
+                            elif rep["is_late"]:
+                                format_requests.append({
+                                    "repeatCell": {
+                                        "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
+                                                  "endRowIndex": len(rows_summary) + 1,
+                                                  "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
+                                        "cell": {"userEnteredFormat": {"backgroundColor": YELLOW}},
+                                        "fields": "userEnteredFormat(backgroundColor)"
+                                    }
+                                })
+                        else:
+                            row_cells.append(False)
+
+                    rows_summary.append(row_cells)
+
+                name_text = f"{w['last_name']} {w['first_name']} ({w['position'] or 'Не указано'})"
+                rows_summary[worker_start_row][0] = name_text
+                merge_requests.append({
+                    "mergeCells": {
+                        "range": {"sheetId": ws_summary.id, "startRowIndex": worker_start_row,
+                                  "endRowIndex": worker_start_row + len(slots),
+                                  "startColumnIndex": 0, "endColumnIndex": 1},
+                        "mergeType": "MERGE_ALL"
+                    }
+                })
+
+                if first_tracked_col is not None:
+                    checkbox_ranges.append(
+                        (worker_start_row, worker_start_row + len(slots), first_tracked_col, len(headers_summary))
+                    )
+
+        conn_sum.close()
+        safe_update(ws_summary, rows_summary)
+
+        checkbox_requests = [
+            {
+                "setDataValidation": {
+                    "range": {"sheetId": ws_summary.id, "startRowIndex": r0, "endRowIndex": r1,
+                              "startColumnIndex": c0, "endColumnIndex": c1},
+                    "rule": {"condition": {"type": "BOOLEAN"}, "strict": True}
+                }
+            }
+            for (r0, r1, c0, c1) in checkbox_ranges
+        ]
+
+        all_requests = merge_requests + format_requests + checkbox_requests
+        if all_requests:
+            for i in range(0, len(all_requests), 400):
+                sheet.batch_update({"requests": all_requests[i:i + 400]})
+
         return True, None
         
     except Exception as e:
