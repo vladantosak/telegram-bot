@@ -204,7 +204,7 @@ def main():
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
     )
-    application.add_module_handler(add_handler)
+    application.add_handler(add_handler)
 
     # Delete worker ConversationHandler
     delete_handler = ConversationHandler(
@@ -216,7 +216,7 @@ def main():
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
     )
-    application.add_module_handler(delete_handler)
+    application.add_handler(delete_handler)
 
     # View Department workers
     view_dept_handler = ConversationHandler(
@@ -226,7 +226,7 @@ def main():
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
     )
-    application.add_module_handler(view_dept_handler)
+    application.add_handler(view_dept_handler)
 
     # Import workers
     import_handler = ConversationHandler(
@@ -237,7 +237,7 @@ def main():
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
     )
-    application.add_module_handler(import_handler)
+    application.add_handler(import_handler)
 
     # Settings panel
     settings_handler = ConversationHandler(
@@ -247,7 +247,7 @@ def main():
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
     )
-    application.add_module_handler(settings_handler)
+    application.add_handler(settings_handler)
 
     # Registration Handler
     registration_handler = ConversationHandler(
@@ -258,7 +258,7 @@ def main():
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
     )
-    application.add_module_handler(registration_handler)
+    application.add_handler(registration_handler)
 
     # Global message report catcher
     application.add_handler(MessageHandler(
