@@ -58,7 +58,10 @@ CHECK_PROMPT_TEMPLATE = """
 =====================
 ПЛОХИЕ ОТЧЁТЫ
 =====================
-Отклонять: "работаю", "в процессе", "нормально", "всё сделал", "на объекте", "занимаюсь", если невозможно понять, что именно делал человек.
+Отклонять: "работаю", "в процессе", "нормально", "всё сделал", "на объекте", "занимаюсь", если невозможно понять, что именно делал человек. Если в отчете не указан объем или детали работы, причиной (issue) напиши строго "не указал объем работы".
+
+Если текст пустой, или рабочий на видео ничего не говорил, причиной (issue) напиши строго "на видео молчал".
+Если в тексте написано "неразборчиво" или речь совсем непонятна, причиной (issue) напиши строго "неразборчивый текст".
 
 =====================
 ФОРМАТ
@@ -66,7 +69,8 @@ CHECK_PROMPT_TEMPLATE = """
 Ответь только JSON:
 {{
 {json_type_field}"is_ok": true или false,
-"issue": "что не так",
+"issue": "причина (например: 'не указал объем работы', 'на видео молчал', 'неразборчивый текст' или краткое описание замечания если is_ok=false). Если is_ok=true, то оставь пустым.",
+"format_comment": "краткое резюме сделанного дела на русском языке без лишних слов (например: 'сварка перемычек', 'уборка берега', 'сказал что сделал'). Если не ок - укажи причину.",
 "required_action": "что написать сотруднику",
 "employee_message": "короткое сообщение сотруднику"
 }}
@@ -126,19 +130,46 @@ def normalize_ai_result(data: dict, source_text: str, report_type: str | None = 
     else:
         is_ok = bool(raw_ok)
 
-    issue = str(data.get("issue") or data.get("format_comment") or "").strip()
+    issue = str(data.get("issue") or "").strip()
+    format_comment = str(data.get("format_comment") or "").strip()
     required_action = str(data.get("required_action") or "").strip()
     employee_message = str(data.get("employee_message") or "").strip()
 
+    # Rule-based overrides for silence/unintelligibility
+    lower_src = source_text.lower().strip()
+    if not lower_src or any(x in lower_src for x in ("на видео молчал", "[без звука]", "[тишина]", "[вздох]", "без звука", "тишина", "музыка", "молчание", "молчал", "молчит", "шум")):
+        is_ok = False
+        issue = "на видео молчал"
+        format_comment = "на видео молчал"
+        required_action = "сделал замечание: на видео молчал"
+        employee_message = "Пожалуйста, сдавайте отчет голосом — вы молчали на видео."
+    elif any(x in lower_src for x in ("неразборчиво", "неразборчивый текст", "шумы", "помехи", "неразборчивая речь")):
+        is_ok = False
+        issue = "неразборчивый текст"
+        format_comment = "неразборчивый текст"
+        required_action = "сделал замечание: неразборчивый текст"
+        employee_message = "Голос на видео неразборчив, пожалуйста, перезапишите отчет."
+
     if is_ok:
         issue = ""
-        format_comment = "всё ОК"
+        # Ensure format_comment describes what they did, but is prefixed by OK
+        if not format_comment or format_comment.lower() in ("всё ок", "все ок", "ок", "всё хорошо"):
+            format_comment = "сказал что сделал"
+        if format_comment.startswith("ОК") or format_comment.startswith("OK"):
+            pass
+        else:
+            format_comment = f"ОК - {format_comment}"
         required_action = "ничего не предпринимать"
         employee_message = ""
     else:
-        if not issue:
-            issue = "есть замечания по отчету"
-        format_comment = f"не ОК, {issue}"
+        if not issue or issue.lower() in ("всё ок", "все ок", "ок", "всё хорошо"):
+            issue = "не указал объем работы"
+        if not format_comment or format_comment.lower() in ("всё ок", "все ок", "ок", "всё хорошо"):
+            format_comment = issue
+        if format_comment.startswith("не ОК") or format_comment.startswith("не ок") or format_comment.startswith("НЕ ОК"):
+            pass
+        else:
+            format_comment = f"не ОК - {format_comment}"
         required_action = f"сделал замечание сотруднику: {issue}"
         if not employee_message:
             employee_message = f"В отчете есть замечание: {issue}. В следующем отчете исправьте это."
@@ -149,6 +180,7 @@ def normalize_ai_result(data: dict, source_text: str, report_type: str | None = 
         "format_comment": format_comment,
         "required_action": required_action,
         "employee_message": employee_message,
+        "issue": issue
     }
 
 def check_status(text: str, report_type: str | None = "status") -> dict:
