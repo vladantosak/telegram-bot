@@ -636,6 +636,62 @@ def generate_and_send_gsheets(*args, **kwargs):
 def fetch_export_data():
     return get_all_workers()
 
+def export_reports_to_excel() -> bytes:
+    import openpyxl
+    from openpyxl import Workbook
+    import io
+    
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Reports"
+    
+    headers = [
+        "ID отчета", "ID сотрудника", "Фамилия", "Имя", "Должность (Отдел)",
+        "Дата отчета", "Тип отчета", "Время слота", "Время получения",
+        "Оценка (ОК)", "Опоздание", "Замечания", "Действия", "Оригинальный текст"
+    ]
+    ws.append(headers)
+    
+    conn = get_db()
+    reports = conn.execute("SELECT * FROM reports ORDER BY report_date DESC, id DESC").fetchall()
+    
+    # Cache worker profiles
+    workers_cache = {}
+    
+    for r in reports:
+        t_id = r["telegram_id"]
+        if t_id not in workers_cache:
+            w_row = conn.execute("SELECT last_name, first_name, position FROM workers WHERE telegram_id = ?", (t_id,)).fetchone()
+            if w_row:
+                workers_cache[t_id] = (w_row["last_name"], w_row["first_name"], w_row["position"])
+            else:
+                workers_cache[t_id] = ("Неизвестно", "Неизвестно", "Неизвестно")
+                
+        last_name, first_name, position = workers_cache[t_id]
+        
+        ws.append([
+            r["id"],
+            r["telegram_id"],
+            last_name,
+            first_name,
+            position,
+            r["report_date"],
+            r["report_type"],
+            r["slot_time"] or "",
+            r["received_at"],
+            "Да" if r["is_ok"] else "Нет",
+            "Да" if r["is_late"] else "Нет",
+            r["format_comment"] or "",
+            r["required_action"] or "",
+            r["raw_text"] or ""
+        ])
+    
+    conn.close()
+    
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
 def export_workers_to_excel() -> bytes:
     import openpyxl
     from openpyxl import Workbook
