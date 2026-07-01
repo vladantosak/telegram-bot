@@ -1,10 +1,50 @@
 import os
+import html
+import re
 import asyncio
 import logging
 from datetime import datetime
 import datetime as dt_module
 from telegram import ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply, Update
 from telegram.ext import ContextTypes, ConversationHandler
+
+def parse_video_comments(format_comment_str: str) -> list[dict]:
+    items = []
+    if not format_comment_str:
+        return items
+    parts = format_comment_str.split("; ")
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r"^Видео\s+(\d+):\s*(ОК|не\s+ОК|НЕ\s+ОК)(?:\s*-\s*|\s+)?(.*)$", part, re.IGNORECASE)
+        if m:
+            num = int(m.group(1))
+            status_str = m.group(2).strip().lower()
+            is_ok = "не" not in status_str
+            comment = m.group(3).strip()
+            items.append({
+                "num": num,
+                "is_ok": is_ok,
+                "comment": comment,
+                "full": part
+            })
+        else:
+            items.append({
+                "num": len(items) + 1,
+                "is_ok": "не ок" not in part.lower(),
+                "comment": part,
+                "full": part
+            })
+    return items
+
+def rebuild_format_comment(video_items: list[dict]) -> str:
+    parts = []
+    for item in video_items:
+        status_label = "ОК" if item["is_ok"] else "не ОК"
+        comment_part = f" - {item['comment']}" if item["comment"] else ""
+        parts.append(f"Видео {item['num']}: {status_label}{comment_part}")
+    return "; ".join(parts)
 
 from db import (
     get_worker, get_submitted_status_slots, get_existing_report_row,
@@ -79,6 +119,70 @@ def make_report_keyboard(report_id: int, report_type: str | None = None) -> Inli
             InlineKeyboardButton(type_btn_text, callback_data=f"toggle_type_{report_id}")
         ]
     ])
+
+def make_video_selection_keyboard(report_id: int, action_type: str, video_items: list[dict]) -> InlineKeyboardMarkup:
+    prefix = "tg" if action_type == "toggle" else "ed"
+    buttons = []
+    
+    if action_type == "toggle":
+        buttons.append([InlineKeyboardButton("🔄 Общая оценка", callback_data=f"{prefix}_overall_{report_id}")])
+    else:
+        buttons.append([InlineKeyboardButton("✏️ Общий комментарий", callback_data=f"{prefix}_overall_{report_id}")])
+        
+    for item in video_items:
+        num = item["num"]
+        if action_type == "toggle":
+            status_emoji = "✅ ОК" if item["is_ok"] else "⚠️ НЕ ОК"
+            btn_text = f"📹 Видео {num}: {status_emoji}"
+        else:
+            btn_text = f"📹 Видео {num}"
+        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"{prefix}_vid_{report_id}_{num}")])
+        
+    buttons.append([InlineKeyboardButton("❌ Назад", callback_data=f"back_to_main_{report_id}")])
+    return InlineKeyboardMarkup(buttons)
+
+async def render_report_message_from_row(report: dict, worker_name: str) -> tuple[str, InlineKeyboardMarkup]:
+    report_id = report["id"]
+    report_type = report["report_type"]
+    slot_time = report["slot_time"]
+    report_date = report["report_date"]
+    is_ok = bool(report["is_ok"])
+    format_comment = report["format_comment"] or ""
+    raw_text = report["raw_text"] or ""
+    
+    cleaned_text = await clean_report_async(raw_text)
+
+    status_line = format_status_or_fact_line(report_type, slot_time, report_date)
+    status_emoji = "✅" if is_ok else "⚠️"
+    
+    notify_lines = [
+        f"👤 <b>{html.escape(worker_name)}</b>",
+        f"📍 {html.escape(status_line)}",
+        f"Оценка: {status_emoji} {'ОК' if is_ok else 'НЕ ОК'}",
+    ]
+    
+    is_status_with_videos = (report_type == "status" and ("Видео" in format_comment or ";" in format_comment))
+    
+    if is_status_with_videos:
+        notify_lines.append("")
+        notify_lines.append("📹 <b>Детали по видео-статусам:</b>")
+        for comment_item in format_comment.split("; "):
+            if comment_item.strip():
+                notify_lines.append(f"  • {html.escape(comment_item.strip())}")
+    else:
+        notify_lines.append(f"Комментарий: {html.escape(format_comment)}")
+        
+    notify_lines.append("")
+    notify_lines.append("📝 <b>Официальный отчет:</b>")
+    notify_lines.append(f"\"{html.escape(cleaned_text)}\"")
+    notify_lines.append("")
+    notify_lines.append("🗣 <b>Оригинальный текст:</b>")
+    notify_lines.append(f"\"{html.escape(raw_text)}\"")
+    
+    notify_text = "\n".join(notify_lines)
+    inline_kbd = make_report_keyboard(report_id, report_type)
+    
+    return notify_text, inline_kbd
 
 def menu_for_user(user_id: int, chat_type: str = "private"):
     if is_admin(user_id) and chat_type == "private":
@@ -244,25 +348,21 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             logger.error(f"Ошибка копирования видео факта дня в чат {dest_chat}: {e}")
 
         # Fact reports CAN be notified to admins (only status notifications are restricted to group chat)
-        notify_text = (
-            f"{w_name}\n"
-            f"{format_status_or_fact_line('daily_fact', None, date_str)}\n"
-            f"Оценка ИИ: {'ОК' if ai_res['is_ok'] else 'НЕ ОК'}\n"
-            f"Комментарий ИИ: {ai_res['format_comment']}\n\n"
-            f"📝 Официальный отчет:\n\"{cleaned_text}\"\n\n"
-            f"🗣 Оригинальный текст:\n\"{text_content}\""
-        )
-        inline_kbd = make_report_keyboard(report_id, "daily_fact")
+        conn = get_db()
+        report_row = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        conn.close()
+
+        notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name)
 
         try:
             if copied_msg_id:
                 sent_notify_msg = await context.bot.send_message(
                     chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd,
-                    reply_to_message_id=copied_msg_id, parse_mode="Markdown"
+                    reply_to_message_id=copied_msg_id, parse_mode="HTML"
                 )
             else:
                 sent_notify_msg = await context.bot.send_message(
-                    chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd, parse_mode="Markdown"
+                    chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd, parse_mode="HTML"
                 )
             await run_db(set_report_group_message, report_id, dest_chat, sent_notify_msg.message_id)
         except Exception as e:
@@ -308,9 +408,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             new_comments = []
             for idx, s_item in enumerate(status_items, start=1 + existing_media_count):
                 res = s_item["ai_res"]
-                status_label = "ОК" if res["is_ok"] else "НЕ ОК"
-                issue_desc = "" if res["is_ok"] else f" ({res['format_comment']})"
-                new_comments.append(f"Видео {idx}: {status_label}{issue_desc}")
+                new_comments.append(f"Видео {idx}: {res['format_comment']}")
 
             if existing["format_comment"] and existing["format_comment"] != "всё ОК":
                 overall_format_comment = existing["format_comment"] + "; " + "; ".join(new_comments)
@@ -345,9 +443,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             new_comments = []
             for idx, s_item in enumerate(status_items, start=1):
                 res = s_item["ai_res"]
-                status_label = "ОК" if res["is_ok"] else "НЕ ОК"
-                issue_desc = "" if res["is_ok"] else f" ({res['format_comment']})"
-                new_comments.append(f"Видео {idx}: {status_label}{issue_desc}")
+                new_comments.append(f"Видео {idx}: {res['format_comment']}")
             overall_format_comment = "; ".join(new_comments)
 
             overall_is_ok = any(x["ai_res"]["is_ok"] for x in status_items)
@@ -423,30 +519,11 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 logger.warning(f"Не удалось удалить старую оценку {old_eval['group_message_id']}: {e}")
 
         # Construct beautiful general comment for the group!
-        status_line = format_status_or_fact_line("status", slot_time, date_str)
-        overall_status_emoji = "✅" if overall_is_ok else "⚠️"
+        conn = get_db()
+        report_row = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        conn.close()
 
-        notify_lines = [
-            f"👤 *{w_name}*",
-            f"📍 {status_line}",
-            f"Оценка: {overall_status_emoji} {'ОК' if overall_is_ok else 'НЕ ОК'}",
-            ""
-        ]
-
-        notify_lines.append("📹 *Детали по видео-статусам:*")
-        for comment_item in overall_format_comment.split("; "):
-            notify_lines.append(f"  • {comment_item}")
-        notify_lines.append("")
-
-        notify_lines.append(f"📝 *Официальный отчет:*")
-        notify_lines.append(f"\"{cleaned_text}\"")
-        notify_lines.append("")
-
-        notify_lines.append(f"🗣 *Оригинальный текст:*")
-        notify_lines.append(f"\"{combined_raw_text}\"")
-
-        notify_text = "\n".join(notify_lines)
-        inline_kbd = make_report_keyboard(report_id, "status")
+        notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name)
 
         # Send replying to the last forwarded video
         last_copied_msg_id = copied_msg_ids[-1] if copied_msg_ids else None
@@ -457,14 +534,14 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                     text=notify_text,
                     reply_markup=inline_kbd,
                     reply_to_message_id=last_copied_msg_id,
-                    parse_mode="Markdown"
+                    parse_mode="HTML"
                 )
             else:
                 sent_notify_msg = await context.bot.send_message(
                     chat_id=dest_chat,
                     text=notify_text,
                     reply_markup=inline_kbd,
-                    parse_mode="Markdown"
+                    parse_mode="HTML"
                 )
             await run_db(set_report_group_message, report_id, dest_chat, sent_notify_msg.message_id)
         except Exception as e:
@@ -501,11 +578,13 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if is_admin(user_id) and context.user_data.get("editing_comment_report_id"):
         report_id = context.user_data["editing_comment_report_id"]
+        video_num = context.user_data.get("editing_comment_video_num")
         original_chat_id = context.user_data.get("editing_comment_chat_id")
         original_msg_id = context.user_data.get("editing_comment_message_id")
         original_text = context.user_data.get("editing_comment_original_text", "")
         
-        del context.user_data["editing_comment_report_id"]
+        context.user_data.pop("editing_comment_report_id", None)
+        context.user_data.pop("editing_comment_video_num", None)
         context.user_data.pop("editing_comment_chat_id", None)
         context.user_data.pop("editing_comment_message_id", None)
         context.user_data.pop("editing_comment_original_text", None)
@@ -531,39 +610,54 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
             return
             
-        new_action = f"Комментарий изменен администратором вручную: {new_comment}"
-        conn.execute(
-            "UPDATE reports SET format_comment = ?, required_action = ? WHERE id = ?",
-            (new_comment, new_action, report_id)
-        )
+        if video_num is not None:
+            # We are editing a specific video's comment!
+            video_items = parse_video_comments(report["format_comment"])
+            for item in video_items:
+                if item["num"] == video_num:
+                    cleaned_comment = new_comment.strip()
+                    if cleaned_comment.lower().startswith("ок"):
+                        item["is_ok"] = True
+                        item["comment"] = cleaned_comment[2:].strip().lstrip("-").strip()
+                    elif cleaned_comment.lower().startswith("не ок"):
+                        item["is_ok"] = False
+                        item["comment"] = cleaned_comment[5:].strip().lstrip("-").strip()
+                    else:
+                        item["comment"] = cleaned_comment
+                        
+            new_format_comment = rebuild_format_comment(video_items)
+            new_overall_ok = all(item["is_ok"] for item in video_items)
+            new_action = f"Комментарий видео {video_num} изменен администратором вручную: {new_comment}"
+            conn.execute(
+                "UPDATE reports SET format_comment = ?, is_ok = ?, required_action = ? WHERE id = ?",
+                (new_format_comment, 1 if new_overall_ok else 0, new_action, report_id)
+            )
+        else:
+            # We are editing the overall / general comment!
+            new_action = f"Комментарий изменен администратором вручную: {new_comment}"
+            conn.execute(
+                "UPDATE reports SET format_comment = ?, required_action = ? WHERE id = ?",
+                (new_comment, new_action, report_id)
+            )
+            
         report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
         worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
         conn.commit()
         conn.close()
+        
         async_sync_gsheets_background()
         
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
-        status_emoji = "✅" if report["is_ok"] == 1 else "⚠️"
+        text, kbd = await render_report_message_from_row(report, worker_name)
         
         if original_chat_id and original_msg_id:
             try:
-                if "Официальный отчет:" not in (original_text or ""):
-                    updated_text = (
-                        f"🔧 Оценка отчета изменена вручную администратором @{update.effective_user.username or user_id}:\n"
-                        f"Сотрудник: {worker_name}\n"
-                        f"Дата отчета: {report['report_date']}\n"
-                        f"Статус: {report['slot_time'] or report['report_type']}\n"
-                        f"Новый статус: {status_emoji} ({new_comment})"
-                    )
-                else:
-                    updated_text = update_message_text_fields(original_text, report["is_ok"] == 1, new_comment)
-                
-                kbd = make_report_keyboard(report_id, report["report_type"])
                 await context.bot.edit_message_text(
                     chat_id=original_chat_id,
                     message_id=original_msg_id,
-                    text=updated_text,
-                    reply_markup=kbd
+                    text=text,
+                    reply_markup=kbd,
+                    parse_mode="HTML"
                 )
             except Exception as e:
                 logger.error(f"Ошибка при обновлении сообщения после редактирования комментария: {e}")
@@ -873,3 +967,237 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(tmp_path)
             except Exception:
                 pass
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await query.answer("У вас нет прав администратора.", show_alert=True)
+        return
+        
+    data = query.data
+    logger.info(f"Получен callback_query: {data} от администратора {user_id}")
+    
+    # 1. Back to main menu
+    if data.startswith("back_to_main_"):
+        report_id = int(data.split("_")[-1])
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone() if report else None
+        conn.close()
+        
+        if report and worker:
+            worker_name = f"{worker['last_name']} {worker['first_name']}"
+            text, kbd = await render_report_message_from_row(report, worker_name)
+            try:
+                await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Ошибка при возврате к основному меню: {e}")
+        return
+
+    # 2. Toggle type (status <-> daily_fact)
+    if data.startswith("toggle_type_"):
+        report_id = int(data.split("_")[-1])
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        if not report:
+            conn.close()
+            return
+            
+        new_type = "daily_fact" if report["report_type"] == "status" else "status"
+        new_slot_time = report["slot_time"]
+        if new_type == "status" and not new_slot_time:
+            new_slot_time = "10:00"
+            
+        conn.execute("UPDATE reports SET report_type = ?, slot_time = ? WHERE id = ?", (new_type, new_slot_time, report_id))
+        conn.commit()
+        
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
+        conn.close()
+        
+        async_sync_gsheets_background()
+        
+        worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+        text, kbd = await render_report_message_from_row(report, worker_name)
+        try:
+            await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Ошибка при изменении типа отчета: {e}")
+        return
+
+    # 3. Main Toggle Button -> Choose overall or video
+    if data.startswith("fix_toggle_"):
+        report_id = int(data.split("_")[-1])
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        conn.close()
+        
+        if not report:
+            return
+            
+        video_items = parse_video_comments(report["format_comment"])
+        if len(video_items) > 1:
+            kbd = make_video_selection_keyboard(report_id, "toggle", video_items)
+            try:
+                await query.edit_message_reply_markup(reply_markup=kbd)
+            except Exception as e:
+                logger.error(f"Ошибка при показе меню выбора видео для toggling: {e}")
+        else:
+            new_is_ok = 0 if report["is_ok"] == 1 else 1
+            new_format_comment = report["format_comment"] or ""
+            if video_items:
+                video_items[0]["is_ok"] = (new_is_ok == 1)
+                new_format_comment = rebuild_format_comment(video_items)
+                
+            conn = get_db()
+            conn.execute("UPDATE reports SET is_ok = ?, format_comment = ? WHERE id = ?", (new_is_ok, new_format_comment, report_id))
+            conn.commit()
+            report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
+            conn.close()
+            
+            async_sync_gsheets_background()
+            
+            worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+            text, kbd = await render_report_message_from_row(report, worker_name)
+            try:
+                await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Ошибка при непосредственном изменении оценки: {e}")
+        return
+
+    # 4. Toggle Overall
+    if data.startswith("tg_overall_"):
+        report_id = int(data.split("_")[-1])
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        if not report:
+            conn.close()
+            return
+            
+        new_is_ok = 0 if report["is_ok"] == 1 else 1
+        conn.execute("UPDATE reports SET is_ok = ? WHERE id = ?", (new_is_ok, report_id))
+        conn.commit()
+        
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
+        conn.close()
+        
+        async_sync_gsheets_background()
+        
+        worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+        text, kbd = await render_report_message_from_row(report, worker_name)
+        try:
+            await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Ошибка при изменении общей оценки: {e}")
+        return
+
+    # 5. Toggle Individual Video Assessment
+    if data.startswith("tg_vid_"):
+        parts = data.split("_")
+        report_id = int(parts[2])
+        video_num = int(parts[3])
+        
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        if not report:
+            conn.close()
+            return
+            
+        video_items = parse_video_comments(report["format_comment"])
+        for item in video_items:
+            if item["num"] == video_num:
+                item["is_ok"] = not item["is_ok"]
+                
+        new_overall_ok = all(item["is_ok"] for item in video_items)
+        new_format_comment = rebuild_format_comment(video_items)
+        
+        conn.execute(
+            "UPDATE reports SET is_ok = ?, format_comment = ? WHERE id = ?",
+            (1 if new_overall_ok else 0, new_format_comment, report_id)
+        )
+        conn.commit()
+        
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
+        conn.close()
+        
+        async_sync_gsheets_background()
+        
+        worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+        text, kbd = await render_report_message_from_row(report, worker_name)
+        try:
+            await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Ошибка при изменении оценки видео: {e}")
+        return
+
+    # 6. Main Edit Comment Button -> Choose overall or video
+    if data.startswith("edit_comment_"):
+        report_id = int(data.split("_")[-1])
+        conn = get_db()
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        conn.close()
+        
+        if not report:
+            return
+            
+        video_items = parse_video_comments(report["format_comment"])
+        if len(video_items) > 1:
+            kbd = make_video_selection_keyboard(report_id, "edit", video_items)
+            try:
+                await query.edit_message_reply_markup(reply_markup=kbd)
+            except Exception as e:
+                logger.error(f"Ошибка при показе меню выбора видео для editing: {e}")
+        else:
+            context.user_data["editing_comment_report_id"] = report_id
+            context.user_data["editing_comment_video_num"] = None
+            context.user_data["editing_comment_chat_id"] = query.message.chat.id
+            context.user_data["editing_comment_message_id"] = query.message.message_id
+            context.user_data["editing_comment_original_text"] = query.message.text
+            
+            prompt_msg = await query.message.reply_text(
+                "✏️ Введите новый комментарий к отчету:\n(или введите «Отмена»)",
+                reply_markup=ForceReply(selective=True)
+            )
+            context.user_data["editing_comment_prompt_message_id"] = prompt_msg.message_id
+        return
+
+    # 7. Edit Overall Comment
+    if data.startswith("ed_overall_"):
+        report_id = int(data.split("_")[-1])
+        context.user_data["editing_comment_report_id"] = report_id
+        context.user_data["editing_comment_video_num"] = None
+        context.user_data["editing_comment_chat_id"] = query.message.chat.id
+        context.user_data["editing_comment_message_id"] = query.message.message_id
+        context.user_data["editing_comment_original_text"] = query.message.text
+        
+        prompt_msg = await query.message.reply_text(
+            "✏️ Введите новый общий комментарий к отчету:\n(или введите «Отмена»)",
+            reply_markup=ForceReply(selective=True)
+        )
+        context.user_data["editing_comment_prompt_message_id"] = prompt_msg.message_id
+        return
+
+    # 8. Edit Specific Video Comment
+    if data.startswith("ed_vid_"):
+        parts = data.split("_")
+        report_id = int(parts[2])
+        video_num = int(parts[3])
+        
+        context.user_data["editing_comment_report_id"] = report_id
+        context.user_data["editing_comment_video_num"] = video_num
+        context.user_data["editing_comment_chat_id"] = query.message.chat.id
+        context.user_data["editing_comment_message_id"] = query.message.message_id
+        context.user_data["editing_comment_original_text"] = query.message.text
+        
+        prompt_msg = await query.message.reply_text(
+            f"✏️ Введите новый комментарий для Видео {video_num}:\n(или введите «Отмена»)",
+            reply_markup=ForceReply(selective=True)
+        )
+        context.user_data["editing_comment_prompt_message_id"] = prompt_msg.message_id
+        return
