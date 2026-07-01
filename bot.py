@@ -4,14 +4,6 @@ import sys
 dir_path = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, dir_path)
 
-print(f"[DIAGNOSTIC] __file__: {__file__}", flush=True)
-print(f"[DIAGNOSTIC] dir_path: {dir_path}", flush=True)
-print(f"[DIAGNOSTIC] sys.path: {sys.path}", flush=True)
-try:
-    print(f"[DIAGNOSTIC] listdir: {os.listdir(dir_path)}", flush=True)
-except Exception as e:
-    print(f"[DIAGNOSTIC] listdir failed: {e}", flush=True)
-
 import logging
 import asyncio
 import json
