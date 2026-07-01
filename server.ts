@@ -11,7 +11,7 @@ app.use(express.json());
 // Helper to run python DB query safely without native node modules
 function runPythonQuery(pythonCode: string): Promise<any> {
   return new Promise((resolve, reject) => {
-    const py = spawn("python3", ["-c", pythonCode]);
+    const py = spawn("python3", ["-c", pythonCode], { cwd: process.cwd() });
     let stdout = "";
     let stderr = "";
     py.stdout.on("data", (data) => (stdout += data.toString()));
@@ -55,7 +55,7 @@ function startBot() {
   botStatus = "Starting";
   
   // Use absolute path or execute in current folder
-  botProcess = spawn("python3", ["bot.py"]);
+  botProcess = spawn("python3", ["bot.py"], { cwd: process.cwd() });
   botStatus = "Running";
 
   botProcess.stdout?.on("data", (data) => {
