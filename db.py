@@ -979,6 +979,49 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
         FROZEN_ROWS = 1
         FROZEN_COLS = 2
 
+        # Read the currently published grid (values + notes) before wiping it, so manual edits
+        # survive the rewrite: a checkbox someone ticked by hand is never flipped back to unchecked,
+        # and a manually-added note is carried forward if we don't have a fresh one to replace it.
+        old_map = {}
+        try:
+            meta = sheet.fetch_sheet_metadata({"ranges": ws_summary.title, "includeGridData": "true"})
+            old_grid = []
+            for s in meta.get("sheets", []):
+                if s.get("properties", {}).get("sheetId") == ws_summary.id:
+                    data = s.get("data", [])
+                    if data:
+                        old_grid = data[0].get("rowData", [])
+                    break
+
+            if old_grid:
+                header_vals = old_grid[0].get("values", [])
+                old_date_cols = {
+                    idx: cell.get("formattedValue")
+                    for idx, cell in enumerate(header_vals)
+                    if idx >= 2 and cell.get("formattedValue")
+                }
+                current_name = None
+                for row in old_grid[1:]:
+                    vals = row.get("values", [])
+                    if not vals:
+                        continue
+                    name_cell_text = vals[0].get("formattedValue") if len(vals) > 0 else None
+                    slot_cell_text = vals[1].get("formattedValue") if len(vals) > 1 else None
+                    if name_cell_text:
+                        current_name = name_cell_text
+                    if not slot_cell_text or current_name is None:
+                        continue
+                    for idx, date_label in old_date_cols.items():
+                        if idx >= len(vals):
+                            continue
+                        cell = vals[idx]
+                        old_map[(current_name, slot_cell_text, date_label)] = {
+                            "bool": cell.get("effectiveValue", {}).get("boolValue"),
+                            "note": cell.get("note")
+                        }
+        except Exception:
+            old_map = {}
+
         # Clear merges/formatting/checkboxes left over from a previous sync before rebuilding the grid,
         # and pin the freeze pane to a known state (mergeCells rejects ranges that straddle the
         # frozen/non-frozen column boundary, so every merge below must respect FROZEN_COLS).
@@ -993,10 +1036,10 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
         ]})
 
         conn_sum = get_db()
-        SUMMARY_DAYS = 30
         today_date = now.date()
+        month_start = today_date.replace(day=1)
         date_list = []
-        d_iter = today_date - dt_module.timedelta(days=SUMMARY_DAYS)
+        d_iter = month_start
         while d_iter <= today_date:
             if d_iter.weekday() < 5:
                 date_list.append(d_iter)
@@ -1006,12 +1049,11 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
         rows_summary = [headers_summary]
 
         GREY = {"red": 0.85, "green": 0.85, "blue": 0.85}
-        YELLOW = {"red": 1.0, "green": 0.95, "blue": 0.6}
-        PINK = {"red": 0.96, "green": 0.78, "blue": 0.78}
         DEPT_BG = {"red": 0.85, "green": 0.82, "blue": 0.93}
 
         merge_requests = []
         format_requests = []
+        note_requests = []
         checkbox_ranges = []
 
         for dept, dept_workers in itertools.groupby(
@@ -1060,7 +1102,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                 start_str = date_list[0].strftime("%Y-%m-%d")
                 end_str = date_list[-1].strftime("%Y-%m-%d")
                 status_rows = conn_sum.execute(
-                    "SELECT report_date, slot_time, is_late, is_ok FROM reports "
+                    "SELECT report_date, slot_time, is_late, is_ok, format_comment, required_action FROM reports "
                     "WHERE telegram_id = ? AND report_type = 'status' AND report_date >= ? AND report_date <= ?",
                     (w["telegram_id"], start_str, end_str)
                 ).fetchall()
@@ -1074,6 +1116,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                     ).fetchall()
                 }
 
+                name_text = f"{w['last_name']} {w['first_name']} ({w['position'] or 'Не указано'})"
                 worker_start_row = len(rows_summary)
                 first_tracked_col = None
 
@@ -1083,6 +1126,9 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                     for col_idx, d in enumerate(date_list):
                         abs_col = 2 + col_idx
                         d_str = d.strftime("%Y-%m-%d")
+                        date_label = headers_summary[abs_col]
+                        old_entry = old_map.get((name_text, slot, date_label))
+                        fresh_note = None
 
                         if d < hire_date:
                             row_cells.append("-")
@@ -1092,7 +1138,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                             first_tracked_col = abs_col
 
                         if d_str in not_working_dates:
-                            row_cells.append(False)
+                            cell_value = False
                             format_requests.append({
                                 "repeatCell": {
                                     "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
@@ -1102,43 +1148,44 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                                     "fields": "userEnteredFormat(backgroundColor)"
                                 }
                             })
-                            continue
-
-                        if d == today_date:
-                            current_mins_now = now.hour * 60 + now.minute
-                            if current_mins_now <= hour * 60 + minute + LATE_THRESHOLD_MIN:
-                                row_cells.append("")
-                                continue
-
-                        rep = status_map.get((d_str, slot))
-                        if rep is not None:
-                            row_cells.append(True)
-                            if not rep["is_ok"]:
-                                format_requests.append({
-                                    "repeatCell": {
-                                        "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
-                                                  "endRowIndex": len(rows_summary) + 1,
-                                                  "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
-                                        "cell": {"userEnteredFormat": {"backgroundColor": PINK}},
-                                        "fields": "userEnteredFormat(backgroundColor)"
-                                    }
-                                })
-                            elif rep["is_late"]:
-                                format_requests.append({
-                                    "repeatCell": {
-                                        "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
-                                                  "endRowIndex": len(rows_summary) + 1,
-                                                  "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
-                                        "cell": {"userEnteredFormat": {"backgroundColor": YELLOW}},
-                                        "fields": "userEnteredFormat(backgroundColor)"
-                                    }
-                                })
+                        elif d == today_date and (now.hour * 60 + now.minute) <= hour * 60 + minute + LATE_THRESHOLD_MIN:
+                            cell_value = ""
                         else:
-                            row_cells.append(False)
+                            rep = status_map.get((d_str, slot))
+                            if rep is not None:
+                                cell_value = True
+                                note_parts = []
+                                if rep["is_late"]:
+                                    note_parts.append("Опоздание")
+                                if not rep["is_ok"]:
+                                    remark = (rep["format_comment"] or "").strip()
+                                    action = (rep["required_action"] or "").strip()
+                                    note_parts.append(f"Замечание: {remark}" if remark else "Есть замечание")
+                                    if action:
+                                        note_parts.append(f"Требуется: {action}")
+                                if note_parts:
+                                    fresh_note = "\n".join(note_parts)
+                            else:
+                                cell_value = False
+                                if old_entry and old_entry.get("bool") is True:
+                                    cell_value = True  # a manual tick in the sheet always wins over "missed"
+
+                        row_cells.append(cell_value)
+
+                        note_to_set = fresh_note or (old_entry.get("note") if old_entry else None)
+                        if note_to_set:
+                            note_requests.append({
+                                "updateCells": {
+                                    "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
+                                              "endRowIndex": len(rows_summary) + 1,
+                                              "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
+                                    "rows": [{"values": [{"note": note_to_set}]}],
+                                    "fields": "note"
+                                }
+                            })
 
                     rows_summary.append(row_cells)
 
-                name_text = f"{w['last_name']} {w['first_name']} ({w['position'] or 'Не указано'})"
                 rows_summary[worker_start_row][0] = name_text
                 merge_requests.append({
                     "mergeCells": {
@@ -1168,7 +1215,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
             for (r0, r1, c0, c1) in checkbox_ranges
         ]
 
-        all_requests = merge_requests + format_requests + checkbox_requests
+        all_requests = merge_requests + format_requests + checkbox_requests + note_requests
         if all_requests:
             for i in range(0, len(all_requests), 400):
                 sheet.batch_update({"requests": all_requests[i:i + 400]})
