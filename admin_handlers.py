@@ -20,7 +20,7 @@ from db import (
     export_workers_to_excel, read_excel, get_next_sort_order, fetch_export_data,
     generate_and_send_excel, generate_and_send_gsheets, get_violators_threshold,
     save_violators_threshold, now_local, set_quiet_mode, is_quiet_mode_enabled,
-    save_scheduled_times, get_scheduled_times
+    save_scheduled_times, get_scheduled_times, sync_gsheets_task
 )
 
 from report_handlers import menu_for_user
@@ -115,7 +115,7 @@ async def require_admin_check(update: Update) -> bool:
 async def settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin_check(update): return ConversationHandler.END
     kbd = ReplyKeyboardMarkup(
-        [["📊 Настроить Google Таблицу"], ["🗑 Очистить базу от удалённых сотрудников"], ["❌ Назад"]],
+        [["📊 Настроить Google Таблицу", "🔄 Синхронизировать сейчас"], ["🗑 Очистить базу от удалённых сотрудников"], ["❌ Назад"]],
         resize_keyboard=True
     )
     await update.message.reply_text("⚙️ Настройки бота. Выберите действие:", reply_markup=kbd)
@@ -123,6 +123,10 @@ async def settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     choice = update.message.text.strip()
+    kbd = ReplyKeyboardMarkup(
+        [["📊 Настроить Google Таблицу", "🔄 Синхронизировать сейчас"], ["🗑 Очистить базу от удалённых сотрудников"], ["❌ Назад"]],
+        resize_keyboard=True
+    )
     if choice == "❌ Назад":
         await update.message.reply_text("Главное меню.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
@@ -137,6 +141,26 @@ async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async_sync_gsheets_background()
         await update.message.reply_text(f"✅ Удалено {deleted} лишних записей отчетов.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
+
+    if choice == "🔄 Синхронизировать сейчас":
+        spreadsheet_id = get_setting("google_spreadsheet_id")
+        creds_str = get_setting("google_service_account")
+        if not spreadsheet_id or not creds_str:
+            await update.message.reply_text(
+                "❌ Google Таблица не настроена. Пожалуйста, сначала настройте Google Таблицу.",
+                reply_markup=kbd
+            )
+            return ASK_SETTINGS_ACTION
+            
+        await update.message.reply_text("⏳ Запускаю синхронизацию данных с Google Таблицей...")
+        import asyncio
+        success, err = await asyncio.to_thread(sync_gsheets_task)
+        if success:
+            await update.message.reply_text("🎉 **Синхронизация завершена успешно!**\nВсе листы (Сотрудники, Отчеты, Аналитика) обновлены.", reply_markup=MAIN_MENU, parse_mode="Markdown")
+            return ConversationHandler.END
+        else:
+            await update.message.reply_text(f"⚠️ **Ошибка синхронизации:**\n`{err}`", reply_markup=kbd, parse_mode="Markdown")
+            return ASK_SETTINGS_ACTION
 
     if choice == "📊 Настроить Google Таблицу":
         spreadsheet_id = get_setting("google_spreadsheet_id", "Не задан")
@@ -625,3 +649,106 @@ async def remind_all_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MAIN_MENU
     )
     return ConversationHandler.END
+
+def extract_spreadsheet_id(text: str) -> str:
+    text = text.strip()
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", text)
+    if match:
+        return match.group(1)
+    return text
+
+async def save_gsheets_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text.lower() == "отмена" or text == CANCEL_TEXT:
+        await update.message.reply_text("Действие отменено.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+        
+    sheet_id = extract_spreadsheet_id(text)
+    if not sheet_id:
+        await update.message.reply_text("❌ Не удалось распознать ID таблицы. Пожалуйста, отправьте корректную ссылку или ID:")
+        return ASK_GSHEETS_URL
+        
+    set_setting("google_spreadsheet_id", sheet_id)
+    
+    await update.message.reply_text(
+        f"✅ ID Google Таблицы сохранен: `{sheet_id}`\n\n"
+        f"Теперь, пожалуйста, **отправьте JSON-файл с ключами сервисного аккаунта** (credentials) как документ.\n"
+        f"Этот файл вы можете скачать из Google Cloud Console при создании ключа сервисного аккаунта.",
+        reply_markup=CANCEL_KEYBOARD,
+        parse_mode="Markdown"
+    )
+    return ASK_GSHEETS_CREDS
+
+async def save_gsheets_creds_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text.lower() == "отмена" or text == CANCEL_TEXT:
+        await update.message.reply_text("Действие отменено.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "❌ Пожалуйста, пришлите JSON-файл ключа сервисного аккаунта Google как документ (или введите «Отмена»):",
+        reply_markup=CANCEL_KEYBOARD
+    )
+    return ASK_GSHEETS_CREDS
+
+async def save_gsheets_creds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc:
+        await update.message.reply_text("❌ Пожалуйста, пришлите JSON-файл ключа сервисного аккаунта Google как документ:")
+        return ASK_GSHEETS_CREDS
+        
+    if not doc.file_name.lower().endswith(".json"):
+        await update.message.reply_text("❌ Файл должен иметь расширение .json. Пожалуйста, отправьте правильный файл:")
+        return ASK_GSHEETS_CREDS
+        
+    try:
+        # Download the file
+        file_obj = await context.bot.get_file(doc.file_id)
+        file_bytes = await file_obj.download_as_bytearray()
+        content = file_bytes.decode("utf-8")
+        
+        # Verify JSON
+        creds_dict = json.loads(content)
+        if "client_email" not in creds_dict or "private_key" not in creds_dict:
+            await update.message.reply_text(
+                "❌ Некорректный формат файла. Убедитесь, что это JSON-файл ключей сервисного аккаунта Google (содержит client_email и private_key):"
+            )
+            return ASK_GSHEETS_CREDS
+            
+        set_setting("google_service_account", content)
+        
+        email = creds_dict.get("client_email")
+        spreadsheet_id = get_setting("google_spreadsheet_id")
+        
+        await update.message.reply_text(
+            f"✅ Ключи сервисного аккаунта успешно сохранены!\n"
+            f"📧 Email сервисного аккаунта: `{email}`\n\n"
+            f"⚠️ **ВАЖНО:** Обязательно откройте доступ к вашей Google Таблице (кнопка 'Поделиться' в правом верхнем углу таблицы) на редактирование для этого email: `{email}`.\n\n"
+            f"Запускаю тестовую синхронизацию...",
+            reply_markup=MAIN_MENU,
+            parse_mode="Markdown"
+        )
+        
+        # Sync synchronously inside thread pool to verify and report success/failure immediately
+        import asyncio
+        from db import sync_gsheets_task
+        success, err = await asyncio.to_thread(sync_gsheets_task)
+        if success:
+            await update.message.reply_text(
+                "🎉 **Синхронизация с Google Таблицей прошла успешно!**\n"
+                "Данные о сотрудниках, отчетах и вкладка Аналитика обновлены в вашей таблице.",
+                reply_markup=MAIN_MENU,
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"⚠️ **Внимание:** Синхронизация завершилась с ошибкой:\n`{err}`\n\n"
+                f"Убедитесь, что вы выдали доступ (Поделиться) на редактирование сервисному аккаунту `{email}` в вашей таблице, после чего попробуйте запустить синхронизацию вручную из настроек.",
+                reply_markup=MAIN_MENU,
+                parse_mode="Markdown"
+            )
+            
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Ошибка при обработке файла credentials: {e}")
+        await update.message.reply_text(f"❌ Ошибка при чтении или разборе файла: {e}\nПожалуйста, пришлите корректный файл:")
+        return ASK_GSHEETS_CREDS
