@@ -11,7 +11,7 @@ from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update, InlineKey
 from telegram.ext import ContextTypes, ConversationHandler
 
 from db import (
-    get_db, run_db, get_worker, get_all_workers, get_workers_by_position,
+    get_db, run_db, get_worker, get_all_workers, get_workers_by_position, get_workers_by_object_id,
     find_unregistered_workers_by_lastname, bind_worker_id, upsert_worker,
     delete_worker, update_worker_field, get_object_group, save_object_group,
     get_group_name, get_group_name_async, fetch_and_save_group_name, get_all_group_names,
@@ -87,15 +87,15 @@ def schedule_description_text() -> str:
     return "\n".join(lines)
 
 def positions_keyboard(rows):
-    positions = sorted({row["position"] for row in rows})
-    keyboard = [[p] for p in positions]
+    departments = sorted({row["object_id"] or "Основной" for row in rows})
+    keyboard = [[d] for d in departments]
     keyboard.append(["❌ Отмена"])
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True), positions
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True), departments
 
 def numbered_workers_keyboard(rows):
     keyboard = []
     for i, row in enumerate(rows, 1):
-        keyboard.append([f"{i}. {row['last_name']} {row['first_name']}"])
+        keyboard.append([f"{i}. {row['last_name']} {row['first_name']} ({row['position'] or 'Не указано'})"])
     keyboard.append(["❌ Отмена"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -115,7 +115,7 @@ async def require_admin_check(update: Update) -> bool:
 async def settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin_check(update): return ConversationHandler.END
     kbd = ReplyKeyboardMarkup(
-        [["📊 Настроить Google Таблицу", "🔄 Синхронизировать сейчас"], ["🗑 Очистить базу от удалённых сотрудников"], ["❌ Назад"]],
+        [["📊 Настроить Google Таблицу", "🔗 Получить ссылку на таблицу"], ["🗑 Очистить базу от удалённых сотрудников"], ["❌ Назад"]],
         resize_keyboard=True
     )
     await update.message.reply_text("⚙️ Настройки бота. Выберите действие:", reply_markup=kbd)
@@ -124,7 +124,7 @@ async def settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     choice = update.message.text.strip()
     kbd = ReplyKeyboardMarkup(
-        [["📊 Настроить Google Таблицу", "🔄 Синхронизировать сейчас"], ["🗑 Очистить базу от удалённых сотрудников"], ["❌ Назад"]],
+        [["📊 Настроить Google Таблицу", "🔗 Получить ссылку на таблицу"], ["🗑 Очистить базу от удалённых сотрудников"], ["❌ Назад"]],
         resize_keyboard=True
     )
     if choice == "❌ Назад":
@@ -142,25 +142,22 @@ async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Удалено {deleted} лишних записей отчетов.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
 
-    if choice == "🔄 Синхронизировать сейчас":
+    if choice == "🔗 Получить ссылку на таблицу":
         spreadsheet_id = get_setting("google_spreadsheet_id")
-        creds_str = get_setting("google_service_account")
-        if not spreadsheet_id or not creds_str:
+        if not spreadsheet_id:
             await update.message.reply_text(
-                "❌ Google Таблица не настроена. Пожалуйста, сначала настройте Google Таблицу.",
+                "❌ Google Таблица не настроена. Пожалуйста, настройте её с помощью кнопки «📊 Настроить Google Таблицу».",
                 reply_markup=kbd
             )
-            return ASK_SETTINGS_ACTION
-            
-        await update.message.reply_text("⏳ Запускаю синхронизацию данных с Google Таблицей...")
-        import asyncio
-        success, err = await asyncio.to_thread(sync_gsheets_task)
-        if success:
-            await update.message.reply_text("🎉 **Синхронизация завершена успешно!**\nВсе листы (Сотрудники, Отчеты, Аналитика) обновлены.", reply_markup=MAIN_MENU, parse_mode="Markdown")
-            return ConversationHandler.END
         else:
-            await update.message.reply_text(f"⚠️ **Ошибка синхронизации:**\n`{err}`", reply_markup=kbd, parse_mode="Markdown")
-            return ASK_SETTINGS_ACTION
+            link = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+            await update.message.reply_text(
+                f"🔗 **Ссылка на вашу Google Таблицу:**\n{link}",
+                reply_markup=kbd,
+                parse_mode="Markdown",
+                disable_web_page_preview=False
+            )
+        return ASK_SETTINGS_ACTION
 
     if choice == "📊 Настроить Google Таблицу":
         spreadsheet_id = get_setting("google_spreadsheet_id", "Не задан")
@@ -285,8 +282,8 @@ async def delete_worker_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ASK_REMOVE_DEPARTMENT
 
 async def delete_worker_department(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    position = update.message.text.strip()
-    rows = get_workers_by_position(position)
+    dept = update.message.text.strip()
+    rows = get_workers_by_object_id(dept)
     if not rows: return ConversationHandler.END
     context.user_data["remove_rows"] = [dict(r) for r in rows]
     await update.message.reply_text("Выберите кого удалить:", reply_markup=numbered_workers_keyboard(rows))
@@ -303,7 +300,7 @@ async def delete_worker_finish(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["worker_to_delete"] = worker
     kbd = ReplyKeyboardMarkup([["Да, удалить", "Нет, отмена"]], resize_keyboard=True)
     await update.message.reply_text(
-        f"⚠️ Вы уверены, что хотите удалить сотрудника {worker['last_name']} {worker['first_name']} (ID: {worker['telegram_id']})?",
+        f"⚠️ Вы уверены, что хотите удалить сотрудника {worker['last_name']} {worker['first_name']} ({worker['position'] or 'Не указано'}) (ID: {worker['telegram_id']})?",
         reply_markup=kbd
     )
     return ASK_CONFIRM_DELETE
@@ -315,7 +312,7 @@ async def delete_worker_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         if worker:
             delete_worker(worker["telegram_id"])
             async_sync_gsheets_background()
-            await update.message.reply_text(f"✅ Сотрудник {worker['last_name']} успешно удален.", reply_markup=MAIN_MENU)
+            await update.message.reply_text(f"✅ Сотрудник {worker['last_name']} {worker['first_name']} успешно удален.", reply_markup=MAIN_MENU)
     else:
         await update.message.reply_text("Удаление сотрудника отменено.", reply_markup=MAIN_MENU)
     context.user_data.clear()
@@ -332,14 +329,14 @@ async def department_workers_start(update: Update, context: ContextTypes.DEFAULT
     return ASK_DEPARTMENT
 
 async def department_workers_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    position = update.message.text.strip()
-    rows = get_workers_by_position(position)
+    dept = update.message.text.strip()
+    rows = get_workers_by_object_id(dept)
     if not rows:
         await update.message.reply_text("Сотрудники не найдены.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
-    lines = [f"📋 Отдел: {position}"]
+    lines = [f"📋 Отдел: {dept}"]
     for i, r in enumerate(rows, 1):
-        lines.append(f"{i}. {r['last_name']} {r['first_name']}")
+        lines.append(f"{i}. {r['last_name']} {r['first_name']} ({r['position'] or 'Не указано'})")
     await update.message.reply_text("\n".join(lines), reply_markup=MAIN_MENU)
     return ConversationHandler.END
 
@@ -502,26 +499,26 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("В базе данных нет сотрудников.", reply_markup=MAIN_MENU)
         return
     
-    by_pos = {}
+    by_obj = {}
     for w in workers:
-        pos = w["position"] or "Не указано"
-        by_pos.setdefault(pos, []).append(w)
+        obj = w["object_id"] or "Основной"
+        by_obj.setdefault(obj, []).append(w)
     
-    lines = ["📋 <b>Список всех сотрудников:</b>\n"]
-    for pos, w_list in sorted(by_pos.items()):
-        lines.append(f"🏢 <b>Отдел: {html.escape(pos)}</b>")
+    lines = ["📋 <b>Список всех сотрудников по отделам:</b>\n"]
+    for obj, w_list in sorted(by_obj.items()):
+        lines.append(f"🏢 <b>Отдел: {html.escape(obj)}</b>")
         for i, w in enumerate(w_list, 1):
             status = "🟢 Акт" if w["is_active"] else "🔴 Неакт"
             ndf = "Да" if w["needs_daily_fact"] else "Нет"
             
             last_name = html.escape(w['last_name'] or '')
             first_name = html.escape(w['first_name'] or '')
+            position = html.escape(w['position'] or 'Не указано')
             schedule = html.escape(w['schedule'] or '')
-            object_id = html.escape(w['object_id'] or '')
             
             lines.append(
-                f"  {i}. {last_name} {first_name} (ID: <code>{w['telegram_id']}</code>)\n"
-                f"     График: {schedule} | Факт дня: {ndf} | Статус: {status} | Объект: {object_id}"
+                f"  {i}. {last_name} {first_name} ({position}) (ID: <code>{w['telegram_id']}</code>)\n"
+                f"     График: {schedule} | Факт дня: {ndf} | Статус: {status}"
             )
         lines.append("")
         
@@ -532,22 +529,66 @@ async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         await update.message.reply_text(full_text, reply_markup=MAIN_MENU, parse_mode="HTML")
 
-async def export_reports_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin_check(update): return
-    await update.message.reply_text("⏳ Формирую Excel файл с отчётами...", reply_markup=MAIN_MENU)
-    try:
-        from db import export_reports_to_excel
-        data = export_reports_to_excel()
-        bio = io.BytesIO(data)
-        bio.name = "reports.xlsx"
-        await update.message.reply_document(
-            document=bio,
-            filename="reports.xlsx",
-            caption="📋 Полная выгрузка отчётов из базы данных.",
-            reply_markup=MAIN_MENU
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при формировании файла отчётов: {e}", reply_markup=MAIN_MENU)
+EXPORT_MENU = ReplyKeyboardMarkup(
+    [
+        ["📊 Скачать Excel файл", "🔄 Синхронизировать сейчас"],
+        ["❌ Назад"]
+    ],
+    resize_keyboard=True
+)
+
+async def export_reports_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin_check(update): return ConversationHandler.END
+    await update.message.reply_text(
+        "📥 Выгрузка отчетов и синхронизация.\nВыберите действие:",
+        reply_markup=EXPORT_MENU
+    )
+    return ASK_EXPORT_TYPE
+
+async def export_reports_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    choice = update.message.text.strip()
+    if choice == "❌ Назад":
+        await update.message.reply_text("Главное меню.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+
+    if choice == "📊 Скачать Excel файл":
+        await update.message.reply_text("⏳ Формирую Excel файл с отчётами...", reply_markup=MAIN_MENU)
+        try:
+            from db import export_reports_to_excel
+            data = export_reports_to_excel()
+            bio = io.BytesIO(data)
+            bio.name = "reports.xlsx"
+            await update.message.reply_document(
+                document=bio,
+                filename="reports.xlsx",
+                caption="📋 Полная выгрузка отчётов из базы данных.",
+                reply_markup=MAIN_MENU
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка при формировании файла отчётов: {e}", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+
+    if choice == "🔄 Синхронизировать сейчас":
+        from db import get_setting, sync_gsheets_task
+        spreadsheet_id = get_setting("google_spreadsheet_id")
+        creds_str = get_setting("google_service_account")
+        if not spreadsheet_id or not creds_str:
+            await update.message.reply_text(
+                "❌ Google Таблица не настроена. Пожалуйста, сначала настройте Google Таблицу в «⚙️ Настройки бота».",
+                reply_markup=MAIN_MENU
+            )
+            return ConversationHandler.END
+            
+        await update.message.reply_text("⏳ Запускаю синхронизацию данных с Google Таблицей...", reply_markup=MAIN_MENU)
+        import asyncio
+        success, err = await asyncio.to_thread(sync_gsheets_task)
+        if success:
+            await update.message.reply_text("🎉 **Синхронизация завершена успешно!**\nВсе листы (Сотрудники, Отчеты, Аналитика) обновлены.", reply_markup=MAIN_MENU, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"⚠️ **Ошибка синхронизации:**\n`{err}`", reply_markup=MAIN_MENU, parse_mode="Markdown")
+        return ConversationHandler.END
+
+    return ASK_EXPORT_TYPE
 
 async def alert_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin_check(update): return ConversationHandler.END
