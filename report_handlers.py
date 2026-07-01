@@ -148,6 +148,7 @@ async def render_report_message_from_row(report: dict, worker_name: str) -> tupl
     report_date = report["report_date"]
     is_ok = bool(report["is_ok"])
     format_comment = report["format_comment"] or ""
+    required_action = report["required_action"] or ("Ничего не предпринимать, всё в порядке" if is_ok else "")
     raw_text = report["raw_text"] or ""
     
     cleaned_text = await clean_report_async(raw_text)
@@ -171,7 +172,9 @@ async def render_report_message_from_row(report: dict, worker_name: str) -> tupl
                 notify_lines.append(f"  • {html.escape(comment_item.strip())}")
     else:
         notify_lines.append(f"Комментарий: {html.escape(format_comment)}")
-        
+
+    notify_lines.append(f"⚡ Требуемое действие: {html.escape(required_action)}")
+
     notify_lines.append("")
     notify_lines.append("📝 <b>Официальный отчет:</b>")
     notify_lines.append(f"\"{html.escape(cleaned_text)}\"")
@@ -426,7 +429,14 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             for idx, s_item in enumerate(status_items, start=1 + existing_media_count):
                 if not s_item["ai_res"]["is_ok"]:
                     required_actions.append(f"Видео {idx}: {s_item['ai_res']['required_action']}")
-            overall_required_action = (existing["required_action"] or "") + " " + " ".join(required_actions)
+            error_count = overall_format_comment.lower().count("не ок")
+            if error_count > 3:
+                prev_action = existing["required_action"] or ""
+                if prev_action.strip().lower() in ("", "всё ок", "ничего не предпринимать, всё в порядке"):
+                    prev_action = ""
+                overall_required_action = (prev_action + " " + " ".join(required_actions)).strip() or "Ничего не предпринимать, всё в порядке"
+            else:
+                overall_required_action = "Ничего не предпринимать, всё в порядке"
 
             await run_db(
                 update_report_text_and_ai,
@@ -456,7 +466,8 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             for idx, s_item in enumerate(status_items, start=1):
                 if not s_item["ai_res"]["is_ok"]:
                     required_actions.append(f"Видео {idx}: {s_item['ai_res']['required_action']}")
-            overall_required_action = "; ".join(required_actions) if required_actions else "всё ОК"
+            error_count = overall_format_comment.lower().count("не ок")
+            overall_required_action = "; ".join(required_actions) if error_count > 3 else "Ничего не предпринимать, всё в порядке"
 
             report_id = await run_db(
                 save_report,

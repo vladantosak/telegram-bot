@@ -13,14 +13,14 @@ from telegram.ext import ContextTypes, ConversationHandler
 from db import (
     get_db, run_db, get_worker, get_all_workers, get_workers_by_position, get_workers_by_object_id,
     find_unregistered_workers_by_lastname, bind_worker_id, upsert_worker,
-    delete_worker, update_worker_field, get_object_group, save_object_group,
+    delete_worker, update_worker_field, get_object_group, save_object_group, clean_position,
     get_group_name, get_group_name_async, fetch_and_save_group_name, get_all_group_names,
     get_setting, set_setting, calculate_worker_stats, SCHEDULES, SCHEDULE_A, DEFAULT_GROUP_ID,
     is_admin, ADMIN_IDS, get_pending_unregistered_user, delete_pending_unregistered_user,
     export_workers_to_excel, read_excel, get_next_sort_order, fetch_export_data,
     generate_and_send_excel, generate_and_send_gsheets, get_violators_threshold,
     save_violators_threshold, now_local, set_quiet_mode, is_quiet_mode_enabled,
-    save_scheduled_times, get_scheduled_times, sync_gsheets_task
+    save_scheduled_times, get_scheduled_times, sync_gsheets_task, async_sync_gsheets_background
 )
 
 from report_handlers import menu_for_user
@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [
-        ["📋 Сотрудники", "➕ Добавить сотрудника", "➖ Удалить сотрудника"],
-        ["🏢 Сотрудники отдела", "⏰ Время оповещений о статусах", "📣 Напомнить всем"],
+        ["➕ Добавить сотрудника", "➖ Удалить сотрудника", "🏢 Сотрудники отдела"],
+        ["⏰ Время оповещений о статусах", "📣 Напомнить всем"],
         ["📥 Выгрузить отчеты", "📥 Импорт сотрудников", "⚙️ Настройки бота"],
     ],
     resize_keyboard=True,
@@ -95,7 +95,7 @@ def positions_keyboard(rows):
 def numbered_workers_keyboard(rows):
     keyboard = []
     for i, row in enumerate(rows, 1):
-        keyboard.append([f"{i}. {row['last_name']} {row['first_name']} ({row['position'] or 'Не указано'})"])
+        keyboard.append([f"{i}. {row['last_name']} {row['first_name']} ({clean_position(row['position'])})"])
     keyboard.append(["❌ Отмена"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -300,7 +300,7 @@ async def delete_worker_finish(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["worker_to_delete"] = worker
     kbd = ReplyKeyboardMarkup([["Да, удалить", "Нет, отмена"]], resize_keyboard=True)
     await update.message.reply_text(
-        f"⚠️ Вы уверены, что хотите удалить сотрудника {worker['last_name']} {worker['first_name']} ({worker['position'] or 'Не указано'}) (ID: {worker['telegram_id']})?",
+        f"⚠️ Вы уверены, что хотите удалить сотрудника {worker['last_name']} {worker['first_name']} ({clean_position(worker['position'])}) (ID: {worker['telegram_id']})?",
         reply_markup=kbd
     )
     return ASK_CONFIRM_DELETE
@@ -334,10 +334,135 @@ async def department_workers_show(update: Update, context: ContextTypes.DEFAULT_
     if not rows:
         await update.message.reply_text("Сотрудники не найдены.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
+    context.user_data["edit_dept_workers"] = [dict(r) for r in rows]
     lines = [f"📋 Отдел: {dept}"]
     for i, r in enumerate(rows, 1):
-        lines.append(f"{i}. {r['last_name']} {r['first_name']} ({r['position'] or 'Не указано'})")
-    await update.message.reply_text("\n".join(lines), reply_markup=MAIN_MENU)
+        lines.append(f"{i}. {r['last_name']} {r['first_name']} ({clean_position(r['position'])})")
+    lines.append("\nВведите номер сотрудника, чтобы отредактировать его, или нажмите «❌ Отмена».")
+    await update.message.reply_text("\n".join(lines), reply_markup=CANCEL_KEYBOARD)
+    return ASK_LIST_WORKER
+
+EDIT_FIELD_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["Фамилия", "Имя", "Должность"],
+        ["График", "Отдел/Объект", "ID группы"],
+        ["Ежедневный факт", "Активен", "Порядок"],
+        ["❌ Отмена"],
+    ],
+    resize_keyboard=True,
+)
+
+EDIT_FIELD_MAP = {
+    "Фамилия": ("last_name", "Введите новую фамилию:"),
+    "Имя": ("first_name", "Введите новое имя:"),
+    "Должность": ("position", "Введите новую должность:"),
+    "Отдел/Объект": ("object_id", "Введите название отдела (объекта):"),
+    "ID группы": ("group_id", "Введите ID группы Telegram (0 — группа по умолчанию):"),
+    "Порядок": ("sort_order", "Введите номер сортировки (число):"),
+}
+
+async def edit_worker_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    num_str = raw.split(".")[0].strip()
+    rows = context.user_data.get("edit_dept_workers", [])
+    if not num_str.isdigit() or not (1 <= int(num_str) <= len(rows)):
+        await update.message.reply_text("Введите корректный номер сотрудника из списка.")
+        return ASK_LIST_WORKER
+    worker = rows[int(num_str) - 1]
+    context.user_data["edit_worker"] = worker
+    await update.message.reply_text(
+        f"✏️ Редактирование: {worker['last_name']} {worker['first_name']} ({clean_position(worker['position'])})\n"
+        f"Что изменить?",
+        reply_markup=EDIT_FIELD_KEYBOARD
+    )
+    return ASK_EDIT_FIELD
+
+async def edit_worker_field_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    choice = update.message.text.strip()
+    worker = context.user_data.get("edit_worker")
+    if not worker:
+        await update.message.reply_text("Сессия редактирования истекла, начните заново.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+
+    if choice == "График":
+        await update.message.reply_text(
+            f"Текущий график: {worker['schedule']}\n{schedule_description_text()}", reply_markup=SCHEDULE_KEYBOARD
+        )
+        return ASK_EDIT_SCHEDULE
+    if choice == "Ежедневный факт":
+        cur = "Да" if worker["needs_daily_fact"] else "Нет"
+        await update.message.reply_text(f"Сейчас: {cur}. Нужно ли присылать ежедневный факт дня?", reply_markup=YES_NO_KEYBOARD)
+        return ASK_EDIT_DAILY_FACT
+    if choice == "Активен":
+        cur = "Да" if worker["is_active"] else "Нет"
+        await update.message.reply_text(f"Сейчас: {cur}. Сотрудник активен?", reply_markup=YES_NO_KEYBOARD)
+        return ASK_EDIT_STATUS_WORK
+    if choice in EDIT_FIELD_MAP:
+        field, prompt = EDIT_FIELD_MAP[choice]
+        context.user_data["edit_field"] = field
+        await update.message.reply_text(f"Сейчас: {worker.get(field)}\n{prompt}", reply_markup=CANCEL_KEYBOARD)
+        return ASK_EDIT_VALUE
+
+    await update.message.reply_text("Выберите поле из меню ниже.", reply_markup=EDIT_FIELD_KEYBOARD)
+    return ASK_EDIT_FIELD
+
+async def edit_worker_value_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    worker = context.user_data.get("edit_worker")
+    field = context.user_data.get("edit_field")
+    raw = update.message.text.strip()
+    if not worker or not field:
+        await update.message.reply_text("Сессия редактирования истекла, начните заново.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+
+    value = raw
+    if field == "group_id":
+        if not raw.lstrip("-").isdigit():
+            await update.message.reply_text("Введите число.")
+            return ASK_EDIT_VALUE
+        value = DEFAULT_GROUP_ID if int(raw) == 0 else int(raw)
+    elif field == "sort_order":
+        if not raw.isdigit():
+            await update.message.reply_text("Введите число.")
+            return ASK_EDIT_VALUE
+        value = int(raw)
+
+    update_worker_field(worker["telegram_id"], field, value)
+    async_sync_gsheets_background()
+    await update.message.reply_text("✅ Изменения сохранены.", reply_markup=MAIN_MENU)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def edit_worker_schedule_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip().upper()
+    if raw not in SCHEDULES:
+        return ASK_EDIT_SCHEDULE
+    worker = context.user_data.get("edit_worker")
+    update_worker_field(worker["telegram_id"], "schedule", raw)
+    async_sync_gsheets_background()
+    await update.message.reply_text("✅ График обновлён.", reply_markup=MAIN_MENU)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def edit_worker_daily_fact_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip().lower()
+    if raw not in ("да", "нет"):
+        return ASK_EDIT_DAILY_FACT
+    worker = context.user_data.get("edit_worker")
+    update_worker_field(worker["telegram_id"], "needs_daily_fact", raw == "да")
+    async_sync_gsheets_background()
+    await update.message.reply_text("✅ Обновлено.", reply_markup=MAIN_MENU)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def edit_worker_status_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip().lower()
+    if raw not in ("да", "нет"):
+        return ASK_EDIT_STATUS_WORK
+    worker = context.user_data.get("edit_worker")
+    update_worker_field(worker["telegram_id"], "is_active", raw == "да")
+    async_sync_gsheets_background()
+    await update.message.reply_text("✅ Обновлено.", reply_markup=MAIN_MENU)
+    context.user_data.clear()
     return ConversationHandler.END
 
 async def import_workers_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -478,10 +603,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Действие отменено.", reply_markup=menu_for_user(user_id, chat_type))
         return ConversationHandler.END
         
-    if text == "📋 Сотрудники":
-        await list_workers_action(update, context)
-        return ConversationHandler.END
-    elif text == "📥 Выгрузить отчеты":
+    if text == "📥 Выгрузить отчеты":
         await export_reports_action(update, context)
         return ConversationHandler.END
         
@@ -491,43 +613,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
     return ConversationHandler.END
-
-async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin_check(update): return
-    workers = get_all_workers()
-    if not workers:
-        await update.message.reply_text("В базе данных нет сотрудников.", reply_markup=MAIN_MENU)
-        return
-    
-    by_obj = {}
-    for w in workers:
-        obj = w["object_id"] or "Основной"
-        by_obj.setdefault(obj, []).append(w)
-    
-    lines = ["📋 <b>Список всех сотрудников по отделам:</b>\n"]
-    for obj, w_list in sorted(by_obj.items()):
-        lines.append(f"🏢 <b>Отдел: {html.escape(obj)}</b>")
-        for i, w in enumerate(w_list, 1):
-            status = "🟢 Акт" if w["is_active"] else "🔴 Неакт"
-            ndf = "Да" if w["needs_daily_fact"] else "Нет"
-            
-            last_name = html.escape(w['last_name'] or '')
-            first_name = html.escape(w['first_name'] or '')
-            position = html.escape(w['position'] or 'Не указано')
-            schedule = html.escape(w['schedule'] or '')
-            
-            lines.append(
-                f"  {i}. {last_name} {first_name} ({position}) (ID: <code>{w['telegram_id']}</code>)\n"
-                f"     График: {schedule} | Факт дня: {ndf} | Статус: {status}"
-            )
-        lines.append("")
-        
-    full_text = "\n".join(lines)
-    if len(full_text) > 4000:
-        for i in range(0, len(full_text), 4000):
-            await update.message.reply_text(full_text[i:i+4000], reply_markup=MAIN_MENU, parse_mode="HTML")
-    else:
-        await update.message.reply_text(full_text, reply_markup=MAIN_MENU, parse_mode="HTML")
 
 EXPORT_MENU = ReplyKeyboardMarkup(
     [

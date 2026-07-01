@@ -7,6 +7,7 @@ sys.path.insert(0, dir_path)
 import logging
 import asyncio
 import json
+import html
 from datetime import datetime
 import datetime as dt_module
 from logging.handlers import RotatingFileHandler
@@ -20,8 +21,11 @@ from db import (
     init_db, get_worker, get_all_workers, get_workers_by_position, get_db, run_db,
     DEFAULT_GROUP_ID, LATE_THRESHOLD_MIN, LOCAL_TZ, SCHEDULES, SCHEDULE_A,
     is_admin, ADMIN_IDS, save_scheduled_times, get_scheduled_times,
-    get_group_name_async, now_local
+    get_group_name_async, now_local, get_submitted_status_slots, clean_position,
+    has_pre_reminder_sent, mark_pre_reminder_sent
 )
+
+PRE_REMINDER_WINDOW_MIN = (10, 15)  # send when a slot is 10-15 minutes away
 
 from report_handlers import (
     handle_report, process_media_batch, menu_for_user, handle_callback_query
@@ -33,17 +37,21 @@ from admin_handlers import (
     add_worker_group, add_worker_schedule, add_worker_needs_daily_fact,
     delete_worker_start, delete_worker_department, delete_worker_finish,
     delete_worker_confirm, department_workers_start, department_workers_show,
+    edit_worker_select, edit_worker_field_chosen, edit_worker_value_received,
+    edit_worker_schedule_received, edit_worker_daily_fact_received, edit_worker_status_received,
     import_workers_start, import_workers_action, import_workers_file,
     register_start, register_lastname_received, register_firstname_received,
     settings_start, settings_action, cancel,
-    list_workers_action, export_reports_start, export_reports_choice, alert_time_start, alert_time_save,
+    export_reports_start, export_reports_choice, alert_time_start, alert_time_save,
     remind_all_start, remind_all_send,
     save_gsheets_url, save_gsheets_creds, save_gsheets_creds_text,
     ASK_WORKER_ID, ASK_LASTNAME, ASK_FIRSTNAME, ASK_POSITION, ASK_GROUP,
     ASK_SCHEDULE, ASK_NEEDS_DAILY_FACT, ASK_REMOVE_DEPARTMENT, ASK_REMOVE_WORKER,
     ASK_DEPARTMENT, ASK_REG_LAST_NAME, ASK_REG_FIRST_NAME, ASK_SETTINGS_ACTION,
     ASK_CONFIRM_DELETE, ASK_IMPORT_ACTION, ASK_IMPORT_FILE, ASK_GSHEETS_URL,
-    ASK_GSHEETS_CREDS, ASK_REPORT_TIME, ASK_CONFIRM_REMIND, ASK_EXPORT_TYPE
+    ASK_GSHEETS_CREDS, ASK_REPORT_TIME, ASK_CONFIRM_REMIND, ASK_EXPORT_TYPE,
+    ASK_LIST_WORKER, ASK_EDIT_FIELD, ASK_EDIT_VALUE, ASK_EDIT_SCHEDULE,
+    ASK_EDIT_DAILY_FACT, ASK_EDIT_STATUS_WORK
 )
 
 # Set up logging
@@ -109,27 +117,60 @@ def reschedule_summary_jobs(application: Application):
             logger.error(f"Ошибка при планировании сводки на {t_str}: {e}")
 
 async def scheduled_summary_callback(context: ContextTypes.DEFAULT_TYPE):
-    from admin_handlers import MAIN_MENU # local import
     now = now_local()
     date_str = now.strftime("%Y-%m-%d")
-    
-    # Generate daily summary text
-    from db import calculate_worker_stats
-    conn = get_db()
-    workers = conn.execute("SELECT * FROM workers ORDER BY position, sort_order, last_name, first_name").fetchall()
-    conn.close()
-    
-    summary_text = f"⏰ Автоматическая запланированная сводка за {date_str}:\n\n"
-    for w in workers:
-        if not w["is_active"]:
-            continue
-        summary_text += f"• {w['last_name']} {w['first_name']} ({w['position']})\n"
+    current_mins = now.hour * 60 + now.minute
 
-    # Send summary to group chat and admins
-    from db import DEFAULT_GROUP_ID
+    conn = get_db()
+    workers = conn.execute(
+        "SELECT * FROM workers WHERE is_active = 1 ORDER BY object_id, sort_order, last_name, first_name"
+    ).fetchall()
+    not_working_today = {
+        r["telegram_id"] for r in conn.execute(
+            "SELECT telegram_id FROM reports WHERE report_date = ? AND report_type = 'not_working'",
+            (date_str,)
+        ).fetchall()
+    }
+    conn.close()
+
+    by_dept = {}
+    for w in workers:
+        if w["telegram_id"] in not_working_today:
+            continue
+        submitted = get_submitted_status_slots(w["telegram_id"], date_str)
+        slots = SCHEDULES.get(w["schedule"], SCHEDULE_A)
+        missing = []
+        for slot in slots:
+            if slot in submitted:
+                continue
+            hour, minute = map(int, slot.split(":"))
+            slot_mins = hour * 60 + minute
+            if current_mins > slot_mins + LATE_THRESHOLD_MIN:
+                overdue = current_mins - slot_mins
+                hrs, mins = divmod(overdue, 60)
+                overdue_str = f"{hrs} ч {mins} мин" if hrs else f"{mins} мин"
+                missing.append(f"{slot} — просрочено на {overdue_str}")
+        if missing:
+            dept = w["object_id"] or "Основной"
+            by_dept.setdefault(dept, []).append((w, missing))
+
+    if not by_dept:
+        summary_text = f"✅ <b>Сводка за {date_str}</b>\nВсе сотрудники вовремя сдали статусы."
+    else:
+        lines = [f"⏰ <b>Не сдали статус за {date_str}:</b>\n"]
+        for dept, entries in sorted(by_dept.items()):
+            lines.append(f"🏢 <b>{html.escape(dept)}</b>")
+            for w, missing in entries:
+                name = html.escape(f"{w['last_name']} {w['first_name']} ({clean_position(w['position'])})")
+                lines.append(f"• {name}")
+                for slot_info in missing:
+                    lines.append(f"    ⛔ {html.escape(slot_info)}")
+            lines.append("")
+        summary_text = "\n".join(lines)
+
     for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_message(chat_id=admin_id, text=summary_text)
+            await context.bot.send_message(chat_id=admin_id, text=summary_text, parse_mode="HTML")
         except Exception:
             pass
 
@@ -179,6 +220,41 @@ async def periodic_gsheets_sync_callback(context: ContextTypes.DEFAULT_TYPE):
     from db import async_sync_gsheets_background
     async_sync_gsheets_background()
 
+async def pre_reminder_check_callback(context: ContextTypes.DEFAULT_TYPE):
+    now = now_local()
+    date_str = now.strftime("%Y-%m-%d")
+    current_mins = now.hour * 60 + now.minute
+    low, high = PRE_REMINDER_WINDOW_MIN
+
+    conn = get_db()
+    workers = conn.execute("SELECT * FROM workers WHERE is_active = 1").fetchall()
+    not_working_today = {
+        r["telegram_id"] for r in conn.execute(
+            "SELECT telegram_id FROM reports WHERE report_date = ? AND report_type = 'not_working'",
+            (date_str,)
+        ).fetchall()
+    }
+    conn.close()
+
+    for w in workers:
+        if w["telegram_id"] in not_working_today:
+            continue
+        submitted = get_submitted_status_slots(w["telegram_id"], date_str)
+        for slot in SCHEDULES.get(w["schedule"], SCHEDULE_A):
+            if slot in submitted:
+                continue
+            hour, minute = map(int, slot.split(":"))
+            mins_left = (hour * 60 + minute) - current_mins
+            if low <= mins_left <= high and not has_pre_reminder_sent(w["telegram_id"], date_str, slot):
+                try:
+                    await context.bot.send_message(
+                        chat_id=w["telegram_id"],
+                        text=f"⏰ Через {mins_left} мин. нужно отправить статус за {slot}. Не забудьте прислать отчёт вовремя!"
+                    )
+                except Exception:
+                    pass
+                mark_pre_reminder_sent(w["telegram_id"], date_str, slot)
+
 async def post_init(application: Application):
     reschedule_summary_jobs(application)
     
@@ -195,6 +271,15 @@ async def post_init(application: Application):
             )
             logger.info("Periodic Google Sheets synchronization scheduled every 30 minutes.")
 
+        if not job_queue.get_jobs_by_name("pre_reminder_check"):
+            job_queue.run_repeating(
+                pre_reminder_check_callback,
+                interval=60,  # check every minute
+                first=30,
+                name="pre_reminder_check"
+            )
+            logger.info("Pre-status reminder check scheduled every minute.")
+
 def main():
     init_db()
     TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -205,7 +290,7 @@ def main():
     application = Application.builder().token(TOKEN).post_init(post_init).build()
 
     admin_cancel_filter = filters.Regex(
-        r"^(❌ Отмена|❌ Назад|📋 Сотрудники|➕ Добавить сотрудника|➖ Удалить сотрудника|🏢 Сотрудники отдела|⏰ Время оповещений о статусах|📣 Напомнить всем|📥 Выгрузить отчеты|📥 Импорт сотрудников|⚙️ Настройки бота|🔑 Начать регистрацию)$"
+        r"^(❌ Отмена|❌ Назад|➕ Добавить сотрудника|➖ Удалить сотрудника|🏢 Сотрудники отдела|⏰ Время оповещений о статусах|📣 Напомнить всем|📥 Выгрузить отчеты|📥 Импорт сотрудников|⚙️ Настройки бота|🔑 Начать регистрацию)$"
     )
     safe_text_filter = filters.TEXT & ~filters.COMMAND & ~admin_cancel_filter
 
@@ -215,9 +300,6 @@ def main():
     application.add_handler(CommandHandler("set_object_group", set_object_group_command))
     application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CommandHandler("quiet_mode", cmd_quiet_mode))
-
-    # Single-click actions
-    application.add_handler(MessageHandler(filters.Regex("^📋 Сотрудники$"), list_workers_action))
 
     # Export reports and sync ConversationHandler
     export_handler = ConversationHandler(
@@ -262,6 +344,12 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^🏢 Сотрудники отдела$"), department_workers_start)],
         states={
             ASK_DEPARTMENT: [MessageHandler(safe_text_filter, department_workers_show)],
+            ASK_LIST_WORKER: [MessageHandler(safe_text_filter, edit_worker_select)],
+            ASK_EDIT_FIELD: [MessageHandler(safe_text_filter, edit_worker_field_chosen)],
+            ASK_EDIT_VALUE: [MessageHandler(safe_text_filter, edit_worker_value_received)],
+            ASK_EDIT_SCHEDULE: [MessageHandler(safe_text_filter, edit_worker_schedule_received)],
+            ASK_EDIT_DAILY_FACT: [MessageHandler(safe_text_filter, edit_worker_daily_fact_received)],
+            ASK_EDIT_STATUS_WORK: [MessageHandler(safe_text_filter, edit_worker_status_received)],
         },
         fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )

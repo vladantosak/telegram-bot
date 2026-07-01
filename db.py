@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 import json
 import hashlib
@@ -35,6 +36,13 @@ def is_admin(user_id: int) -> bool:
 SCHEDULE_A = ["10:00", "12:00", "15:00", "17:00"]
 SCHEDULE_B = ["11:00", "13:00", "16:00", "18:00"]
 SCHEDULES = {"A": SCHEDULE_A, "B": SCHEDULE_B}
+
+def clean_position(position: str | None) -> str:
+    """Strip a trailing '(...)' suffix some positions were saved with, e.g.
+    'Сварщик (Industriala_Welders_Reports)' -> 'Сварщик' — the department
+    is already shown separately, it shouldn't be duplicated inside position."""
+    text = (position or "Не указано").strip()
+    return re.sub(r"\s*\([^()]*\)\s*$", "", text).strip() or "Не указано"
 
 ENCRYPTED_SETTING_KEYS = {"google_service_account"}
 _fernet = None
@@ -400,6 +408,24 @@ def get_submitted_status_slots(telegram_id: int, report_date: str) -> set:
     conn.close()
     return {r["slot_time"] for r in rows}
 
+def has_pre_reminder_sent(telegram_id: int, report_date: str, slot_time: str) -> bool:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT 1 FROM sent_pre_reminders WHERE telegram_id = ? AND report_date = ? AND slot_time = ?",
+        (telegram_id, report_date, slot_time)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+def mark_pre_reminder_sent(telegram_id: int, report_date: str, slot_time: str):
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO sent_pre_reminders (telegram_id, report_date, slot_time) VALUES (?, ?, ?)",
+        (telegram_id, report_date, slot_time)
+    )
+    conn.commit()
+    conn.close()
+
 def get_existing_report_row(telegram_id: int, report_date: str, report_type: str, slot_time: str | None = None):
     conn = get_db()
     if report_type == "status":
@@ -705,19 +731,48 @@ def export_reports_to_excel() -> bytes:
 def export_workers_to_excel() -> bytes:
     import openpyxl
     from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
     import io
-    
+
     wb = Workbook()
     ws = wb.active
-    ws.title = "Workers"
-    
+    ws.title = "Сотрудники"
+
     headers = [
-        "telegram_id", "last_name", "first_name", "position", 
-        "group_id", "schedule", "needs_daily_fact", "object_id", 
-        "is_active", "sort_order"
+        "Telegram ID", "Фамилия", "Имя", "Должность",
+        "ID чата (уведомления)", "График (А или Б)", "Итоговый отчет за день",
+        "Статус", "Номер в списке", "Объект"
+    ]
+    hints = [
+        "не менять", "фамилия", "имя", "должность",
+        "чат id", "А или Б", "Да/Нет",
+        "Работает/Отпуск/Больничный", "число", "объект"
     ]
     ws.append(headers)
-    
+    ws.append(hints)
+
+    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    hint_fill = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
+    hint_font = Font(italic=True, color="555555")
+    warn_fill = PatternFill(start_color="F8CBAD", end_color="F8CBAD", fill_type="solid")
+
+    for col in range(1, len(headers) + 1):
+        c1 = ws.cell(row=1, column=col)
+        c1.fill = header_fill
+        c1.font = header_font
+        c1.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c2 = ws.cell(row=2, column=col)
+        c2.fill = hint_fill
+        c2.font = hint_font
+        c2.alignment = Alignment(horizontal="center")
+    ws.cell(row=2, column=1).fill = warn_fill
+
+    ws.freeze_panes = "A3"
+    for i, width in enumerate([14, 16, 14, 22, 18, 12, 16, 20, 10, 26], 1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+
     workers = get_all_workers()
     for w in workers:
         ws.append([
@@ -727,29 +782,53 @@ def export_workers_to_excel() -> bytes:
             w["position"],
             w["group_id"],
             w["schedule"],
-            w["needs_daily_fact"],
+            "Да" if w["needs_daily_fact"] else "Нет",
+            "Работает" if w["is_active"] else "Отпуск",
+            w["sort_order"],
             w["object_id"],
-            w["is_active"],
-            w["sort_order"]
         ])
-    
+
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
+
+EXCEL_HEADER_ALIASES = {
+    "telegram id": "telegram_id",
+    "фамилия": "last_name",
+    "имя": "first_name",
+    "должность": "position",
+    "должность / отдел": "position",
+    "id чата (уведомления)": "group_id",
+    "id чата": "group_id",
+    "график (а или б)": "schedule",
+    "график": "schedule",
+    "итоговый отчет за день": "needs_daily_fact",
+    "итоговый отчёт за день": "needs_daily_fact",
+    "статус": "is_active",
+    "номер в списке": "sort_order",
+    "объект": "object_id",
+}
 
 def read_excel(file_path: str) -> list[dict]:
     import openpyxl
     wb = openpyxl.load_workbook(file_path, data_only=True)
     ws = wb.active
-    
+
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
         return []
-        
-    headers = [str(cell).strip() if cell is not None else "" for cell in rows[0]]
-    
+
+    raw_headers = [str(cell).strip() if cell is not None else "" for cell in rows[0]]
+    headers = [EXCEL_HEADER_ALIASES.get(h.lower(), h) for h in raw_headers]
+
+    data_rows = rows[1:]
+    if data_rows and data_rows[0]:
+        first_cell = data_rows[0][0]
+        if isinstance(first_cell, str) and not first_cell.strip().lstrip("-").isdigit():
+            data_rows = data_rows[1:]  # skip the "не менять / фамилия / имя / ..." hint row
+
     workers = []
-    for row in rows[1:]:
+    for row in data_rows:
         if not any(row):
             continue
         row_dict = {}
@@ -785,7 +864,10 @@ def read_excel(file_path: str) -> list[dict]:
             row_dict["object_id"] = str(row_dict.get("object_id", "Основной") or "Основной").strip()
             
             is_act = row_dict.get("is_active")
-            if is_act in (False, 0, "0", "Нет", "нет", "no", "NO", "False", "false"):
+            if isinstance(is_act, str):
+                not_working_labels = {"отпуск", "больничный", "нет", "no", "false", "0", "не работает"}
+                row_dict["is_active"] = is_act.strip().lower() not in not_working_labels
+            elif is_act in (False, 0):
                 row_dict["is_active"] = False
             else:
                 row_dict["is_active"] = True
@@ -849,7 +931,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
             rows_workers.append([
                 str(w["object_id"] or "Основной"),
                 f"{w['last_name']} {w['first_name']}",
-                str(w["position"] or "Не указано"),
+                clean_position(w["position"]),
                 str(w["telegram_id"]),
                 str(w["group_id"]),
                 str(w["schedule"]),
@@ -898,7 +980,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                 str(r["telegram_id"]),
                 str(r["object_id"] or "Основной"),
                 fio,
-                str(r["position"] or "Не указано"),
+                clean_position(r["position"]),
                 str(r["report_date"]),
                 str(r["report_type"]),
                 str(r["slot_time"] or ""),
@@ -952,7 +1034,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
             rows_analytics.append([
                 str(w["object_id"] or "Основной"),
                 f"{w['last_name']} {w['first_name']}",
-                str(w["position"]),
+                clean_position(w["position"]),
                 str(stats_30["expected"]),
                 str(stats_30["submitted"]),
                 str(stats_30["lates"]),
@@ -1072,6 +1154,15 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                 }
             })
         rows_summary.append(headers_summary)
+        header_row_idx = len(rows_summary) - 1
+        format_requests.append({
+            "repeatCell": {
+                "range": {"sheetId": ws_summary.id, "startRowIndex": header_row_idx, "endRowIndex": header_row_idx + 1,
+                          "startColumnIndex": 0, "endColumnIndex": len(headers_summary)},
+                "cell": {"userEnteredFormat": {"textFormat": {"bold": True, "foregroundColor": {"red": 0, "green": 0, "blue": 0}}}},
+                "fields": "userEnteredFormat.textFormat(bold,foregroundColor)"
+            }
+        })
 
         for dept, dept_workers in itertools.groupby(
             (w for w in workers if w["is_active"]),
@@ -1099,7 +1190,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                 "repeatCell": {
                     "range": {"sheetId": ws_summary.id, "startRowIndex": dept_row_idx, "endRowIndex": dept_row_idx + 1,
                               "startColumnIndex": 0, "endColumnIndex": len(headers_summary)},
-                    "cell": {"userEnteredFormat": {"backgroundColor": DEPT_BG, "textFormat": {"bold": True}}},
+                    "cell": {"userEnteredFormat": {"backgroundColor": DEPT_BG, "textFormat": {"bold": True, "foregroundColor": {"red": 0, "green": 0, "blue": 0}}}},
                     "fields": "userEnteredFormat(backgroundColor,textFormat)"
                 }
             })
@@ -1119,7 +1210,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                 start_str = date_list[0].strftime("%Y-%m-%d")
                 end_str = date_list[-1].strftime("%Y-%m-%d")
                 status_rows = conn_sum.execute(
-                    "SELECT report_date, slot_time, is_late, is_ok, format_comment, required_action FROM reports "
+                    "SELECT report_date, slot_time, received_at, is_ok, format_comment, required_action FROM reports "
                     "WHERE telegram_id = ? AND report_type = 'status' AND report_date >= ? AND report_date <= ?",
                     (w["telegram_id"], start_str, end_str)
                 ).fetchall()
@@ -1133,7 +1224,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                     ).fetchall()
                 }
 
-                name_text = f"{w['last_name']} {w['first_name']} ({w['position'] or 'Не указано'})"
+                name_text = f"{w['last_name']} {w['first_name']} ({clean_position(w['position'])})"
                 worker_start_row = len(rows_summary)
                 first_tracked_col = None
 
@@ -1156,15 +1247,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
 
                         if d_str in not_working_dates:
                             cell_value = False
-                            format_requests.append({
-                                "repeatCell": {
-                                    "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
-                                              "endRowIndex": len(rows_summary) + 1,
-                                              "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
-                                    "cell": {"userEnteredFormat": {"backgroundColor": GREY}},
-                                    "fields": "userEnteredFormat(backgroundColor)"
-                                }
-                            })
+                            fresh_note = "Выходной/отгул"
                         elif d == today_date and (now.hour * 60 + now.minute) <= hour * 60 + minute + LATE_THRESHOLD_MIN:
                             cell_value = ""
                         else:
@@ -1172,8 +1255,16 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                             if rep is not None:
                                 cell_value = True
                                 note_parts = []
-                                if rep["is_late"]:
-                                    note_parts.append("Опоздание")
+                                received_at = rep["received_at"] or ""
+                                try:
+                                    rh, rm = int(received_at[0:2]), int(received_at[3:5])
+                                    diff_mins = (rh * 60 + rm) - (hour * 60 + minute)
+                                    if diff_mins < -30:
+                                        note_parts.append("Прислал рано")
+                                    elif diff_mins > 60:
+                                        note_parts.append("Прислал поздно")
+                                except (ValueError, IndexError):
+                                    pass
                                 if not rep["is_ok"]:
                                     remark = (rep["format_comment"] or "").strip()
                                     action = (rep["required_action"] or "").strip()
@@ -1182,29 +1273,10 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                                         note_parts.append(f"Требуется: {action}")
                                 if note_parts:
                                     fresh_note = "\n".join(note_parts)
-                                    format_requests.append({
-                                        "repeatCell": {
-                                            "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
-                                                      "endRowIndex": len(rows_summary) + 1,
-                                                      "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
-                                            "cell": {"userEnteredFormat": {"backgroundColor": YELLOW}},
-                                            "fields": "userEnteredFormat(backgroundColor)"
-                                        }
-                                    })
                             else:
                                 cell_value = False
                                 if old_entry and old_entry.get("bool") is True:
                                     cell_value = True  # a manual tick in the sheet always wins over "missed"
-                                else:
-                                    format_requests.append({
-                                        "repeatCell": {
-                                            "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
-                                                      "endRowIndex": len(rows_summary) + 1,
-                                                      "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
-                                            "cell": {"userEnteredFormat": {"backgroundColor": PINK}},
-                                            "fields": "userEnteredFormat(backgroundColor)"
-                                        }
-                                    })
 
                         row_cells.append(cell_value)
 
@@ -1238,6 +1310,32 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                     )
 
         conn_sum.close()
+
+        grid_last_row = len(rows_summary)
+        BLACK = {"red": 0, "green": 0, "blue": 0}
+        border_requests = []
+        if grid_last_row > header_row_idx:
+            # Thin line between every day column
+            border_requests.append({
+                "updateBorders": {
+                    "range": {"sheetId": ws_summary.id, "startRowIndex": header_row_idx, "endRowIndex": grid_last_row,
+                              "startColumnIndex": 2, "endColumnIndex": len(headers_summary)},
+                    "innerVertical": {"style": "SOLID", "width": 1, "color": BLACK}
+                }
+            })
+            # Thick line at the end of each work week (after every Friday column)
+            for col_idx, d in enumerate(date_list):
+                abs_col = 2 + col_idx
+                if d.weekday() == 4 and abs_col + 1 < len(headers_summary):
+                    border_requests.append({
+                        "repeatCell": {
+                            "range": {"sheetId": ws_summary.id, "startRowIndex": header_row_idx, "endRowIndex": grid_last_row,
+                                      "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
+                            "cell": {"userEnteredFormat": {"borders": {"right": {"style": "SOLID_THICK", "width": 2, "color": BLACK}}}},
+                            "fields": "userEnteredFormat.borders.right"
+                        }
+                    })
+
         safe_update(ws_summary, rows_summary)
 
         checkbox_requests = [
@@ -1251,7 +1349,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
             for (r0, r1, c0, c1) in checkbox_ranges
         ]
 
-        all_requests = merge_requests + format_requests + checkbox_requests + note_requests
+        all_requests = merge_requests + format_requests + border_requests + checkbox_requests + note_requests
         if all_requests:
             for i in range(0, len(all_requests), 400):
                 sheet.batch_update({"requests": all_requests[i:i + 400]})
