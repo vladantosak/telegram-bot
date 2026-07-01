@@ -538,6 +538,18 @@ def set_quiet_mode(enabled: bool):
     conn.commit()
     conn.close()
 
+def get_scheduled_times() -> list[str]:
+    try:
+        val = get_setting("scheduled_summary_times")
+        if val:
+            return json.loads(val)
+    except Exception:
+        pass
+    return ["19:00"]
+
+def save_scheduled_times(times: list[str]):
+    set_setting("scheduled_summary_times", json.dumps(times))
+
 def get_worker_target_group(worker) -> int:
     try:
         w_dict = dict(worker)
