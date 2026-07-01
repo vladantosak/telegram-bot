@@ -24,7 +24,7 @@ from db import (
 )
 
 from report_handlers import (
-    handle_report, process_media_batch, menu_for_user
+    handle_report, process_media_batch, menu_for_user, handle_callback_query
 )
 
 from admin_handlers import (
@@ -296,6 +296,9 @@ def main():
         filters.VOICE | filters.VIDEO | filters.VIDEO_NOTE | filters.TEXT & ~filters.COMMAND,
         handle_report
     ))
+
+    # Callback Query Handler for report buttons
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
 
     logger.info("Bot main listener initialized successfully...")
     application.run_polling()
