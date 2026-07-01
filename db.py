@@ -976,7 +976,13 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
         except gspread.exceptions.WorksheetNotFound:
             ws_summary = sheet.add_worksheet(title="Сводка", rows="2000", cols="60")
 
-        FROZEN_ROWS = 1
+        GREY = {"red": 0.85, "green": 0.85, "blue": 0.85}
+        YELLOW = {"red": 1.0, "green": 0.95, "blue": 0.6}
+        PINK = {"red": 0.96, "green": 0.78, "blue": 0.78}
+        DEPT_BG = {"red": 0.85, "green": 0.82, "blue": 0.93}
+        LEGEND = [(PINK, "Не сдал"), (YELLOW, "Сдал, но есть замечание"), (GREY, "Выходной, отпуск")]
+
+        FROZEN_ROWS = len(LEGEND) + 1  # legend rows + the "Сотрудник/Время/даты" header row
         FROZEN_COLS = 2
 
         # Read the currently published grid (values + notes) before wiping it, so manual edits
@@ -993,15 +999,15 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                         old_grid = data[0].get("rowData", [])
                     break
 
-            if old_grid:
-                header_vals = old_grid[0].get("values", [])
+            if len(old_grid) > FROZEN_ROWS - 1:
+                header_vals = old_grid[FROZEN_ROWS - 1].get("values", [])
                 old_date_cols = {
                     idx: cell.get("formattedValue")
                     for idx, cell in enumerate(header_vals)
                     if idx >= 2 and cell.get("formattedValue")
                 }
                 current_name = None
-                for row in old_grid[1:]:
+                for row in old_grid[FROZEN_ROWS:]:
                     vals = row.get("values", [])
                     if not vals:
                         continue
@@ -1046,15 +1052,26 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
             d_iter += dt_module.timedelta(days=1)
 
         headers_summary = ["Сотрудник", "Время"] + [d.strftime("%d.%m") for d in date_list]
-        rows_summary = [headers_summary]
-
-        GREY = {"red": 0.85, "green": 0.85, "blue": 0.85}
-        DEPT_BG = {"red": 0.85, "green": 0.82, "blue": 0.93}
 
         merge_requests = []
         format_requests = []
         note_requests = []
         checkbox_ranges = []
+
+        # Legend rows, matching the reference sheet: a colored swatch in column A, label in column B
+        rows_summary = []
+        for color, label in LEGEND:
+            legend_row_idx = len(rows_summary)
+            rows_summary.append(["", label] + [""] * (len(headers_summary) - 2))
+            format_requests.append({
+                "repeatCell": {
+                    "range": {"sheetId": ws_summary.id, "startRowIndex": legend_row_idx, "endRowIndex": legend_row_idx + 1,
+                              "startColumnIndex": 0, "endColumnIndex": 1},
+                    "cell": {"userEnteredFormat": {"backgroundColor": color}},
+                    "fields": "userEnteredFormat(backgroundColor)"
+                }
+            })
+        rows_summary.append(headers_summary)
 
         for dept, dept_workers in itertools.groupby(
             (w for w in workers if w["is_active"]),
@@ -1165,10 +1182,29 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                                         note_parts.append(f"Требуется: {action}")
                                 if note_parts:
                                     fresh_note = "\n".join(note_parts)
+                                    format_requests.append({
+                                        "repeatCell": {
+                                            "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
+                                                      "endRowIndex": len(rows_summary) + 1,
+                                                      "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
+                                            "cell": {"userEnteredFormat": {"backgroundColor": YELLOW}},
+                                            "fields": "userEnteredFormat(backgroundColor)"
+                                        }
+                                    })
                             else:
                                 cell_value = False
                                 if old_entry and old_entry.get("bool") is True:
                                     cell_value = True  # a manual tick in the sheet always wins over "missed"
+                                else:
+                                    format_requests.append({
+                                        "repeatCell": {
+                                            "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
+                                                      "endRowIndex": len(rows_summary) + 1,
+                                                      "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
+                                            "cell": {"userEnteredFormat": {"backgroundColor": PINK}},
+                                            "fields": "userEnteredFormat(backgroundColor)"
+                                        }
+                                    })
 
                         row_cells.append(cell_value)
 
