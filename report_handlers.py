@@ -268,12 +268,6 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         except Exception as e:
             logger.error(f"Ошибка отправки оценки факта в чат {dest_chat}: {e}")
 
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(chat_id=admin_id, text=notify_text, reply_markup=inline_kbd, parse_mode="Markdown")
-            except Exception:
-                pass
-
         try:
             if ai_res["is_ok"]:
                 await upd.message.reply_text(f"✅ Факт получен и принят без замечаний!", parse_mode="Markdown")
@@ -730,12 +724,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(chat_id=dest_chat, text=notify_text)
                 except Exception as e:
                     logger.error(f"Ошибка отправки уведомления в группу: {e}")
-                    
-                for admin_id in ADMIN_IDS:
-                    try:
-                        await context.bot.send_message(chat_id=admin_id, text=notify_text)
-                    except Exception:
-                        pass
                 return
             else:
                 context.user_data.pop("not_working_reason", None)
@@ -875,14 +863,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await run_db(set_report_group_message, report_id, dest_chat, sent_notify_msg.message_id)
         except Exception as e:
             logger.error(f"Ошибка отправки оценки в чат {dest_chat}: {e}")
-
-        # CRITICAL REQ: Status comments should ONLY go to the group chat, not the admin chat!
-        if ai_res["report_type"] != "status":
-            for admin_id in ADMIN_IDS:
-                try:
-                    await context.bot.send_message(chat_id=admin_id, text=notify_text, reply_markup=inline_kbd, parse_mode="Markdown")
-                except Exception:
-                    pass
     finally:
         try:
             lock.release()
