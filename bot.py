@@ -38,6 +38,7 @@ from admin_handlers import (
     settings_start, settings_action, cancel,
     list_workers_action, export_reports_action, alert_time_start, alert_time_save,
     remind_all_start, remind_all_send,
+    save_gsheets_url, save_gsheets_creds, save_gsheets_creds_text,
     ASK_WORKER_ID, ASK_LASTNAME, ASK_FIRSTNAME, ASK_POSITION, ASK_GROUP,
     ASK_SCHEDULE, ASK_NEEDS_DAILY_FACT, ASK_REMOVE_DEPARTMENT, ASK_REMOVE_WORKER,
     ASK_DEPARTMENT, ASK_REG_LAST_NAME, ASK_REG_FIRST_NAME, ASK_SETTINGS_ACTION,
@@ -173,8 +174,26 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     await update.message.reply_text("ℹ️ Полная аналитика по отчетам выгружается в Google Таблицу на лист 'Аналитика'.")
 
+async def periodic_gsheets_sync_callback(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Running scheduled periodic Google Sheets synchronization...")
+    from db import async_sync_gsheets_background
+    async_sync_gsheets_background()
+
 async def post_init(application: Application):
     reschedule_summary_jobs(application)
+    
+    # Schedule periodic Google Sheets synchronization every 30 minutes
+    job_queue = application.job_queue
+    if job_queue:
+        existing = job_queue.get_jobs_by_name("periodic_gsheets_sync")
+        if not existing:
+            job_queue.run_repeating(
+                periodic_gsheets_sync_callback,
+                interval=1800, # 30 minutes
+                first=60, # first run after 1 minute
+                name="periodic_gsheets_sync"
+            )
+            logger.info("Periodic Google Sheets synchronization scheduled every 30 minutes.")
 
 def main():
     init_db()
@@ -255,6 +274,11 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^⚙️ Настройки бота$"), settings_start)],
         states={
             ASK_SETTINGS_ACTION: [MessageHandler(safe_text_filter, settings_action)],
+            ASK_GSHEETS_URL: [MessageHandler(safe_text_filter, save_gsheets_url)],
+            ASK_GSHEETS_CREDS: [
+                MessageHandler(filters.Document.ALL, save_gsheets_creds),
+                MessageHandler(safe_text_filter, save_gsheets_creds_text),
+            ],
         },
         fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )
