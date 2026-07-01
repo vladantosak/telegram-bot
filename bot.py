@@ -88,7 +88,7 @@ def now_local() -> datetime:
     """Текущее время в локальном часовом поясе."""
     return datetime.now(LOCAL_TZ)
 
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+groq_client = Groq(api_key=GROQ_API_KEY, timeout=120.0) if GROQ_API_KEY else None
 
 LATE_THRESHOLD_MIN = 15
 SCHEDULE_A = ["10:00", "12:00", "15:00", "17:00"]
@@ -6086,7 +6086,9 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tmp_path = f"tmp/file_{user_id}_{int(datetime.now().timestamp())}.{ext}"
                 
                 await tg_file.download_to_drive(tmp_path)
+                logger.info(f"[handler] Начало транскрипции файла {tmp_path} для пользователя {user_id}")
                 text_content = await transcribe_audio_async(tmp_path)
+                logger.info(f"[handler] Транскрипция завершена: '{text_content[:80]}'")
 
         if not text_content:
             await update.message.reply_text("Ошибка: Не удалось распознать аудио или медиа отчета.")
@@ -6505,9 +6507,18 @@ async def _flush_media_batch(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     lock = get_user_lock(user_id)
     await lock.acquire()
     try:
+        logger.info(f"[media_batch] Начало обработки {len(buf['items'])} видео от пользователя {user_id}")
         await process_media_batch(user_id, buf["items"], context)
-    except Exception:
+        logger.info(f"[media_batch] Обработка завершена для пользователя {user_id}")
+    except Exception as exc:
         logger.exception(f"Ошибка обработки пачки видео-отчетов пользователя {user_id}")
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Ошибка при обработке видео: {exc}\n\nПопробуйте отправить ещё раз."
+            )
+        except Exception:
+            pass
     finally:
         try:
             lock.release()
@@ -6534,12 +6545,16 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         upd = item["update"]
         date_str = now.strftime("%Y-%m-%d")
 
+        logger.info(f"[process_media_batch] Видео {idx}/{len(items)} пользователя {user_id}: текст='{text_content[:80]}'")
+
         last_slot_time = now.replace(hour=last_hour, minute=last_minute, second=0, microsecond=0)
         last_slot_limit = last_slot_time + dt_module.timedelta(minutes=LATE_THRESHOLD_MIN)
 
         forced_type = "status" if now <= last_slot_limit else None
 
+        logger.info(f"[process_media_batch] Видео {idx}: вызов check_status_async...")
         ai_res_pre = await check_status_async(text_content, report_type_override=forced_type)
+        logger.info(f"[process_media_batch] Видео {idx}: check_status_async вернул report_type={ai_res_pre.get('report_type')}")
         report_type = ai_res_pre["report_type"]
 
         if report_type == "status":
