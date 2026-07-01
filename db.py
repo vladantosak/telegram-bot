@@ -976,11 +976,20 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
         except gspread.exceptions.WorksheetNotFound:
             ws_summary = sheet.add_worksheet(title="Сводка", rows="2000", cols="60")
 
-        # Clear merges/formatting/checkboxes left over from a previous sync before rebuilding the grid
+        FROZEN_ROWS = 1
+        FROZEN_COLS = 2
+
+        # Clear merges/formatting/checkboxes left over from a previous sync before rebuilding the grid,
+        # and pin the freeze pane to a known state (mergeCells rejects ranges that straddle the
+        # frozen/non-frozen column boundary, so every merge below must respect FROZEN_COLS).
         sheet.batch_update({"requests": [
             {"unmergeCells": {"range": {"sheetId": ws_summary.id}}},
             {"repeatCell": {"range": {"sheetId": ws_summary.id}, "cell": {"userEnteredFormat": {}}, "fields": "userEnteredFormat"}},
-            {"setDataValidation": {"range": {"sheetId": ws_summary.id}}}
+            {"setDataValidation": {"range": {"sheetId": ws_summary.id}}},
+            {"updateSheetProperties": {
+                "properties": {"sheetId": ws_summary.id, "gridProperties": {"frozenRowCount": FROZEN_ROWS, "frozenColumnCount": FROZEN_COLS}},
+                "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount"
+            }}
         ]})
 
         conn_sum = get_db()
@@ -1011,10 +1020,19 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
         ):
             dept_row_idx = len(rows_summary)
             rows_summary.append([dept] + [""] * (len(headers_summary) - 1))
+            # Two separate merges (frozen columns 0-1, then the rest) — Sheets rejects a merge
+            # that spans both frozen and non-frozen columns.
             merge_requests.append({
                 "mergeCells": {
                     "range": {"sheetId": ws_summary.id, "startRowIndex": dept_row_idx, "endRowIndex": dept_row_idx + 1,
-                              "startColumnIndex": 0, "endColumnIndex": len(headers_summary)},
+                              "startColumnIndex": 0, "endColumnIndex": FROZEN_COLS},
+                    "mergeType": "MERGE_ALL"
+                }
+            })
+            merge_requests.append({
+                "mergeCells": {
+                    "range": {"sheetId": ws_summary.id, "startRowIndex": dept_row_idx, "endRowIndex": dept_row_idx + 1,
+                              "startColumnIndex": FROZEN_COLS, "endColumnIndex": len(headers_summary)},
                     "mergeType": "MERGE_ALL"
                 }
             })
