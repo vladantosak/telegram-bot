@@ -23,6 +23,8 @@ from db import (
     save_scheduled_times, get_scheduled_times
 )
 
+from report_handlers import menu_for_user
+
 logger = logging.getLogger(__name__)
 
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -74,7 +76,8 @@ CANCEL_TEXT = "❌ Отмена"
     ASK_REG_FIRST_NAME,
     ASK_SETTINGS_ACTION,
     ASK_IMPORT_ACTION,
-) = range(33)
+    ASK_CONFIRM_REMIND,
+) = range(34)
 
 def schedule_description_text() -> str:
     lines = []
@@ -443,6 +446,167 @@ async def register_firstname_received(update: Update, context: ContextTypes.DEFA
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip() if update.message.text else ""
     context.user_data.clear()
-    await update.message.reply_text("Действие отменено.", reply_markup=menu_for_user(update.effective_user.id, update.effective_chat.type))
+    
+    user_id = update.effective_user.id
+    chat_type = update.effective_chat.type
+    
+    if text in (CANCEL_TEXT, "❌ Отмена"):
+        await update.message.reply_text("Действие отменено.", reply_markup=menu_for_user(user_id, chat_type))
+    else:
+        await update.message.reply_text(
+            f"❌ Предыдущее действие отменено.\nПожалуйста, нажмите кнопку *«{text}»* ещё раз для подтверждения.",
+            reply_markup=menu_for_user(user_id, chat_type),
+            parse_mode="Markdown"
+        )
+    return ConversationHandler.END
+
+async def list_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin_check(update): return
+    workers = get_all_workers()
+    if not workers:
+        await update.message.reply_text("В базе данных нет сотрудников.", reply_markup=MAIN_MENU)
+        return
+    
+    by_pos = {}
+    for w in workers:
+        pos = w["position"] or "Не указано"
+        by_pos.setdefault(pos, []).append(w)
+    
+    lines = ["📋 **Список всех сотрудников:**\n"]
+    for pos, w_list in sorted(by_pos.items()):
+        lines.append(f"🏢 **Отдел: {pos}**")
+        for i, w in enumerate(w_list, 1):
+            status = "🟢 Акт" if w["is_active"] else "🔴 Неакт"
+            ndf = "Да" if w["needs_daily_fact"] else "Нет"
+            lines.append(
+                f"  {i}. {w['last_name']} {w['first_name']} (ID: `{w['telegram_id']}`)\n"
+                f"     График: {w['schedule']} | Факт дня: {ndf} | Статус: {status} | Объект: {w['object_id']}"
+            )
+        lines.append("")
+        
+    full_text = "\n".join(lines)
+    if len(full_text) > 4000:
+        for i in range(0, len(full_text), 4000):
+            await update.message.reply_text(full_text[i:i+4000], reply_markup=MAIN_MENU, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(full_text, reply_markup=MAIN_MENU, parse_mode="Markdown")
+
+async def export_reports_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin_check(update): return
+    await update.message.reply_text("⏳ Формирую Excel файл с отчётами...", reply_markup=MAIN_MENU)
+    try:
+        from db import export_reports_to_excel
+        data = export_reports_to_excel()
+        bio = io.BytesIO(data)
+        bio.name = "reports.xlsx"
+        await update.message.reply_document(
+            document=bio,
+            filename="reports.xlsx",
+            caption="📋 Полная выгрузка отчётов из базы данных.",
+            reply_markup=MAIN_MENU
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при формировании файла отчётов: {e}", reply_markup=MAIN_MENU)
+
+async def alert_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin_check(update): return ConversationHandler.END
+    times = get_scheduled_times() or ["19:00"]
+    times_str = ", ".join(times)
+    await update.message.reply_text(
+        f"⏰ **Текущее время авто-сводок:**\n"
+        f"`{times_str}`\n\n"
+        f"Пожалуйста, введите новое время (или список времён через запятую в формате `ЧЧ:ММ`, например: `12:00, 15:00, 19:00`):",
+        reply_markup=CANCEL_KEYBOARD,
+        parse_mode="Markdown"
+    )
+    return ASK_REPORT_TIME
+
+async def alert_time_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text.lower() == "отмена" or text == CANCEL_TEXT:
+        await update.message.reply_text("Действие отменено.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+        
+    parts = [p.strip() for p in text.split(",")]
+    valid_times = []
+    invalid_parts = []
+    
+    import re
+    for p in parts:
+        if re.match(r"^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]$", p):
+            valid_times.append(p)
+        else:
+            invalid_parts.append(p)
+            
+    if invalid_parts:
+        await update.message.reply_text(
+            f"❌ Неверный формат времени: {', '.join(invalid_parts)}.\n"
+            f"Пожалуйста, введите время в формате `ЧЧ:ММ` (например: `19:00` или `10:00, 15:00`):",
+            reply_markup=CANCEL_KEYBOARD
+        )
+        return ASK_REPORT_TIME
+        
+    save_scheduled_times(valid_times)
+    from bot import reschedule_summary_jobs
+    reschedule_summary_jobs(context.application)
+    
+    times_str = ", ".join(valid_times)
+    await update.message.reply_text(
+        f"✅ Время автоматических сводок успешно обновлено: `{times_str}`!",
+        reply_markup=MAIN_MENU,
+        parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+
+async def remind_all_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin_check(update): return ConversationHandler.END
+    await update.message.reply_text(
+        "📣 **Рассылка напоминания всем активным сотрудникам**\n\n"
+        "Вы можете отправить текст напоминания по умолчанию:\n"
+        "_«🔔 Напоминание: пожалуйста, не забудьте вовремя отправить ваш видеоотчёт!»_\n\n"
+        "Напишите свой текст напоминания для отправки или введите `Да`, чтобы использовать стандартный:",
+        reply_markup=CANCEL_KEYBOARD,
+        parse_mode="Markdown"
+    )
+    return ASK_CONFIRM_REMIND
+
+async def remind_all_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import asyncio
+    text = update.message.text.strip()
+    if text.lower() == "отмена" or text == CANCEL_TEXT:
+        await update.message.reply_text("Рассылка отменена.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+        
+    reminder_text = "🔔 Напоминание: пожалуйста, не забудьте вовремя отправить ваш видеоотчёт!"
+    if text.lower() != "да":
+        reminder_text = text
+        
+    workers = get_all_workers()
+    active_workers = [w for w in workers if w["is_active"]]
+    
+    if not active_workers:
+        await update.message.reply_text("Нет активных сотрудников в базе данных.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+        
+    await update.message.reply_text(f"⏳ Отправка сообщения {len(active_workers)} сотрудникам...", reply_markup=MAIN_MENU)
+    
+    success_count = 0
+    fail_count = 0
+    for w in active_workers:
+        try:
+            await context.bot.send_message(chat_id=w["telegram_id"], text=reminder_text)
+            success_count += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.warning(f"Не удалось отправить напоминание {w['telegram_id']}: {e}")
+            fail_count += 1
+            
+    await update.message.reply_text(
+        f"✅ Рассылка завершена!\n"
+        f"Успешно отправлено: {success_count}\n"
+        f"Ошибок отправки: {fail_count}",
+        reply_markup=MAIN_MENU
+    )
     return ConversationHandler.END
