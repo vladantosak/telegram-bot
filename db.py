@@ -598,3 +598,234 @@ def get_all_group_names() -> dict:
     if DEFAULT_GROUP_ID not in res:
         res[DEFAULT_GROUP_ID] = str(DEFAULT_GROUP_ID)
     return res
+
+def get_next_sort_order(position: str) -> int:
+    conn = get_db()
+    row = conn.execute("SELECT MAX(sort_order) as max_order FROM workers WHERE lower(position) = lower(?)", (position,)).fetchone()
+    conn.close()
+    if row and row["max_order"] is not None:
+        return row["max_order"] + 1
+    return 0
+
+def update_worker_field(telegram_id: int, field_name: str, value):
+    conn = get_db()
+    allowed_fields = {"last_name", "first_name", "position", "group_id", "schedule", "needs_daily_fact", "sort_order", "is_active", "object_id"}
+    if field_name in allowed_fields:
+        conn.execute(f"UPDATE workers SET {field_name} = ? WHERE telegram_id = ?", (value, telegram_id))
+        conn.commit()
+    conn.close()
+
+def get_violators_threshold() -> int:
+    try:
+        val = get_setting("violators_threshold")
+        if val is not None:
+            return int(val)
+    except Exception:
+        pass
+    return 3
+
+def save_violators_threshold(val: int):
+    set_setting("violators_threshold", str(val))
+
+def generate_and_send_excel(*args, **kwargs):
+    pass
+
+def generate_and_send_gsheets(*args, **kwargs):
+    pass
+
+def fetch_export_data():
+    return get_all_workers()
+
+def export_workers_to_excel() -> bytes:
+    import openpyxl
+    from openpyxl import Workbook
+    import io
+    
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Workers"
+    
+    headers = [
+        "telegram_id", "last_name", "first_name", "position", 
+        "group_id", "schedule", "needs_daily_fact", "object_id", 
+        "is_active", "sort_order"
+    ]
+    ws.append(headers)
+    
+    workers = get_all_workers()
+    for w in workers:
+        ws.append([
+            w["telegram_id"],
+            w["last_name"],
+            w["first_name"],
+            w["position"],
+            w["group_id"],
+            w["schedule"],
+            w["needs_daily_fact"],
+            w["object_id"],
+            w["is_active"],
+            w["sort_order"]
+        ])
+    
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+def read_excel(file_path: str) -> list[dict]:
+    import openpyxl
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    ws = wb.active
+    
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return []
+        
+    headers = [str(cell).strip() if cell is not None else "" for cell in rows[0]]
+    
+    workers = []
+    for row in rows[1:]:
+        if not any(row):
+            continue
+        row_dict = {}
+        for i, h in enumerate(headers):
+            if i < len(row) and h:
+                row_dict[h] = row[i]
+        
+        if "telegram_id" in row_dict and row_dict["telegram_id"] is not None:
+            try:
+                row_dict["telegram_id"] = int(row_dict["telegram_id"])
+            except ValueError:
+                continue
+            
+            row_dict["last_name"] = str(row_dict.get("last_name", "") or "").strip()
+            row_dict["first_name"] = str(row_dict.get("first_name", "") or "").strip()
+            row_dict["position"] = str(row_dict.get("position", "Не указано") or "Не указано").strip()
+            
+            try:
+                row_dict["group_id"] = int(row_dict.get("group_id", DEFAULT_GROUP_ID) or DEFAULT_GROUP_ID)
+            except ValueError:
+                row_dict["group_id"] = DEFAULT_GROUP_ID
+                
+            row_dict["schedule"] = str(row_dict.get("schedule", "A") or "A").strip().upper()
+            if row_dict["schedule"] not in SCHEDULES:
+                row_dict["schedule"] = "A"
+                
+            ndf = row_dict.get("needs_daily_fact")
+            if ndf in (True, 1, "1", "Да", "да", "yes", "YES", "True", "true"):
+                row_dict["needs_daily_fact"] = True
+            else:
+                row_dict["needs_daily_fact"] = False
+                
+            row_dict["object_id"] = str(row_dict.get("object_id", "Основной") or "Основной").strip()
+            
+            is_act = row_dict.get("is_active")
+            if is_act in (False, 0, "0", "Нет", "нет", "no", "NO", "False", "false"):
+                row_dict["is_active"] = False
+            else:
+                row_dict["is_active"] = True
+                
+            try:
+                row_dict["sort_order"] = int(row_dict.get("sort_order", 0) or 0)
+            except ValueError:
+                row_dict["sort_order"] = 0
+                
+            workers.append(row_dict)
+            
+    return workers
+
+def sync_gsheets_task():
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except ImportError:
+        return
+
+    spreadsheet_id = get_setting("google_spreadsheet_id")
+    creds_str = get_setting("google_service_account")
+    if not spreadsheet_id or not creds_str:
+        return
+
+    try:
+        creds_dict = json.loads(creds_str)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        
+        sheet = client.open_by_key(spreadsheet_id)
+        
+        # 1. Sync Workers to "Сотрудники"
+        workers = get_all_workers()
+        headers_workers = [
+            "telegram_id", "last_name", "first_name", "position", 
+            "group_id", "schedule", "needs_daily_fact", "object_id", 
+            "is_active", "sort_order"
+        ]
+        
+        rows_workers = [headers_workers]
+        for w in workers:
+            rows_workers.append([
+                str(w["telegram_id"]),
+                str(w["last_name"]),
+                str(w["first_name"]),
+                str(w["position"]),
+                str(w["group_id"]),
+                str(w["schedule"]),
+                "Да" if w["needs_daily_fact"] else "Нет",
+                str(w["object_id"]),
+                "Да" if w["is_active"] else "Нет",
+                str(w["sort_order"])
+            ])
+            
+        try:
+            ws_workers = sheet.worksheet("Сотрудники")
+        except gspread.exceptions.WorksheetNotFound:
+            ws_workers = sheet.add_worksheet(title="Сотрудники", rows="1000", cols="20")
+            
+        ws_workers.clear()
+        ws_workers.update("A1", rows_workers)
+        
+        # 2. Sync Reports to "Отчеты"
+        conn = get_db()
+        reports = conn.execute("SELECT * FROM reports ORDER BY id DESC").fetchall()
+        conn.close()
+        
+        headers_reports = [
+            "id", "telegram_id", "report_date", "report_type", "slot_time",
+            "received_at", "is_ok", "is_late", "format_comment", "required_action", "raw_text"
+        ]
+        
+        rows_reports = [headers_reports]
+        for r in reports:
+            rows_reports.append([
+                str(r["id"]),
+                str(r["telegram_id"]),
+                str(r["report_date"]),
+                str(r["report_type"]),
+                str(r["slot_time"] or ""),
+                str(r["received_at"]),
+                "Да" if r["is_ok"] else "Нет",
+                "Да" if r["is_late"] else "Нет",
+                str(r["format_comment"] or ""),
+                str(r["required_action"] or ""),
+                str(r["raw_text"] or "")
+            ])
+            
+        try:
+            ws_reports = sheet.worksheet("Отчеты")
+        except gspread.exceptions.WorksheetNotFound:
+            ws_reports = sheet.add_worksheet(title="Отчеты", rows="5000", cols="20")
+            
+        ws_reports.clear()
+        ws_reports.update("A1", rows_reports)
+        
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"[GSheets Sync Error] {e}")
+
+def async_sync_gsheets_background():
+    import threading
+    t = threading.Thread(target=sync_gsheets_task, daemon=True)
+    t.start()
