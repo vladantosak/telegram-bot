@@ -186,8 +186,9 @@ def main():
     application = Application.builder().token(TOKEN).post_init(post_init).build()
 
     admin_cancel_filter = filters.Regex(
-        r"^(❌ Отмена|📋 Сотрудники|➕ Добавить сотрудника|➖ Удалить сотрудника|🏢 Сотрудники отдела|⏰ Время оповещений о статусах|📣 Напомнить всем|📥 Выгрузить отчеты|📥 Импорт сотрудников|⚙️ Настройки бота)$"
+        r"^(❌ Отмена|❌ Назад|📋 Сотрудники|➕ Добавить сотрудника|➖ Удалить сотрудника|🏢 Сотрудники отдела|⏰ Время оповещений о статусах|📣 Напомнить всем|📥 Выгрузить отчеты|📥 Импорт сотрудников|⚙️ Настройки бота|🔑 Начать регистрацию)$"
     )
+    safe_text_filter = filters.TEXT & ~filters.COMMAND & ~admin_cancel_filter
 
     # Generic handlers
     application.add_handler(CommandHandler("start", start))
@@ -204,13 +205,13 @@ def main():
     add_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ Добавить сотрудника$"), add_worker_start)],
         states={
-            ASK_WORKER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_id)],
-            ASK_LASTNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_lastname)],
-            ASK_FIRSTNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_firstname)],
-            ASK_POSITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_position)],
-            ASK_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_group)],
-            ASK_SCHEDULE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_schedule)],
-            ASK_NEEDS_DAILY_FACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_needs_daily_fact)],
+            ASK_WORKER_ID: [MessageHandler(safe_text_filter, add_worker_id)],
+            ASK_LASTNAME: [MessageHandler(safe_text_filter, add_worker_lastname)],
+            ASK_FIRSTNAME: [MessageHandler(safe_text_filter, add_worker_firstname)],
+            ASK_POSITION: [MessageHandler(safe_text_filter, add_worker_position)],
+            ASK_GROUP: [MessageHandler(safe_text_filter, add_worker_group)],
+            ASK_SCHEDULE: [MessageHandler(safe_text_filter, add_worker_schedule)],
+            ASK_NEEDS_DAILY_FACT: [MessageHandler(safe_text_filter, add_worker_needs_daily_fact)],
         },
         fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )
@@ -220,9 +221,9 @@ def main():
     delete_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➖ Удалить сотрудника$"), delete_worker_start)],
         states={
-            ASK_REMOVE_DEPARTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_worker_department)],
-            ASK_REMOVE_WORKER: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_worker_finish)],
-            ASK_CONFIRM_DELETE: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_worker_confirm)],
+            ASK_REMOVE_DEPARTMENT: [MessageHandler(safe_text_filter, delete_worker_department)],
+            ASK_REMOVE_WORKER: [MessageHandler(safe_text_filter, delete_worker_finish)],
+            ASK_CONFIRM_DELETE: [MessageHandler(safe_text_filter, delete_worker_confirm)],
         },
         fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )
@@ -232,7 +233,7 @@ def main():
     view_dept_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🏢 Сотрудники отдела$"), department_workers_start)],
         states={
-            ASK_DEPARTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, department_workers_show)],
+            ASK_DEPARTMENT: [MessageHandler(safe_text_filter, department_workers_show)],
         },
         fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )
@@ -242,7 +243,7 @@ def main():
     import_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📥 Импорт сотрудников$"), import_workers_start)],
         states={
-            ASK_IMPORT_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, import_workers_action)],
+            ASK_IMPORT_ACTION: [MessageHandler(safe_text_filter, import_workers_action)],
             ASK_IMPORT_FILE: [MessageHandler(filters.Document.ALL, import_workers_file)],
         },
         fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
@@ -253,7 +254,7 @@ def main():
     settings_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^⚙️ Настройки бота$"), settings_start)],
         states={
-            ASK_SETTINGS_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, settings_action)],
+            ASK_SETTINGS_ACTION: [MessageHandler(safe_text_filter, settings_action)],
         },
         fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )
@@ -263,7 +264,7 @@ def main():
     alert_time_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^⏰ Время оповещений о статусах$"), alert_time_start)],
         states={
-            ASK_REPORT_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, alert_time_save)],
+            ASK_REPORT_TIME: [MessageHandler(safe_text_filter, alert_time_save)],
         },
         fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )
@@ -273,7 +274,7 @@ def main():
     remind_all_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📣 Напомнить всем$"), remind_all_start)],
         states={
-            ASK_CONFIRM_REMIND: [MessageHandler(filters.TEXT & ~filters.COMMAND, remind_all_send)],
+            ASK_CONFIRM_REMIND: [MessageHandler(safe_text_filter, remind_all_send)],
         },
         fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )
@@ -283,10 +284,10 @@ def main():
     registration_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🔑 Начать регистрацию$"), register_start)],
         states={
-            ASK_REG_LAST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_lastname_received)],
-            ASK_REG_FIRST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_firstname_received)],
+            ASK_REG_LAST_NAME: [MessageHandler(safe_text_filter, register_lastname_received)],
+            ASK_REG_FIRST_NAME: [MessageHandler(safe_text_filter, register_firstname_received)],
         },
-        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )
     application.add_handler(registration_handler)
 
