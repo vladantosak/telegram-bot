@@ -6568,9 +6568,14 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 old_media_rows = await run_db(get_report_media, existing["id"])
 
         if existing:
-            ai_res = await check_status_async(text_content, report_type_override=report_type)
-            cleaned_text = await clean_report_async(text_content)
-            raw_text_final = text_content
+            # При объединении статусов — ИИ оценивает все видео вместе (старый текст + новый)
+            if do_full_merge and existing.get("raw_text"):
+                combined_text = existing["raw_text"].strip() + "\n" + text_content.strip()
+            else:
+                combined_text = text_content
+            ai_res = await check_status_async(combined_text, report_type_override=report_type)
+            cleaned_text = await clean_report_async(combined_text)
+            raw_text_final = combined_text
             report_id = existing["id"]
             await run_db(
                 update_report_text_and_ai,
