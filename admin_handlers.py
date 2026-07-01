@@ -223,7 +223,7 @@ async def add_worker_firstname(update: Update, context: ContextTypes.DEFAULT_TYP
     return ASK_POSITION
 
 async def add_worker_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["position"] = update.message.text.strip()
+    context.user_data["position"] = clean_position(update.message.text.strip())
     await update.message.reply_text("Введите ID группы Telegram (или 0 для группы по умолчанию):", reply_markup=CANCEL_KEYBOARD)
     return ASK_GROUP
 
@@ -400,7 +400,8 @@ async def edit_worker_field_chosen(update: Update, context: ContextTypes.DEFAULT
     if choice in EDIT_FIELD_MAP:
         field, prompt = EDIT_FIELD_MAP[choice]
         context.user_data["edit_field"] = field
-        await update.message.reply_text(f"Сейчас: {worker.get(field)}\n{prompt}", reply_markup=CANCEL_KEYBOARD)
+        cur_val = clean_position(worker.get(field)) if field == "position" else worker.get(field)
+        await update.message.reply_text(f"Сейчас: {cur_val}\n{prompt}", reply_markup=CANCEL_KEYBOARD)
         return ASK_EDIT_VALUE
 
     await update.message.reply_text("Выберите поле из меню ниже.", reply_markup=EDIT_FIELD_KEYBOARD)
@@ -415,7 +416,9 @@ async def edit_worker_value_received(update: Update, context: ContextTypes.DEFAU
         return ConversationHandler.END
 
     value = raw
-    if field == "group_id":
+    if field == "position":
+        value = clean_position(raw)
+    elif field == "group_id":
         if not raw.lstrip("-").isdigit():
             await update.message.reply_text("Введите число.")
             return ASK_EDIT_VALUE

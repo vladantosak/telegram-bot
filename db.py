@@ -697,12 +697,13 @@ def export_reports_to_excel() -> bytes:
     for r in reports:
         t_id = r["telegram_id"]
         if t_id not in workers_cache:
-            w_row = conn.execute("SELECT last_name, first_name, position FROM workers WHERE telegram_id = ?", (t_id,)).fetchone()
+            w_row = conn.execute("SELECT last_name, first_name, position, object_id FROM workers WHERE telegram_id = ?", (t_id,)).fetchone()
             if w_row:
-                workers_cache[t_id] = (w_row["last_name"], w_row["first_name"], w_row["position"])
+                position_display = f"{clean_position(w_row['position'])} ({w_row['object_id'] or 'Основной'})"
+                workers_cache[t_id] = (w_row["last_name"], w_row["first_name"], position_display)
             else:
                 workers_cache[t_id] = ("Неизвестно", "Неизвестно", "Неизвестно")
-                
+
         last_name, first_name, position = workers_cache[t_id]
         
         ws.append([
@@ -844,7 +845,7 @@ def read_excel(file_path: str) -> list[dict]:
             
             row_dict["last_name"] = str(row_dict.get("last_name", "") or "").strip()
             row_dict["first_name"] = str(row_dict.get("first_name", "") or "").strip()
-            row_dict["position"] = str(row_dict.get("position", "Не указано") or "Не указано").strip()
+            row_dict["position"] = clean_position(str(row_dict.get("position", "Не указано") or "Не указано"))
             
             try:
                 row_dict["group_id"] = int(row_dict.get("group_id", DEFAULT_GROUP_ID) or DEFAULT_GROUP_ID)
