@@ -36,11 +36,13 @@ from admin_handlers import (
     import_workers_start, import_workers_action, import_workers_file,
     register_start, register_lastname_received, register_firstname_received,
     settings_start, settings_action, cancel,
+    list_workers_action, export_reports_action, alert_time_start, alert_time_save,
+    remind_all_start, remind_all_send,
     ASK_WORKER_ID, ASK_LASTNAME, ASK_FIRSTNAME, ASK_POSITION, ASK_GROUP,
     ASK_SCHEDULE, ASK_NEEDS_DAILY_FACT, ASK_REMOVE_DEPARTMENT, ASK_REMOVE_WORKER,
     ASK_DEPARTMENT, ASK_REG_LAST_NAME, ASK_REG_FIRST_NAME, ASK_SETTINGS_ACTION,
     ASK_CONFIRM_DELETE, ASK_IMPORT_ACTION, ASK_IMPORT_FILE, ASK_GSHEETS_URL,
-    ASK_GSHEETS_CREDS
+    ASK_GSHEETS_CREDS, ASK_REPORT_TIME, ASK_CONFIRM_REMIND
 )
 
 # Set up logging
@@ -183,12 +185,20 @@ def main():
 
     application = Application.builder().token(TOKEN).post_init(post_init).build()
 
+    admin_cancel_filter = filters.Regex(
+        r"^(❌ Отмена|📋 Сотрудники|➕ Добавить сотрудника|➖ Удалить сотрудника|🏢 Сотрудники отдела|⏰ Время оповещений о статусах|📣 Напомнить всем|📥 Выгрузить отчеты|📥 Импорт сотрудников|⚙️ Настройки бота)$"
+    )
+
     # Generic handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("top", top_command))
     application.add_handler(CommandHandler("set_object_group", set_object_group_command))
     application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CommandHandler("quiet_mode", cmd_quiet_mode))
+
+    # Single-click actions
+    application.add_handler(MessageHandler(filters.Regex("^📋 Сотрудники$"), list_workers_action))
+    application.add_handler(MessageHandler(filters.Regex("^📥 Выгрузить отчеты$"), export_reports_action))
 
     # Add worker ConversationHandler
     add_handler = ConversationHandler(
@@ -202,7 +212,7 @@ def main():
             ASK_SCHEDULE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_schedule)],
             ASK_NEEDS_DAILY_FACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_needs_daily_fact)],
         },
-        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )
     application.add_handler(add_handler)
 
@@ -214,7 +224,7 @@ def main():
             ASK_REMOVE_WORKER: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_worker_finish)],
             ASK_CONFIRM_DELETE: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_worker_confirm)],
         },
-        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )
     application.add_handler(delete_handler)
 
@@ -224,7 +234,7 @@ def main():
         states={
             ASK_DEPARTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, department_workers_show)],
         },
-        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )
     application.add_handler(view_dept_handler)
 
@@ -235,7 +245,7 @@ def main():
             ASK_IMPORT_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, import_workers_action)],
             ASK_IMPORT_FILE: [MessageHandler(filters.Document.ALL, import_workers_file)],
         },
-        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )
     application.add_handler(import_handler)
 
@@ -245,9 +255,29 @@ def main():
         states={
             ASK_SETTINGS_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, settings_action)],
         },
-        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
+        fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )
     application.add_handler(settings_handler)
+
+    # Alert summary time handler
+    alert_time_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^⏰ Время оповещений о статусах$"), alert_time_start)],
+        states={
+            ASK_REPORT_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, alert_time_save)],
+        },
+        fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
+    )
+    application.add_handler(alert_time_handler)
+
+    # Manual notification blast reminder
+    remind_all_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📣 Напомнить всем$"), remind_all_start)],
+        states={
+            ASK_CONFIRM_REMIND: [MessageHandler(filters.TEXT & ~filters.COMMAND, remind_all_send)],
+        },
+        fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
+    )
+    application.add_handler(remind_all_handler)
 
     # Registration Handler
     registration_handler = ConversationHandler(
