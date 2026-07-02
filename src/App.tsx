@@ -356,7 +356,7 @@ export default function App() {
                       <th className="py-4 px-6">Должность</th>
                       <th className="py-4 px-6">ID Группы</th>
                       <th className="py-4 px-6">График</th>
-                      <th className="py-4 px-6">Факт Дня</th>
+                      <th className="py-4 px-6">Факт</th>
                       <th className="py-4 px-6">Статус</th>
                     </tr>
                   </thead>

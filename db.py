@@ -45,6 +45,27 @@ def clean_position(position: str | None) -> str:
     text = (position or "Не указано").strip()
     return re.sub(r"\s*\([^()]*\)\s*$", "", text).strip() or "Не указано"
 
+def extract_issue_lines(format_comment: str) -> list[str]:
+    """Turns an AI-generated format_comment (possibly multi-video, e.g. 'Видео 1: не ОК -
+    на видео молчал; Видео 2: ОК - сказал что сделал') into a plain list of just the
+    negative remarks, one per line — no 'Видео N:'/'не ОК -' labels, no clean videos."""
+    parts = [p.strip() for p in (format_comment or "").split(";") if p.strip()]
+    lines = []
+    for part in parts:
+        part = re.sub(r"^Видео\s*\d+\s*:\s*", "", part, flags=re.IGNORECASE).strip()
+        low = part.lower()
+        if low.startswith("не ок"):
+            issue = re.sub(r"^не\s*ок\s*-?\s*", "", part, flags=re.IGNORECASE).strip()
+            if issue:
+                lines.append(issue[0].upper() + issue[1:])
+        elif low.startswith("ок"):
+            continue
+        elif part:
+            lines.append(part[0].upper() + part[1:])
+    return lines
+
+STATUS_ACCEPT_WINDOW_MIN = 60  # сколько ждать после времени слота, прежде чем считать статус несданным
+
 ENCRYPTED_SETTING_KEYS = {"google_service_account"}
 _fernet = None
 
@@ -1124,7 +1145,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
         workers = get_all_workers()
         headers_workers = [
             "Отдел", "ФИО сотрудника", "Должность", "Telegram ID",
-            "ID Группы", "График", "Факт дня", "Активен", "Порядок сортировки"
+            "ID Группы", "График", "Факт", "Активен", "Порядок сортировки"
         ]
         
         rows_workers = [headers_workers]
@@ -1443,7 +1464,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
 
                     if d_str in not_working_dates:
                         cell_value = False
-                    elif d == today_date and (now.hour * 60 + now.minute) <= hour * 60 + minute + LATE_THRESHOLD_MIN:
+                    elif d == today_date and (now.hour * 60 + now.minute) <= hour * 60 + minute + STATUS_ACCEPT_WINDOW_MIN:
                         cell_value = ""
                     else:
                         rep = status_map.get((d_str, slot))
@@ -1463,11 +1484,8 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                             except (ValueError, IndexError):
                                 pass
                             if not rep["is_ok"]:
-                                remark = (rep["format_comment"] or "").strip()
-                                action = (rep["required_action"] or "").strip()
-                                note_parts.append(f"Замечание: {remark}" if remark else "Есть замечание")
-                                if action:
-                                    note_parts.append(f"Требуется: {action}")
+                                issues = extract_issue_lines(rep["format_comment"])
+                                note_parts.extend(issues if issues else ["Есть замечание"])
                             if note_parts:
                                 fresh_note = "\n".join(note_parts)
                             if is_late_submit:
@@ -1486,6 +1504,15 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                                 cell_value = True  # a manual tick in the sheet always wins over "missed"
                             else:
                                 fresh_note = missed_reasons.get((d_str, slot))
+                                format_requests.append({
+                                    "repeatCell": {
+                                        "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
+                                                  "endRowIndex": len(rows_summary) + 1,
+                                                  "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
+                                        "cell": {"userEnteredFormat": {"backgroundColor": PINK}},
+                                        "fields": "userEnteredFormat(backgroundColor)"
+                                    }
+                                })
 
                     row_cells.append(cell_value)
 
@@ -1503,18 +1530,18 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
 
                 rows_summary.append(row_cells)
 
-            # "Факт дня" gets its own row per worker, independent of the per-slot status rows
+            # "Факт" gets its own row per worker, independent of the per-slot status rows
             # above — own checkboxes, own notes, sourced from report_type='daily_fact' instead
             # of 'status'. Only shown for workers who are actually expected to submit one.
             if include_fact_row:
-                row_cells = ["", "Факт дня"]
+                row_cells = ["", "Факт"]
                 last_slot = slots[-1]
                 last_hour, last_minute = map(int, last_slot.split(":"))
                 for col_idx, d in enumerate(date_list):
                     abs_col = 2 + col_idx
                     d_str = d.strftime("%Y-%m-%d")
                     date_label = headers_summary[abs_col]
-                    old_entry = old_map.get((name_text, "Факт дня", date_label))
+                    old_entry = old_map.get((name_text, "Факт", date_label))
                     fresh_note = None
 
                     if d < hire_date:
@@ -1534,17 +1561,24 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                             cell_value = True
                             note_parts = []
                             if not rep["is_ok"]:
-                                remark = (rep["format_comment"] or "").strip()
-                                action = (rep["required_action"] or "").strip()
-                                note_parts.append(f"Замечание: {remark}" if remark else "Есть замечание")
-                                if action:
-                                    note_parts.append(f"Требуется: {action}")
+                                issues = extract_issue_lines(rep["format_comment"])
+                                note_parts.extend(issues if issues else ["Есть замечание"])
                             if note_parts:
                                 fresh_note = "\n".join(note_parts)
                         else:
                             cell_value = False
                             if old_entry and old_entry.get("bool") is True:
                                 cell_value = True  # a manual tick in the sheet always wins over "missed"
+                            else:
+                                format_requests.append({
+                                    "repeatCell": {
+                                        "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
+                                                  "endRowIndex": len(rows_summary) + 1,
+                                                  "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
+                                        "cell": {"userEnteredFormat": {"backgroundColor": PINK}},
+                                        "fields": "userEnteredFormat(backgroundColor)"
+                                    }
+                                })
 
                     row_cells.append(cell_value)
 

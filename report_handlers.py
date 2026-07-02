@@ -345,7 +345,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         logger.info(f"[process_media_batch] Видео {idx}/{len(items)} пользователя {user_id}: текст='{text_content[:80]}'")
 
         last_slot_time = now.replace(hour=last_hour, minute=last_minute, second=0, microsecond=0)
-        last_slot_limit = last_slot_time + dt_module.timedelta(minutes=LATE_THRESHOLD_MIN)
+        last_slot_limit = last_slot_time + dt_module.timedelta(minutes=STATUS_LATE_TOLERANCE_MIN)
         forced_type = "status" if now <= last_slot_limit else None
 
         ai_res_pre = await check_status_async(text_content, report_type_override=forced_type)
@@ -971,7 +971,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last_slot_time_str = sched_list[-1]
         last_hour, last_minute = map(int, last_slot_time_str.split(":"))
         last_slot_time = now.replace(hour=last_hour, minute=last_minute, second=0, microsecond=0)
-        last_slot_limit = last_slot_time + dt_module.timedelta(minutes=LATE_THRESHOLD_MIN)
+        last_slot_limit = last_slot_time + dt_module.timedelta(minutes=STATUS_LATE_TOLERANCE_MIN)
 
         report_type_override = "status" if now <= last_slot_limit else None
 
