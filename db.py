@@ -1762,7 +1762,41 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
         logging.getLogger(__name__).error(f"[GSheets Sync Error] {e}")
         return False, str(e)
 
+_gsheets_sync_lock = None
+_gsheets_sync_state_lock = None
+_gsheets_sync_pending = False
+
 def async_sync_gsheets_background():
+    # BUG FIX: this used to spawn a brand-new thread on every call with no coordination.
+    # save_report()/delete_worker()/etc. all call this after every single report, so at
+    # end-of-day when several workers submit within seconds of each other, this could fire
+    # 5-10 overlapping threads, each doing its own full read of `reports` plus dozens of
+    # Google Sheets API calls (clear + rebuild) against the SAME spreadsheet concurrently -
+    # wasted API quota, risk of 429 rate-limit errors, and interleaved writes to the same
+    # sheet from independent runs. Now at most one sync runs at a time; a request that
+    # arrives while one is already running just sets a "run once more" flag instead of
+    # starting a second thread, and the running sync re-executes once more before exiting
+    # so it still picks up whatever triggered the extra request.
     import threading
-    t = threading.Thread(target=sync_gsheets_task, daemon=True)
-    t.start()
+    global _gsheets_sync_lock, _gsheets_sync_state_lock, _gsheets_sync_pending
+    if _gsheets_sync_lock is None:
+        _gsheets_sync_lock = threading.Lock()
+        _gsheets_sync_state_lock = threading.Lock()
+
+    with _gsheets_sync_state_lock:
+        if _gsheets_sync_lock.locked():
+            _gsheets_sync_pending = True
+            return
+
+    def _run():
+        global _gsheets_sync_pending
+        with _gsheets_sync_lock:
+            while True:
+                sync_gsheets_task()
+                with _gsheets_sync_state_lock:
+                    if _gsheets_sync_pending:
+                        _gsheets_sync_pending = False
+                        continue
+                    break
+
+    threading.Thread(target=_run, daemon=True).start()
