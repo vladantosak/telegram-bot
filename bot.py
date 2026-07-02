@@ -189,7 +189,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if is_admin(user_id) and chat_type == "private":
         await update.message.reply_text("Привет! Выберите действие кнопкой ниже.", reply_markup=MAIN_MENU)
-    elif chat_type == "private" and get_worker(user_id) is None:
+        return
+    worker = await run_db(get_worker, user_id) if chat_type == "private" else None
+    if chat_type == "private" and worker is None:
         await update.message.reply_text(
             "👋 Добро пожаловать! Чтобы начать сдавать отчёты, сначала зарегистрируйтесь — нажмите кнопку ниже.",
             reply_markup=menu_for_user(user_id, chat_type)
@@ -199,7 +201,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_admin(user_id) and get_worker(user_id) is None:
+    if not is_admin(user_id) and await run_db(get_worker, user_id) is None:
         await update.message.reply_text("Эта команда доступна только сотрудникам и администраторам.")
         return
     await update.message.reply_text("🏆 Рейтинг лучших сотрудников формируется в Google Таблице во вкладке 'Аналитика'.")
@@ -215,14 +217,14 @@ async def set_object_group_command(update: Update, context: ContextTypes.DEFAULT
     from db import save_object_group
     obj_name = args[0]
     group_id = int(args[1]) if len(args) > 1 else update.effective_chat.id
-    save_object_group(obj_name, group_id)
+    await run_db(save_object_group, obj_name, group_id)
     await update.message.reply_text(f"✅ Объект *{obj_name}* успешно привязан к группе `{group_id}`!", parse_mode="Markdown")
 
 async def cmd_quiet_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     from db import set_quiet_mode, is_quiet_mode_enabled
-    curr = is_quiet_mode_enabled()
-    set_quiet_mode(not curr)
+    curr = await run_db(is_quiet_mode_enabled)
+    await run_db(set_quiet_mode, not curr)
     status_label = "ВКЛЮЧЕН" if not curr else "ВЫКЛЮЧЕН"
     await update.message.reply_text(f"🔇 Тихий режим {status_label}.")
 

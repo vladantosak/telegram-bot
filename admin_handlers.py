@@ -298,7 +298,7 @@ async def add_worker_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker_id = int(raw)
     context.user_data["new_worker_id"] = worker_id
     
-    pending = get_pending_unregistered_user(worker_id)
+    pending = await run_db(get_pending_unregistered_user, worker_id)
     if pending:
         context.user_data["pending_last_name"] = pending["last_name"]
         context.user_data["pending_first_name"] = pending["first_name"]
@@ -417,7 +417,7 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
 
 async def delete_worker_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin_check(update): return ConversationHandler.END
-    rows = get_all_workers()
+    rows = await run_db(get_all_workers)
     if not rows:
         await update.message.reply_text("В базе нет сотрудников.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
@@ -427,7 +427,7 @@ async def delete_worker_start(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def delete_worker_department(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dept = update.message.text.strip()
-    rows = get_workers_by_object_id(dept)
+    rows = await run_db(get_workers_by_object_id, dept)
     if not rows: return ConversationHandler.END
     context.user_data["remove_rows"] = [dict(r) for r in rows]
     await update.message.reply_text("Выберите кого удалить:", reply_markup=numbered_workers_keyboard(rows))
@@ -464,7 +464,7 @@ async def delete_worker_confirm(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def department_workers_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin_check(update): return ConversationHandler.END
-    rows = get_all_workers()
+    rows = await run_db(get_all_workers)
     if not rows:
         await update.message.reply_text("В базе нет сотрудников.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
@@ -474,7 +474,7 @@ async def department_workers_start(update: Update, context: ContextTypes.DEFAULT
 
 async def department_workers_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dept = update.message.text.strip()
-    rows = get_workers_by_object_id(dept)
+    rows = await run_db(get_workers_by_object_id, dept)
     if not rows:
         await update.message.reply_text("Сотрудники не найдены.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
@@ -683,7 +683,7 @@ async def import_workers_action(update: Update, context: ContextTypes.DEFAULT_TY
     if choice == "📤 Скачать текущий список сотрудников":
         await update.message.reply_text("⏳ Формирую файл...", reply_markup=CANCEL_KEYBOARD)
         try:
-            data = export_workers_to_excel()
+            data = await run_db(export_workers_to_excel)
             bio = io.BytesIO(data)
             bio.name = "workers.xlsx"
             await update.message.reply_document(
@@ -728,7 +728,7 @@ async def import_workers_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         tg_file = await context.bot.get_file(doc.file_id)
         local_path = "workers_temp_import.xlsx"
         await tg_file.download_to_drive(local_path)
-        workers = read_excel(local_path)
+        workers = await run_db(read_excel, local_path)
         if not workers:
             await update.message.reply_text(
                 "⚠️ В файле не найдено ни одной записи с заполненным Telegram ID.\n"
@@ -1029,7 +1029,7 @@ async def export_reports_choice(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("⏳ Формирую Excel файл с отчётами...", reply_markup=MAIN_MENU)
         try:
             from db import export_reports_to_excel
-            data = export_reports_to_excel()
+            data = await run_db(export_reports_to_excel)
             bio = io.BytesIO(data)
             bio.name = "reports.xlsx"
             await update.message.reply_document(
@@ -1044,8 +1044,8 @@ async def export_reports_choice(update: Update, context: ContextTypes.DEFAULT_TY
 
     if choice == "🔄 Синхронизировать сейчас":
         from db import get_setting, sync_gsheets_task
-        spreadsheet_id = get_setting("google_spreadsheet_id")
-        creds_str = get_setting("google_service_account")
+        spreadsheet_id = await run_db(get_setting, "google_spreadsheet_id")
+        creds_str = await run_db(get_setting, "google_service_account")
         if not spreadsheet_id or not creds_str:
             await update.message.reply_text(
                 "❌ Google Таблица не настроена. Пожалуйста, сначала настройте Google Таблицу в «⚙️ Настройки бота».",
@@ -1066,7 +1066,7 @@ async def export_reports_choice(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def alert_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin_check(update): return ConversationHandler.END
-    times = get_scheduled_times() or ["19:00"]
+    times = await run_db(get_scheduled_times) or ["19:00"]
     times_str = ", ".join(times)
     await update.message.reply_text(
         f"⏰ **Текущее время авто-сводок:**\n"
@@ -1137,7 +1137,7 @@ async def remind_all_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.lower() != "да":
         reminder_text = text
         
-    workers = get_all_workers()
+    workers = await run_db(get_all_workers)
     active_workers = [w for w in workers if w["is_active"]]
     
     if not active_workers:

@@ -744,16 +744,20 @@ def get_group_name(group_id: int) -> str:
     conn.close()
     return row["group_name"] if row else str(group_id)
 
-async def get_group_name_async(bot, group_id: int) -> str:
+def _get_group_name_row(group_id: int):
     conn = get_db()
     row = conn.execute("SELECT group_name FROM groups WHERE group_id = ?", (group_id,)).fetchone()
     conn.close()
+    return row
+
+async def get_group_name_async(bot, group_id: int) -> str:
+    row = await run_db(_get_group_name_row, group_id)
     if row:
         return row["group_name"]
     try:
         chat = await bot.get_chat(group_id)
         name = chat.title or str(group_id)
-        save_group_name(group_id, name)
+        await run_db(save_group_name, group_id, name)
         return name
     except Exception:
         return str(group_id)
@@ -764,7 +768,7 @@ async def fetch_and_save_group_name(bot, group_id: int) -> str:
         name = chat.title or str(group_id)
     except Exception:
         name = str(group_id)
-    save_group_name(group_id, name)
+    await run_db(save_group_name, group_id, name)
     return name
 
 def get_all_group_names() -> dict:

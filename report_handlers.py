@@ -349,9 +349,13 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             logger.error(f"Ошибка копирования видео факта дня в чат {dest_chat}: {e}")
 
         # Fact reports CAN be notified to admins (only status notifications are restricted to group chat)
-        conn = get_db()
-        report_row = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        conn.close()
+        def _fetch_report_row():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            conn.close()
+            return r
+
+        report_row = await run_db(_fetch_report_row)
 
         notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name)
 
@@ -541,9 +545,13 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 logger.warning(f"Не удалось удалить старую оценку {old_eval['group_message_id']}: {e}")
 
         # Construct beautiful general comment for the group!
-        conn = get_db()
-        report_row = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        conn.close()
+        def _fetch_report_row2():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            conn.close()
+            return r
+
+        report_row = await run_db(_fetch_report_row2)
 
         notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name)
 
@@ -626,47 +634,53 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not new_comment or new_comment.lower() in ("отмена", "❌ отмена"):
             return
             
-        conn = get_db()
-        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        if not report:
+        def _apply_manual_comment():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            if not r:
+                conn.close()
+                return None, None
+
+            if video_num is not None:
+                # We are editing a specific video's comment!
+                video_items = parse_video_comments(r["format_comment"])
+                for item in video_items:
+                    if item["num"] == video_num:
+                        cleaned_comment = new_comment.strip()
+                        if cleaned_comment.lower().startswith("ок"):
+                            item["is_ok"] = True
+                            item["comment"] = cleaned_comment[2:].strip().lstrip("-").strip()
+                        elif cleaned_comment.lower().startswith("не ок"):
+                            item["is_ok"] = False
+                            item["comment"] = cleaned_comment[5:].strip().lstrip("-").strip()
+                        else:
+                            item["comment"] = cleaned_comment
+
+                new_format_comment = rebuild_format_comment(video_items)
+                new_overall_ok = all(item["is_ok"] for item in video_items)
+                new_action = f"Комментарий видео {video_num} изменен администратором вручную: {new_comment}"
+                conn.execute(
+                    "UPDATE reports SET format_comment = ?, is_ok = ?, required_action = ? WHERE id = ?",
+                    (new_format_comment, 1 if new_overall_ok else 0, new_action, report_id)
+                )
+            else:
+                # We are editing the overall / general comment!
+                new_action = f"Комментарий изменен администратором вручную: {new_comment}"
+                conn.execute(
+                    "UPDATE reports SET format_comment = ?, required_action = ? WHERE id = ?",
+                    (new_comment, new_action, report_id)
+                )
+
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            w = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (r["telegram_id"],)).fetchone()
+            conn.commit()
             conn.close()
+            return r, w
+
+        report, worker = await run_db(_apply_manual_comment)
+        if not report:
             return
-            
-        if video_num is not None:
-            # We are editing a specific video's comment!
-            video_items = parse_video_comments(report["format_comment"])
-            for item in video_items:
-                if item["num"] == video_num:
-                    cleaned_comment = new_comment.strip()
-                    if cleaned_comment.lower().startswith("ок"):
-                        item["is_ok"] = True
-                        item["comment"] = cleaned_comment[2:].strip().lstrip("-").strip()
-                    elif cleaned_comment.lower().startswith("не ок"):
-                        item["is_ok"] = False
-                        item["comment"] = cleaned_comment[5:].strip().lstrip("-").strip()
-                    else:
-                        item["comment"] = cleaned_comment
-                        
-            new_format_comment = rebuild_format_comment(video_items)
-            new_overall_ok = all(item["is_ok"] for item in video_items)
-            new_action = f"Комментарий видео {video_num} изменен администратором вручную: {new_comment}"
-            conn.execute(
-                "UPDATE reports SET format_comment = ?, is_ok = ?, required_action = ? WHERE id = ?",
-                (new_format_comment, 1 if new_overall_ok else 0, new_action, report_id)
-            )
-        else:
-            # We are editing the overall / general comment!
-            new_action = f"Комментарий изменен администратором вручную: {new_comment}"
-            conn.execute(
-                "UPDATE reports SET format_comment = ?, required_action = ? WHERE id = ?",
-                (new_comment, new_action, report_id)
-            )
-            
-        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
-        conn.commit()
-        conn.close()
-        
+
         async_sync_gsheets_background()
         
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
@@ -759,7 +773,8 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "timestamp": datetime.now().isoformat(),
                 "text": text_content
             }
-            save_pending_unregistered_user(
+            await run_db(
+                save_pending_unregistered_user,
                 telegram_id=user_id,
                 first_name=user_info["first_name"],
                 last_name=user_info["last_name"],
@@ -881,13 +896,18 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text_content in ("🛌 Не работаю сегодня", "Не работаю сегодня") or text_content.lower() == "не работаю сегодня":
             now = now_local()
             date_str = now.strftime("%Y-%m-%d")
-            conn = get_db()
-            existing_not_working = conn.execute(
-                "SELECT * FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = 'not_working'",
-                (user_id, date_str)
-            ).fetchone()
-            conn.close()
-            
+
+            def _fetch_not_working():
+                conn = get_db()
+                r = conn.execute(
+                    "SELECT * FROM reports WHERE telegram_id = ? AND report_date = ? AND report_type = 'not_working'",
+                    (user_id, date_str)
+                ).fetchone()
+                conn.close()
+                return r
+
+            existing_not_working = await run_db(_fetch_not_working)
+
             if existing_not_working:
                 await update.message.reply_text("У вас уже установлен статус «Не работаю сегодня» на сегодня.", reply_markup=menu_for_user(user_id, update.effective_chat.type))
                 return
@@ -1036,11 +1056,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # 1. Back to main menu
     if data.startswith("back_to_main_"):
         report_id = int(data.split("_")[-1])
-        conn = get_db()
-        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone() if report else None
-        conn.close()
-        
+
+        def _fetch_report_and_worker():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            w = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (r["telegram_id"],)).fetchone() if r else None
+            conn.close()
+            return r, w
+
+        report, worker = await run_db(_fetch_report_and_worker)
+
         if report and worker:
             worker_name = f"{worker['last_name']} {worker['first_name']}"
             text, kbd = await render_report_message_from_row(report, worker_name)
@@ -1053,24 +1078,31 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # 2. Toggle type (status <-> daily_fact)
     if data.startswith("toggle_type_"):
         report_id = int(data.split("_")[-1])
-        conn = get_db()
-        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        if not report:
+
+        def _toggle_type():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            if not r:
+                conn.close()
+                return None, None
+
+            new_type = "daily_fact" if r["report_type"] == "status" else "status"
+            new_slot_time = r["slot_time"]
+            if new_type == "status" and not new_slot_time:
+                new_slot_time = "10:00"
+
+            conn.execute("UPDATE reports SET report_type = ?, slot_time = ? WHERE id = ?", (new_type, new_slot_time, report_id))
+            conn.commit()
+
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            w = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (r["telegram_id"],)).fetchone()
             conn.close()
+            return r, w
+
+        report, worker = await run_db(_toggle_type)
+        if not report:
             return
-            
-        new_type = "daily_fact" if report["report_type"] == "status" else "status"
-        new_slot_time = report["slot_time"]
-        if new_type == "status" and not new_slot_time:
-            new_slot_time = "10:00"
-            
-        conn.execute("UPDATE reports SET report_type = ?, slot_time = ? WHERE id = ?", (new_type, new_slot_time, report_id))
-        conn.commit()
-        
-        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
-        conn.close()
-        
+
         async_sync_gsheets_background()
         
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
@@ -1084,13 +1116,18 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # 3. Main Toggle Button -> Choose overall or video
     if data.startswith("fix_toggle_"):
         report_id = int(data.split("_")[-1])
-        conn = get_db()
-        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        conn.close()
-        
+
+        def _fetch_report():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            conn.close()
+            return r
+
+        report = await run_db(_fetch_report)
+
         if not report:
             return
-            
+
         video_items = parse_video_comments(report["format_comment"])
         if len(video_items) > 1:
             kbd = make_video_selection_keyboard(report_id, "toggle", video_items)
@@ -1104,14 +1141,18 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             if video_items:
                 video_items[0]["is_ok"] = (new_is_ok == 1)
                 new_format_comment = rebuild_format_comment(video_items)
-                
-            conn = get_db()
-            conn.execute("UPDATE reports SET is_ok = ?, format_comment = ? WHERE id = ?", (new_is_ok, new_format_comment, report_id))
-            conn.commit()
-            report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-            worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
-            conn.close()
-            
+
+            def _apply_fix_toggle():
+                conn = get_db()
+                conn.execute("UPDATE reports SET is_ok = ?, format_comment = ? WHERE id = ?", (new_is_ok, new_format_comment, report_id))
+                conn.commit()
+                r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+                w = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (r["telegram_id"],)).fetchone()
+                conn.close()
+                return r, w
+
+            report, worker = await run_db(_apply_fix_toggle)
+
             async_sync_gsheets_background()
             
             worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
@@ -1125,20 +1166,27 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # 4. Toggle Overall
     if data.startswith("tg_overall_"):
         report_id = int(data.split("_")[-1])
-        conn = get_db()
-        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        if not report:
+
+        def _toggle_overall():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            if not r:
+                conn.close()
+                return None, None
+
+            new_is_ok = 0 if r["is_ok"] == 1 else 1
+            conn.execute("UPDATE reports SET is_ok = ? WHERE id = ?", (new_is_ok, report_id))
+            conn.commit()
+
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            w = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (r["telegram_id"],)).fetchone()
             conn.close()
+            return r, w
+
+        report, worker = await run_db(_toggle_overall)
+        if not report:
             return
-            
-        new_is_ok = 0 if report["is_ok"] == 1 else 1
-        conn.execute("UPDATE reports SET is_ok = ? WHERE id = ?", (new_is_ok, report_id))
-        conn.commit()
-        
-        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
-        conn.close()
-        
+
         async_sync_gsheets_background()
         
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
@@ -1155,30 +1203,36 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         report_id = int(parts[2])
         video_num = int(parts[3])
         
-        conn = get_db()
-        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        if not report:
+        def _toggle_video():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            if not r:
+                conn.close()
+                return None, None
+
+            video_items = parse_video_comments(r["format_comment"])
+            for item in video_items:
+                if item["num"] == video_num:
+                    item["is_ok"] = not item["is_ok"]
+
+            new_overall_ok = all(item["is_ok"] for item in video_items)
+            new_format_comment = rebuild_format_comment(video_items)
+
+            conn.execute(
+                "UPDATE reports SET is_ok = ?, format_comment = ? WHERE id = ?",
+                (1 if new_overall_ok else 0, new_format_comment, report_id)
+            )
+            conn.commit()
+
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            w = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (r["telegram_id"],)).fetchone()
             conn.close()
+            return r, w
+
+        report, worker = await run_db(_toggle_video)
+        if not report:
             return
-            
-        video_items = parse_video_comments(report["format_comment"])
-        for item in video_items:
-            if item["num"] == video_num:
-                item["is_ok"] = not item["is_ok"]
-                
-        new_overall_ok = all(item["is_ok"] for item in video_items)
-        new_format_comment = rebuild_format_comment(video_items)
-        
-        conn.execute(
-            "UPDATE reports SET is_ok = ?, format_comment = ? WHERE id = ?",
-            (1 if new_overall_ok else 0, new_format_comment, report_id)
-        )
-        conn.commit()
-        
-        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        worker = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (report["telegram_id"],)).fetchone()
-        conn.close()
-        
+
         async_sync_gsheets_background()
         
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
@@ -1192,10 +1246,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # 6. Main Edit Comment Button -> Choose overall or video
     if data.startswith("edit_comment_"):
         report_id = int(data.split("_")[-1])
-        conn = get_db()
-        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        conn.close()
-        
+
+        def _fetch_report():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            conn.close()
+            return r
+
+        report = await run_db(_fetch_report)
+
         if not report:
             return
             
