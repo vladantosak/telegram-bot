@@ -143,6 +143,8 @@ async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         deleted_pre_reminders = conn.execute(
             "DELETE FROM sent_pre_reminders WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)"
         ).rowcount
+        conn.execute("DELETE FROM pending_reason_requests WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)")
+        conn.execute("DELETE FROM missed_status_reasons WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)")
         conn.commit()
         conn.close()
         async_sync_gsheets_background()

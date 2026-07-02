@@ -22,7 +22,8 @@ from db import (
     DEFAULT_GROUP_ID, LATE_THRESHOLD_MIN, LOCAL_TZ, SCHEDULES, SCHEDULE_A,
     is_admin, ADMIN_IDS, save_scheduled_times, get_scheduled_times,
     get_group_name_async, now_local, get_submitted_status_slots, clean_position,
-    has_pre_reminder_sent, mark_pre_reminder_sent
+    has_pre_reminder_sent, mark_pre_reminder_sent,
+    has_pending_reason_request, create_pending_reason_request
 )
 
 PRE_REMINDER_WINDOW_MIN = (10, 15)  # send when a slot is 10-15 minutes away
@@ -260,6 +261,47 @@ async def pre_reminder_check_callback(context: ContextTypes.DEFAULT_TYPE):
                     pass
                 mark_pre_reminder_sent(w["telegram_id"], date_str, slot)
 
+async def missed_status_check_callback(context: ContextTypes.DEFAULT_TYPE):
+    now = now_local()
+    date_str = now.strftime("%Y-%m-%d")
+    current_mins = now.hour * 60 + now.minute
+
+    conn = get_db()
+    workers = conn.execute("SELECT * FROM workers WHERE is_active = 1").fetchall()
+    not_working_today = {
+        r["telegram_id"] for r in conn.execute(
+            "SELECT telegram_id FROM reports WHERE report_date = ? AND report_type = 'not_working'",
+            (date_str,)
+        ).fetchall()
+    }
+    conn.close()
+
+    for w in workers:
+        if w["telegram_id"] in not_working_today:
+            continue
+        submitted = get_submitted_status_slots(w["telegram_id"], date_str)
+        for slot in SCHEDULES.get(w["schedule"], SCHEDULE_A):
+            if slot in submitted:
+                continue
+            hour, minute = map(int, slot.split(":"))
+            mins_late = current_mins - (hour * 60 + minute)
+            # Fire once, shortly after the slot is officially considered missed
+            if LATE_THRESHOLD_MIN <= mins_late < LATE_THRESHOLD_MIN + 2:
+                if has_pending_reason_request(w["telegram_id"], date_str, slot):
+                    continue
+                try:
+                    await context.bot.send_message(
+                        chat_id=w["telegram_id"],
+                        text=(
+                            f"⚠️ Вы не прислали статус за {slot}.\n"
+                            f"Пожалуйста, укажите причину, почему не прислали статус — "
+                            f"после этого ваше видео будет просмотрено контролем."
+                        )
+                    )
+                except Exception:
+                    pass
+                create_pending_reason_request(w["telegram_id"], date_str, slot, now.strftime("%H:%M:%S"))
+
 async def post_init(application: Application):
     reschedule_summary_jobs(application)
     
@@ -284,6 +326,15 @@ async def post_init(application: Application):
                 name="pre_reminder_check"
             )
             logger.info("Pre-status reminder check scheduled every minute.")
+
+        if not job_queue.get_jobs_by_name("missed_status_check"):
+            job_queue.run_repeating(
+                missed_status_check_callback,
+                interval=60,  # check every minute
+                first=45,
+                name="missed_status_check"
+            )
+            logger.info("Missed-status reason request check scheduled every minute.")
 
 def main():
     init_db()

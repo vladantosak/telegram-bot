@@ -55,7 +55,8 @@ from db import (
     delete_pending_unregistered_user, bind_worker_id, async_sync_gsheets_background,
     get_db, run_db, is_admin, ADMIN_IDS, DEFAULT_GROUP_ID, SCHEDULES, SCHEDULE_A,
     LATE_THRESHOLD_MIN, now_local, is_quiet_mode_enabled, get_worker_target_group,
-    get_group_name
+    get_group_name, get_pending_reason_requests, resolve_pending_reason_requests,
+    get_missed_status_reason
 )
 
 from ai import (
@@ -684,11 +685,34 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lock = get_user_lock(user_id)
     await lock.acquire()
 
-    worker = await run_db(get_worker, user_id)
     text_content = ""
     tmp_path = None
-    
+
     try:
+        worker = await run_db(get_worker, user_id)
+
+        if worker:
+            pending_reasons = await run_db(get_pending_reason_requests, user_id)
+            if pending_reasons:
+                is_media_msg = bool(update.message.voice or update.message.video or update.message.video_note)
+                if is_media_msg:
+                    slots_str = ", ".join(f"{p['slot_time']} ({p['report_date']})" for p in pending_reasons)
+                    await update.message.reply_text(
+                        f"⚠️ Сначала укажите причину, почему не был сдан статус за: {slots_str}.\n"
+                        f"Напишите текстом объяснение — после этого сможете отправить видео-отчёт."
+                    )
+                    return
+                if update.message.text:
+                    reason_text = update.message.text.strip()
+                    if reason_text and reason_text != "❌ Отмена":
+                        await run_db(resolve_pending_reason_requests, user_id, reason_text)
+                        async_sync_gsheets_background()
+                        await update.message.reply_text(
+                            "✅ Спасибо, причина зафиксирована. Теперь можете отправить видео-отчёт.",
+                            reply_markup=menu_for_user(user_id, update.effective_chat.type)
+                        )
+                        return
+
         if update.message.text:
             text_content = update.message.text.strip()
         else:

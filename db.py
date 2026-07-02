@@ -174,6 +174,28 @@ def init_db():
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS pending_reason_requests (
+            telegram_id INTEGER,
+            report_date TEXT,
+            slot_time TEXT,
+            requested_at TEXT,
+            PRIMARY KEY (telegram_id, report_date, slot_time)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS missed_status_reasons (
+            telegram_id INTEGER,
+            report_date TEXT,
+            slot_time TEXT,
+            reason TEXT,
+            PRIMARY KEY (telegram_id, report_date, slot_time)
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS pending_unregistered_users (
             telegram_id INTEGER PRIMARY KEY,
             first_name TEXT NOT NULL,
@@ -237,6 +259,8 @@ def bind_worker_id(old_id: int, new_id: int):
         conn.execute("UPDATE reports SET telegram_id = ? WHERE telegram_id = ?", (new_id, old_id))
         conn.execute("UPDATE sent_reminders SET telegram_id = ? WHERE telegram_id = ?", (new_id, old_id))
         conn.execute("UPDATE sent_pre_reminders SET telegram_id = ? WHERE telegram_id = ?", (new_id, old_id))
+        conn.execute("UPDATE pending_reason_requests SET telegram_id = ? WHERE telegram_id = ?", (new_id, old_id))
+        conn.execute("UPDATE missed_status_reasons SET telegram_id = ? WHERE telegram_id = ?", (new_id, old_id))
         conn.execute("UPDATE pending_unregistered_users SET telegram_id = ? WHERE telegram_id = ?", (new_id, old_id))
         conn.commit()
     except Exception as e:
@@ -345,6 +369,8 @@ def delete_worker(telegram_id: int) -> bool:
         conn.execute("DELETE FROM reports WHERE telegram_id = ?", (telegram_id,))
         conn.execute("DELETE FROM sent_reminders WHERE telegram_id = ?", (telegram_id,))
         conn.execute("DELETE FROM sent_pre_reminders WHERE telegram_id = ?", (telegram_id,))
+        conn.execute("DELETE FROM pending_reason_requests WHERE telegram_id = ?", (telegram_id,))
+        conn.execute("DELETE FROM missed_status_reasons WHERE telegram_id = ?", (telegram_id,))
         conn.execute("DELETE FROM pending_unregistered_users WHERE telegram_id = ?", (telegram_id,))
         cur = conn.execute("DELETE FROM workers WHERE telegram_id = ?", (telegram_id,))
         conn.commit()
@@ -425,6 +451,59 @@ def mark_pre_reminder_sent(telegram_id: int, report_date: str, slot_time: str):
     )
     conn.commit()
     conn.close()
+
+def has_pending_reason_request(telegram_id: int, report_date: str, slot_time: str) -> bool:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT 1 FROM pending_reason_requests WHERE telegram_id = ? AND report_date = ? AND slot_time = ?",
+        (telegram_id, report_date, slot_time)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+def create_pending_reason_request(telegram_id: int, report_date: str, slot_time: str, requested_at: str):
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO pending_reason_requests (telegram_id, report_date, slot_time, requested_at) VALUES (?, ?, ?, ?)",
+        (telegram_id, report_date, slot_time, requested_at)
+    )
+    conn.commit()
+    conn.close()
+
+def get_pending_reason_requests(telegram_id: int) -> list:
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT report_date, slot_time FROM pending_reason_requests WHERE telegram_id = ? ORDER BY requested_at",
+        (telegram_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def resolve_pending_reason_requests(telegram_id: int, reason: str):
+    conn = get_db()
+    pending = conn.execute(
+        "SELECT report_date, slot_time FROM pending_reason_requests WHERE telegram_id = ?",
+        (telegram_id,)
+    ).fetchall()
+    for p in pending:
+        conn.execute(
+            "INSERT INTO missed_status_reasons (telegram_id, report_date, slot_time, reason) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(telegram_id, report_date, slot_time) DO UPDATE SET reason=excluded.reason",
+            (telegram_id, p["report_date"], p["slot_time"], reason)
+        )
+    conn.execute("DELETE FROM pending_reason_requests WHERE telegram_id = ?", (telegram_id,))
+    conn.commit()
+    conn.close()
+    return [dict(p) for p in pending]
+
+def get_missed_status_reason(telegram_id: int, report_date: str, slot_time: str) -> str | None:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT reason FROM missed_status_reasons WHERE telegram_id = ? AND report_date = ? AND slot_time = ?",
+        (telegram_id, report_date, slot_time)
+    ).fetchone()
+    conn.close()
+    return row["reason"] if row else None
 
 def get_existing_report_row(telegram_id: int, report_date: str, report_type: str, slot_time: str | None = None):
     conn = get_db()
@@ -1225,6 +1304,14 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                     ).fetchall()
                 }
 
+                missed_reasons = {
+                    (r["report_date"], r["slot_time"]): r["reason"] for r in conn_sum.execute(
+                        "SELECT report_date, slot_time, reason FROM missed_status_reasons "
+                        "WHERE telegram_id = ? AND report_date >= ? AND report_date <= ?",
+                        (w["telegram_id"], start_str, end_str)
+                    ).fetchall()
+                }
+
                 name_text = f"{w['last_name']} {w['first_name']} ({clean_position(w['position'])})"
                 worker_start_row = len(rows_summary)
                 first_tracked_col = None
@@ -1257,13 +1344,15 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                                 cell_value = True
                                 note_parts = []
                                 received_at = rep["received_at"] or ""
+                                is_late_submit = False
                                 try:
                                     rh, rm = int(received_at[0:2]), int(received_at[3:5])
                                     diff_mins = (rh * 60 + rm) - (hour * 60 + minute)
                                     if diff_mins < -30:
                                         note_parts.append("Прислал рано")
                                     elif diff_mins > 60:
-                                        note_parts.append("Прислал поздно")
+                                        note_parts.append("Прислал с опозданием")
+                                        is_late_submit = True
                                 except (ValueError, IndexError):
                                     pass
                                 if not rep["is_ok"]:
@@ -1274,10 +1363,22 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                                         note_parts.append(f"Требуется: {action}")
                                 if note_parts:
                                     fresh_note = "\n".join(note_parts)
+                                if is_late_submit:
+                                    format_requests.append({
+                                        "repeatCell": {
+                                            "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
+                                                      "endRowIndex": len(rows_summary) + 1,
+                                                      "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
+                                            "cell": {"userEnteredFormat": {"backgroundColor": YELLOW}},
+                                            "fields": "userEnteredFormat(backgroundColor)"
+                                        }
+                                    })
                             else:
                                 cell_value = False
                                 if old_entry and old_entry.get("bool") is True:
                                     cell_value = True  # a manual tick in the sheet always wins over "missed"
+                                else:
+                                    fresh_note = missed_reasons.get((d_str, slot))
 
                         row_cells.append(cell_value)
 
