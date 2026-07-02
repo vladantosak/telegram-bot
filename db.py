@@ -1313,12 +1313,16 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
         except Exception:
             old_map = {}
 
-        # Clear merges/formatting/checkboxes left over from a previous sync before rebuilding the grid,
-        # and pin the freeze pane to a known state (mergeCells rejects ranges that straddle the
-        # frozen/non-frozen column boundary, so every merge below must respect FROZEN_COLS).
+        # Clear merges/formatting/checkboxes/notes left over from a previous sync before rebuilding
+        # the grid, and pin the freeze pane to a known state (mergeCells rejects ranges that straddle
+        # the frozen/non-frozen column boundary, so every merge below must respect FROZEN_COLS).
+        # Note: ws.clear() (called later via safe_update) only clears cell VALUES — it does not
+        # touch merges, formatting, data validation (checkboxes) or notes, so each of those has to
+        # be cleared explicitly here or it survives indefinitely, including for deleted workers'
+        # old rows (this was the cause of stale notes/comments lingering after a worker was removed).
         sheet.batch_update({"requests": [
             {"unmergeCells": {"range": {"sheetId": ws_summary.id}}},
-            {"repeatCell": {"range": {"sheetId": ws_summary.id}, "cell": {"userEnteredFormat": {}}, "fields": "userEnteredFormat"}},
+            {"repeatCell": {"range": {"sheetId": ws_summary.id}, "cell": {"userEnteredFormat": {}, "note": ""}, "fields": "userEnteredFormat,note"}},
             {"setDataValidation": {"range": {"sheetId": ws_summary.id}}},
             {"updateSheetProperties": {
                 "properties": {"sheetId": ws_summary.id, "gridProperties": {"frozenRowCount": FROZEN_ROWS, "frozenColumnCount": FROZEN_COLS}},
