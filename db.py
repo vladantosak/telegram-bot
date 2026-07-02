@@ -1455,10 +1455,10 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                             try:
                                 rh, rm = int(received_at[0:2]), int(received_at[3:5])
                                 diff_mins = (rh * 60 + rm) - (hour * 60 + minute)
-                                if diff_mins < -30:
-                                    note_parts.append("Прислал рано")
-                                elif diff_mins > 60:
-                                    note_parts.append("Прислал с опозданием")
+                                # Acceptance window for a slot: -30/+60 минут от планового времени.
+                                # Всё за пределами окна (и рано, и поздно) — единая пометка "Прислал поздно".
+                                if diff_mins < -30 or diff_mins > 60:
+                                    note_parts.append(f"Прислал поздно, в {received_at[:5]}")
                                     is_late_submit = True
                             except (ValueError, IndexError):
                                 pass

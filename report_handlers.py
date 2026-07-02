@@ -282,7 +282,8 @@ async def _flush_media_batch(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-SLOT_MATCH_WINDOW_MIN = 60  # +-1 час: видео, отправленное в пределах часа от планового времени слота, относится к этому слоту
+STATUS_EARLY_TOLERANCE_MIN = 30  # можно сдать до получаса раньше времени слота - это ещё "вовремя"
+STATUS_LATE_TOLERANCE_MIN = 60   # можно сдать до часа позже времени слота - это ещё "вовремя"
 
 def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots: set):
     """Attributes a status video to the schedule slot closest to it in clock time, among
@@ -291,7 +292,10 @@ def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots:
     numerically passed, so a video sent a few minutes BEFORE the next slot (e.g. 11:58 for
     a 12:00 slot) fell through to the older, already-passed 10:00 slot instead of the
     obviously-intended 12:00 one. Distance-based matching fixes that at the root, for every
-    slot pair, instead of special-casing the boundary."""
+    slot pair, instead of special-casing the boundary.
+
+    Once a slot is picked, "вовремя" means received within [slot-30мин, slot+60мин] — the
+    asymmetric acceptance window; anything outside it (early or late) is "прислал поздно"."""
     current_mins = now.hour * 60 + now.minute
     candidates = [s for s in schedule if s not in submitted_slots] or list(schedule)
 
@@ -303,18 +307,18 @@ def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots:
             best_slot, best_diff = slot, diff
 
     h, m = map(int, best_slot.split(":"))
-    is_late = current_mins > h * 60 + m + LATE_THRESHOLD_MIN
-    within_window = best_diff <= SLOT_MATCH_WINDOW_MIN
+    slot_mins = h * 60 + m
+    signed_diff = current_mins - slot_mins
+    is_late = signed_diff < -STATUS_EARLY_TOLERANCE_MIN or signed_diff > STATUS_LATE_TOLERANCE_MIN
 
     logger.info(
         "[Определение времени] Видео получено: "
         f"дата={now.strftime('%d.%m.%Y')}, локальное время (Europe/Chisinau)={now.strftime('%H:%M:%S')}, "
         f"расписание={schedule}, уже сдано сегодня={sorted(submitted_slots) or 'ничего'}, "
-        f"допустимое отклонение=±{SLOT_MATCH_WINDOW_MIN} мин. "
-        f"Определённое окно сдачи: {best_slot} (расстояние {best_diff} мин, "
-        f"{'в пределах допуска' if within_window else 'вне допуска — использован ближайший из доступных слотов'}). "
+        f"допустимые рамки приёма=-{STATUS_EARLY_TOLERANCE_MIN}/+{STATUS_LATE_TOLERANCE_MIN} мин от времени слота. "
+        f"Определённое окно сдачи: {best_slot} (расстояние {best_diff} мин). "
         f"Результат: статус привязан к окну {best_slot}"
-        + (f", опоздание {current_mins - (h * 60 + m)} мин." if is_late else ", вовремя.")
+        + (f", прислал поздно (получено в {now.strftime('%H:%M')})." if is_late else ", вовремя.")
     )
     return best_slot, is_late
 
@@ -613,7 +617,9 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 employee_messages.append(f"Видео {idx}: {res['employee_message']}")
 
         suffix_tail = f" (видео 1-{len(status_items)})" if len(status_items) > 1 else ""
-        info_suffix = f" за статус *{slot_time}*{suffix_tail}"
+        time_str = status_now.strftime("%H:%M")
+        late_str = " — прислал поздно" if is_late else ""
+        info_suffix = f" за статус *{slot_time}*{suffix_tail} принят в *{time_str}*{late_str}"
 
         for s_item in status_items:
             upd = s_item["upd"]
@@ -1020,9 +1026,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await notify_admins_if_remark_threshold_crossed(context, user_id, w_name)
         time_str = now.strftime("%H:%M")
         if ai_res["report_type"] == "status" and nearest_slot:
-            sh, sm = map(int, nearest_slot.split(":"))
-            diff_mins = (now.hour * 60 + now.minute) - (sh * 60 + sm)
-            late_str = f" (опоздание {diff_mins} мин)" if diff_mins > LATE_THRESHOLD_MIN else ""
+            late_str = " — прислал поздно" if is_late else ""
             info_suffix = f" за статус *{nearest_slot}* принят в *{time_str}*{late_str}"
         else:
             info_suffix = f" — факт получен в *{time_str}*"
