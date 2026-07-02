@@ -285,7 +285,7 @@ async def _flush_media_batch(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 STATUS_EARLY_TOLERANCE_MIN = 30  # можно сдать до получаса раньше времени слота - это ещё "вовремя"
 STATUS_LATE_TOLERANCE_MIN = 60   # можно сдать до часа позже времени слота - это ещё "вовремя"
 
-def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots: set):
+def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots: set, worker_name: str = "?"):
     """Attributes a status video to the schedule slot closest to it in clock time, among
     slots not yet submitted today. Pure nearest-by-distance — no "must already be due"
     gate. The previous version only ever considered a slot once its clock time had
@@ -312,12 +312,13 @@ def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots:
     is_late = signed_diff < -STATUS_EARLY_TOLERANCE_MIN or signed_diff > STATUS_LATE_TOLERANCE_MIN
 
     logger.info(
-        "[Определение времени] Видео получено: "
-        f"дата={now.strftime('%d.%m.%Y')}, локальное время (Europe/Chisinau)={now.strftime('%H:%M:%S')}, "
-        f"расписание={schedule}, уже сдано сегодня={sorted(submitted_slots) or 'ничего'}, "
-        f"допустимые рамки приёма=-{STATUS_EARLY_TOLERANCE_MIN}/+{STATUS_LATE_TOLERANCE_MIN} мин от времени слота. "
-        f"Определённое окно сдачи: {best_slot} (расстояние {best_diff} мин). "
-        f"Результат: статус привязан к окну {best_slot}"
+        "[Определение времени] Получено видео. "
+        f"Сотрудник: {worker_name}. "
+        f"Время Telegram (локальное, Europe/Chisinau): {now.strftime('%H:%M:%S')} ({now.strftime('%d.%m.%Y')}). "
+        f"Расписание: {schedule}. Уже сдано сегодня: {sorted(submitted_slots) or 'ничего'}. "
+        f"Допустимые рамки приёма: -{STATUS_EARLY_TOLERANCE_MIN}/+{STATUS_LATE_TOLERANCE_MIN} мин от времени слота. "
+        f"Определено окно сдачи: {best_slot} (расстояние {best_diff} мин). "
+        f"Результат: видео успешно привязано к статусу за {best_slot}"
         + (f", прислал поздно (получено в {now.strftime('%H:%M')})." if is_late else ", вовремя.")
     )
     return best_slot, is_late
@@ -439,7 +440,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         date_str = status_items[0]["date_str"]
 
         submitted_slots = await run_db(get_submitted_status_slots, user_id, date_str)
-        slot_time, is_late = pick_target_status_slot(sched_list, status_now, submitted_slots)
+        slot_time, is_late = pick_target_status_slot(sched_list, status_now, submitted_slots, w_name)
 
         existing = await run_db(get_existing_report_row, user_id, date_str, "status", slot_time)
 
@@ -979,7 +980,9 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if report_type == "status":
             submitted_slots = await run_db(get_submitted_status_slots, user_id, date_str)
-            nearest_slot, is_late = pick_target_status_slot(sched_list, now, submitted_slots)
+            nearest_slot, is_late = pick_target_status_slot(
+                sched_list, now, submitted_slots, f"{worker['last_name']} {worker['first_name']}"
+            )
         else:
             nearest_slot, is_late = None, False
 
