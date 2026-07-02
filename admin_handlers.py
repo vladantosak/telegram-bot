@@ -286,6 +286,16 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
     except Exception:
         pass
 
+    new_worker_id = context.user_data["new_worker_id"]
+    if new_worker_id > 0:
+        try:
+            await context.bot.send_message(
+                chat_id=new_worker_id,
+                text="✅ Вы успешно добавлены в базу!\nТеперь вы можете отправлять видео-отчёты контролю."
+            )
+        except Exception as e:
+            logger.warning(f"[ADD] Не удалось уведомить сотрудника {new_worker_id} о добавлении: {e}")
+
     async_sync_gsheets_background()
     await update.message.reply_text("Сотрудник успешно добавлен в базу!", reply_markup=MAIN_MENU)
     context.user_data.clear()
