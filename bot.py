@@ -123,38 +123,42 @@ async def scheduled_summary_callback(context: ContextTypes.DEFAULT_TYPE):
     date_str = now.strftime("%Y-%m-%d")
     current_mins = now.hour * 60 + now.minute
 
-    conn = get_db()
-    workers = conn.execute(
-        "SELECT * FROM workers WHERE is_active = 1 ORDER BY object_id, sort_order, last_name, first_name"
-    ).fetchall()
-    not_working_today = {
-        r["telegram_id"] for r in conn.execute(
-            "SELECT telegram_id FROM reports WHERE report_date = ? AND report_type = 'not_working'",
-            (date_str,)
+    def _build_by_dept():
+        conn = get_db()
+        workers = conn.execute(
+            "SELECT * FROM workers WHERE is_active = 1 ORDER BY object_id, sort_order, last_name, first_name"
         ).fetchall()
-    }
-    conn.close()
+        not_working_today = {
+            r["telegram_id"] for r in conn.execute(
+                "SELECT telegram_id FROM reports WHERE report_date = ? AND report_type = 'not_working'",
+                (date_str,)
+            ).fetchall()
+        }
+        conn.close()
 
-    by_dept = {}
-    for w in workers:
-        if w["telegram_id"] in not_working_today:
-            continue
-        submitted = get_submitted_status_slots(w["telegram_id"], date_str)
-        slots = SCHEDULES.get(w["schedule"], SCHEDULE_A)
-        missing = []
-        for slot in slots:
-            if slot in submitted:
+        result = {}
+        for w in workers:
+            if w["telegram_id"] in not_working_today:
                 continue
-            hour, minute = map(int, slot.split(":"))
-            slot_mins = hour * 60 + minute
-            if current_mins > slot_mins + LATE_THRESHOLD_MIN:
-                overdue = current_mins - slot_mins
-                hrs, mins = divmod(overdue, 60)
-                overdue_str = f"{hrs} ч {mins} мин" if hrs else f"{mins} мин"
-                missing.append(f"{slot} — просрочено на {overdue_str}")
-        if missing:
-            dept = w["object_id"] or "Основной"
-            by_dept.setdefault(dept, []).append((w, missing))
+            submitted = get_submitted_status_slots(w["telegram_id"], date_str)
+            slots = SCHEDULES.get(w["schedule"], SCHEDULE_A)
+            missing = []
+            for slot in slots:
+                if slot in submitted:
+                    continue
+                hour, minute = map(int, slot.split(":"))
+                slot_mins = hour * 60 + minute
+                if current_mins > slot_mins + LATE_THRESHOLD_MIN:
+                    overdue = current_mins - slot_mins
+                    hrs, mins = divmod(overdue, 60)
+                    overdue_str = f"{hrs} ч {mins} мин" if hrs else f"{mins} мин"
+                    missing.append(f"{slot} — просрочено на {overdue_str}")
+            if missing:
+                dept = w["object_id"] or "Основной"
+                result.setdefault(dept, []).append((dict(w), missing))
+        return result
+
+    by_dept = await run_db(_build_by_dept)
 
     if not by_dept:
         summary_text = f"✅ <b>Сводка за {date_str}</b>\nВсе сотрудники вовремя сдали статусы."
@@ -233,82 +237,96 @@ async def pre_reminder_check_callback(context: ContextTypes.DEFAULT_TYPE):
     current_mins = now.hour * 60 + now.minute
     low, high = PRE_REMINDER_WINDOW_MIN
 
-    conn = get_db()
-    workers = conn.execute("SELECT * FROM workers WHERE is_active = 1").fetchall()
-    not_working_today = {
-        r["telegram_id"] for r in conn.execute(
-            "SELECT telegram_id FROM reports WHERE report_date = ? AND report_type = 'not_working'",
-            (date_str,)
-        ).fetchall()
-    }
-    conn.close()
+    def _find_targets():
+        conn = get_db()
+        workers = conn.execute("SELECT * FROM workers WHERE is_active = 1").fetchall()
+        not_working_today = {
+            r["telegram_id"] for r in conn.execute(
+                "SELECT telegram_id FROM reports WHERE report_date = ? AND report_type = 'not_working'",
+                (date_str,)
+            ).fetchall()
+        }
+        conn.close()
 
-    for w in workers:
-        if w["telegram_id"] in not_working_today:
-            continue
-        submitted = get_submitted_status_slots(w["telegram_id"], date_str)
-        for slot in SCHEDULES.get(w["schedule"], SCHEDULE_A):
-            if slot in submitted:
+        found = []
+        for w in workers:
+            if w["telegram_id"] in not_working_today:
                 continue
-            hour, minute = map(int, slot.split(":"))
-            mins_left = (hour * 60 + minute) - current_mins
-            if low <= mins_left <= high and not has_pre_reminder_sent(w["telegram_id"], date_str, slot):
-                try:
-                    await context.bot.send_message(
-                        chat_id=w["telegram_id"],
-                        text=f"⏰ Через {mins_left} мин. нужно отправить статус за {slot}. Не забудьте прислать отчёт вовремя!"
-                    )
-                except Exception:
-                    pass
-                mark_pre_reminder_sent(w["telegram_id"], date_str, slot)
+            submitted = get_submitted_status_slots(w["telegram_id"], date_str)
+            for slot in SCHEDULES.get(w["schedule"], SCHEDULE_A):
+                if slot in submitted:
+                    continue
+                hour, minute = map(int, slot.split(":"))
+                mins_left = (hour * 60 + minute) - current_mins
+                if low <= mins_left <= high and not has_pre_reminder_sent(w["telegram_id"], date_str, slot):
+                    found.append((w["telegram_id"], slot, mins_left))
+        return found
+
+    targets = await run_db(_find_targets)
+    for telegram_id, slot, mins_left in targets:
+        try:
+            await context.bot.send_message(
+                chat_id=telegram_id,
+                text=f"⏰ Через {mins_left} мин. нужно отправить статус за {slot}. Не забудьте прислать отчёт вовремя!"
+            )
+        except Exception:
+            pass
+        await run_db(mark_pre_reminder_sent, telegram_id, date_str, slot)
 
 async def missed_status_check_callback(context: ContextTypes.DEFAULT_TYPE):
     now = now_local()
     date_str = now.strftime("%Y-%m-%d")
     current_mins = now.hour * 60 + now.minute
 
-    conn = get_db()
-    workers = conn.execute("SELECT * FROM workers WHERE is_active = 1").fetchall()
-    not_working_today = {
-        r["telegram_id"] for r in conn.execute(
-            "SELECT telegram_id FROM reports WHERE report_date = ? AND report_type = 'not_working'",
-            (date_str,)
-        ).fetchall()
-    }
-    conn.close()
+    def _find_targets():
+        conn = get_db()
+        workers = conn.execute("SELECT * FROM workers WHERE is_active = 1").fetchall()
+        not_working_today = {
+            r["telegram_id"] for r in conn.execute(
+                "SELECT telegram_id FROM reports WHERE report_date = ? AND report_type = 'not_working'",
+                (date_str,)
+            ).fetchall()
+        }
+        conn.close()
 
-    for w in workers:
-        if w["telegram_id"] in not_working_today:
-            continue
-        submitted = get_submitted_status_slots(w["telegram_id"], date_str)
-        for slot in SCHEDULES.get(w["schedule"], SCHEDULE_A):
-            if slot in submitted:
+        found = []
+        for w in workers:
+            if w["telegram_id"] in not_working_today:
                 continue
-            hour, minute = map(int, slot.split(":"))
-            mins_late = current_mins - (hour * 60 + minute)
-            # Fire once, shortly after the slot is officially considered missed
-            if LATE_THRESHOLD_MIN <= mins_late < LATE_THRESHOLD_MIN + 2:
-                if has_pending_reason_request(w["telegram_id"], date_str, slot):
+            submitted = get_submitted_status_slots(w["telegram_id"], date_str)
+            for slot in SCHEDULES.get(w["schedule"], SCHEDULE_A):
+                if slot in submitted:
                     continue
-                try:
-                    await context.bot.send_message(
-                        chat_id=w["telegram_id"],
-                        text=(
-                            f"⚠️ Вы не прислали статус за {slot}.\n"
-                            f"Пожалуйста, укажите причину, почему не прислали статус — "
-                            f"после этого ваше видео будет просмотрено контролем."
-                        )
-                    )
-                except Exception:
-                    pass
-                create_pending_reason_request(w["telegram_id"], date_str, slot, now.strftime("%H:%M:%S"))
+                hour, minute = map(int, slot.split(":"))
+                mins_late = current_mins - (hour * 60 + minute)
+                # Fire once, shortly after the slot is officially considered missed
+                if LATE_THRESHOLD_MIN <= mins_late < LATE_THRESHOLD_MIN + 2:
+                    if has_pending_reason_request(w["telegram_id"], date_str, slot):
+                        continue
+                    found.append((w["telegram_id"], slot))
+        return found
+
+    targets = await run_db(_find_targets)
+    for telegram_id, slot in targets:
+        try:
+            await context.bot.send_message(
+                chat_id=telegram_id,
+                text=(
+                    f"⚠️ Вы не прислали статус за {slot}.\n"
+                    f"Пожалуйста, укажите причину, почему не прислали статус — "
+                    f"после этого ваше видео будет просмотрено контролем."
+                )
+            )
+        except Exception:
+            pass
+        await run_db(create_pending_reason_request, telegram_id, date_str, slot, now.strftime("%H:%M:%S"))
 
 async def nightly_backup_callback(context: ContextTypes.DEFAULT_TYPE):
     from db import backup_database_to_file
     now = now_local()
     backup_path = f"backup_{now.strftime('%Y%m%d_%H%M%S')}.db"
     try:
-        backup_database_to_file(backup_path)
+        await run_db(backup_database_to_file, backup_path)
     except Exception as e:
         logger.error(f"Ошибка создания бэкапа БД: {e}")
         return

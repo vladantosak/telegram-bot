@@ -262,8 +262,9 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
     raw = update.message.text.strip().lower()
     if raw not in ("да", "нет"): return ASK_NEEDS_DAILY_FACT
 
-    next_order = get_next_sort_order(context.user_data["position"])
-    upsert_worker(
+    next_order = await run_db(get_next_sort_order, context.user_data["position"])
+    await run_db(
+        upsert_worker,
         telegram_id=context.user_data["new_worker_id"],
         last_name=context.user_data["last_name"],
         first_name=context.user_data["first_name"],
@@ -273,7 +274,7 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
         needs_daily_fact=(raw == "да"),
         sort_order=next_order,
     )
-    delete_pending_unregistered_user(context.user_data["new_worker_id"])
+    await run_db(delete_pending_unregistered_user, context.user_data["new_worker_id"])
     await fetch_and_save_group_name(context.bot, context.user_data["group_id"])
     
     target_group_id = context.user_data["group_id"] or DEFAULT_GROUP_ID
@@ -327,7 +328,7 @@ async def delete_worker_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     if choice == "Да, удалить":
         worker = context.user_data.get("worker_to_delete")
         if worker:
-            delete_worker(worker["telegram_id"])
+            await run_db(delete_worker, worker["telegram_id"])
             async_sync_gsheets_background()
             await update.message.reply_text(f"✅ Сотрудник {worker['last_name']} {worker['first_name']} успешно удален.", reply_markup=MAIN_MENU)
     else:
@@ -446,7 +447,7 @@ async def edit_worker_value_received(update: Update, context: ContextTypes.DEFAU
             return ASK_EDIT_VALUE
         value = int(raw)
 
-    update_worker_field(worker["telegram_id"], field, value)
+    await run_db(update_worker_field, worker["telegram_id"], field, value)
     async_sync_gsheets_background()
     await update.message.reply_text("✅ Изменения сохранены.", reply_markup=MAIN_MENU)
     context.user_data.clear()
@@ -457,7 +458,7 @@ async def edit_worker_schedule_received(update: Update, context: ContextTypes.DE
     if raw not in SCHEDULES:
         return ASK_EDIT_SCHEDULE
     worker = context.user_data.get("edit_worker")
-    update_worker_field(worker["telegram_id"], "schedule", raw)
+    await run_db(update_worker_field, worker["telegram_id"], "schedule", raw)
     async_sync_gsheets_background()
     await update.message.reply_text("✅ График обновлён.", reply_markup=MAIN_MENU)
     context.user_data.clear()
@@ -468,7 +469,7 @@ async def edit_worker_daily_fact_received(update: Update, context: ContextTypes.
     if raw not in ("да", "нет"):
         return ASK_EDIT_DAILY_FACT
     worker = context.user_data.get("edit_worker")
-    update_worker_field(worker["telegram_id"], "needs_daily_fact", raw == "да")
+    await run_db(update_worker_field, worker["telegram_id"], "needs_daily_fact", raw == "да")
     async_sync_gsheets_background()
     await update.message.reply_text("✅ Обновлено.", reply_markup=MAIN_MENU)
     context.user_data.clear()
@@ -480,7 +481,7 @@ async def edit_worker_status_received(update: Update, context: ContextTypes.DEFA
         return ASK_EDIT_STATUS_WORK
     if raw == "да":
         worker = context.user_data.get("edit_worker")
-        update_worker_field(worker["telegram_id"], "is_active", True)
+        await run_db(update_worker_field, worker["telegram_id"], "is_active", True)
         async_sync_gsheets_background()
         await update.message.reply_text("✅ Сотрудник отмечен как работающий.", reply_markup=MAIN_MENU)
         context.user_data.clear()
@@ -513,7 +514,8 @@ async def edit_worker_not_working_reason(update: Update, context: ContextTypes.D
     now = now_local()
     for i in range(days):
         d = now + dt_module.timedelta(days=i)
-        save_report(
+        await run_db(
+            save_report,
             telegram_id=worker["telegram_id"],
             report_date=d.strftime("%Y-%m-%d"),
             report_type="not_working",
@@ -610,13 +612,15 @@ async def import_workers_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             if os.path.exists(local_path): os.remove(local_path)
             return ConversationHandler.END
 
-        for w in workers:
-            upsert_worker(
-                telegram_id=w["telegram_id"], last_name=w["last_name"], first_name=w["first_name"],
-                position=w["position"], group_id=w["group_id"], schedule=w["schedule"],
-                needs_daily_fact=w["needs_daily_fact"], object_id=w.get("object_id", "Основной"),
-                is_active=1 if w.get("is_active", True) else 0, sort_order=w.get("sort_order", 0)
-            )
+        def _import_all(rows):
+            for w in rows:
+                upsert_worker(
+                    telegram_id=w["telegram_id"], last_name=w["last_name"], first_name=w["first_name"],
+                    position=w["position"], group_id=w["group_id"], schedule=w["schedule"],
+                    needs_daily_fact=w["needs_daily_fact"], object_id=w.get("object_id", "Основной"),
+                    is_active=1 if w.get("is_active", True) else 0, sort_order=w.get("sort_order", 0)
+                )
+        await run_db(_import_all, workers)
         if os.path.exists(local_path): os.remove(local_path)
         async_sync_gsheets_background()
         await update.message.reply_text(
@@ -654,13 +658,13 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text("Регистрация отменена.", reply_markup=menu_for_user(user_id))
         return ConversationHandler.END
     
-    workers = find_unregistered_workers_by_lastname(text)
+    workers = await run_db(find_unregistered_workers_by_lastname, text)
     if len(workers) == 0:
         await update.message.reply_text(f"❌ Сотрудник с фамилией <b>{html.escape(text)}</b> не найден среди незарегистрированных.", parse_mode="HTML", reply_markup=menu_for_user(user_id))
         return ConversationHandler.END
     elif len(workers) == 1:
         candidate = workers[0]
-        bind_worker_id(candidate["telegram_id"], user_id)
+        await run_db(bind_worker_id, candidate["telegram_id"], user_id)
         w_fio = f"{candidate['last_name']} {candidate['first_name']}"
         await update.message.reply_text(f"🎉 <b>Регистрация успешна!</b>\nВы привязаны к профилю: <b>{html.escape(w_fio)}</b>.", parse_mode="HTML", reply_markup=menu_for_user(user_id))
         return ConversationHandler.END
@@ -688,7 +692,7 @@ async def register_firstname_received(update: Update, context: ContextTypes.DEFA
         await update.message.reply_text("❌ Пожалуйста, выберите имя из списка.")
         return ASK_REG_FIRST_NAME
     
-    bind_worker_id(matched_candidate["telegram_id"], user_id)
+    await run_db(bind_worker_id, matched_candidate["telegram_id"], user_id)
     w_fio = f"{matched_candidate['last_name']} {matched_candidate['first_name']}"
     await update.message.reply_text(f"🎉 <b>Регистрация успешна!</b>\nВы привязаны к профилю: <b>{html.escape(w_fio)}</b>.", parse_mode="HTML", reply_markup=menu_for_user(user_id))
     return ConversationHandler.END
@@ -810,7 +814,7 @@ async def alert_time_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ASK_REPORT_TIME
         
-    save_scheduled_times(valid_times)
+    await run_db(save_scheduled_times, valid_times)
     from bot import reschedule_summary_jobs
     reschedule_summary_jobs(context.application)
     
@@ -891,7 +895,7 @@ async def save_gsheets_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не удалось распознать ID таблицы. Пожалуйста, отправьте корректную ссылку или ID:")
         return ASK_GSHEETS_URL
         
-    set_setting("google_spreadsheet_id", sheet_id)
+    await run_db(set_setting, "google_spreadsheet_id", sheet_id)
     
     await update.message.reply_text(
         f"✅ ID Google Таблицы сохранен: `{sheet_id}`\n\n"
@@ -937,10 +941,10 @@ async def save_gsheets_creds(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return ASK_GSHEETS_CREDS
             
-        set_setting("google_service_account", content)
-        
+        await run_db(set_setting, "google_service_account", content)
+
         email = creds_dict.get("client_email")
-        spreadsheet_id = get_setting("google_spreadsheet_id")
+        spreadsheet_id = await run_db(get_setting, "google_spreadsheet_id")
         
         await update.message.reply_text(
             f"✅ Ключи сервисного аккаунта успешно сохранены!\n"

@@ -1038,7 +1038,10 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
             
         safe_update(ws_workers, rows_workers)
         
-        # 2. Sync Reports to "Отчеты"
+        # 2. Sync Reports to "Отчеты" and 3. Sync Analytics to "Аналитика"
+        # All DB reads happen first and the connection is closed BEFORE any Sheets API
+        # calls — holding a SQLite connection open across slow network I/O is what let a
+        # concurrent admin write (e.g. deleting a worker) block on the DB and freeze the bot.
         conn = get_db()
         reports = conn.execute("""
             SELECT r.*, w.last_name, w.first_name, w.position, w.object_id
@@ -1046,13 +1049,13 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
             LEFT JOIN workers w ON r.telegram_id = w.telegram_id
             ORDER BY r.id DESC
         """).fetchall()
-        
+
         headers_reports = [
             "ID отчета", "Telegram ID", "Отдел", "ФИО сотрудника", "Должность",
             "Дата отчета", "Тип отчета", "Время слота", "Время получения",
             "Оценка (ОК)", "Опоздание", "Замечания", "Действия", "Оригинальный текст"
         ]
-        
+
         rows_reports = [headers_reports]
         for r in reports:
             # Check if unregistered user has pending info
@@ -1082,38 +1085,25 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                 str(r["required_action"] or ""),
                 str(r["raw_text"] or "")
             ])
-            
-        try:
-            ws_reports = sheet.worksheet("Отчеты")
-        except gspread.exceptions.WorksheetNotFound:
-            ws_reports = sheet.add_worksheet(title="Отчеты", rows="5000", cols="20")
-            
-        safe_update(ws_reports, rows_reports)
-
-        # 3. Sync Analytics to "Аналитика"
-        try:
-            ws_analytics = sheet.worksheet("Аналитика")
-        except gspread.exceptions.WorksheetNotFound:
-            ws_analytics = sheet.add_worksheet(title="Аналитика", rows="1000", cols="20")
 
         now = now_local()
         end_date_str = now.strftime("%Y-%m-%d")
-        
+
         # Earliest report date fallback
         earliest_row = conn.execute("SELECT MIN(report_date) as min_date FROM reports").fetchone()
         earliest_date_str = (earliest_row["min_date"] if earliest_row and earliest_row["min_date"] else end_date_str) or end_date_str
-        
+
         # Start date for last 30 days
         start_30_days = (now - dt_module.timedelta(days=30)).strftime("%Y-%m-%d")
         if start_30_days < earliest_date_str:
             start_30_days = earliest_date_str
-            
+
         headers_analytics = [
-            "Отдел", "ФИО сотрудника", "Должность", 
+            "Отдел", "ФИО сотрудника", "Должность",
             "Всего отчетов (за 30 дн)", "Сдано (за 30 дн)", "Опозданий (за 30 дн)", "Замечаний (за 30 дн)", "Пропущено (за 30 дн)", "% Сдачи (за 30 дн)",
             "Всего отчетов (всё время)", "Сдано (всё время)", "Опозданий (всё время)", "Замечаний (всё время)", "Пропущено (всё время)", "% Сдачи (всё время)"
         ]
-        
+
         rows_analytics = [headers_analytics]
         for w in workers:
             if not w["is_active"]:
@@ -1146,6 +1136,17 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                 )
 
         conn.close()
+
+        try:
+            ws_reports = sheet.worksheet("Отчеты")
+        except gspread.exceptions.WorksheetNotFound:
+            ws_reports = sheet.add_worksheet(title="Отчеты", rows="5000", cols="20")
+        safe_update(ws_reports, rows_reports)
+
+        try:
+            ws_analytics = sheet.worksheet("Аналитика")
+        except gspread.exceptions.WorksheetNotFound:
+            ws_analytics = sheet.add_worksheet(title="Аналитика", rows="1000", cols="20")
         safe_update(ws_analytics, rows_analytics)
 
         # 4. Sync Summary checkbox grid to "Сводка"
