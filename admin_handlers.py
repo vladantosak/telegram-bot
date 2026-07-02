@@ -814,11 +814,13 @@ async def _show_registration_confirm(update: Update, context: ContextTypes.DEFAU
     fio = f"{candidate['last_name']} {candidate['first_name']}"
     kbd = ReplyKeyboardMarkup([["✅ Да, это я", "❌ Нет, не я"]], resize_keyboard=True)
     await update.message.reply_text(
-        f"Найден сотрудник:\n"
+        f"✅ Отлично! Мы нашли Вашу учётную запись.\n\n"
         f"👤 <b>{html.escape(fio)}</b>\n"
         f"💼 Должность: {html.escape(clean_position(candidate['position']))}\n"
         f"🏢 Отдел: {html.escape(str(candidate['object_id'] or 'Основной'))}\n\n"
-        f"Это вы?",
+        f"<b>Шаг 2 из 3</b>\n\n"
+        f"Сейчас осталось подтвердить, что это Вы, и регистрация завершится.\n"
+        f"Внизу экрана появятся две кнопки. Нажмите «✅ Да, это я», если данные верны.",
         parse_mode="HTML",
         reply_markup=kbd
     )
@@ -847,10 +849,10 @@ async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data.clear()
     await update.message.reply_text(
-        "👋 <b>Добро пожаловать в систему сдачи видео-отчётов!</b>\n\n"
-        "Этот бот принимает ваши видео-статусы, проверяет их и ведёт учёт сдачи отчётов бригадиру/контролю.\n"
-        "Чтобы начать пользоваться ботом, нужно один раз зарегистрироваться.\n\n"
-        "Пожалуйста, введите вашу <b>фамилию</b>:",
+        "<b>Шаг 1 из 3</b>\n\n"
+        "Пожалуйста, введите Вашу фамилию латинскими буквами, как она записана в базе сотрудников.\n\n"
+        "Например: <b>Popescu</b>\n\n"
+        "Введите фамилию в поле сообщения внизу экрана и нажмите «Отправить».",
         parse_mode="HTML", reply_markup=CANCEL_KEYBOARD
     )
     return ASK_REG_LAST_NAME
@@ -865,7 +867,11 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
         return ConversationHandler.END
 
     if len(text) < 2 or len(text) > 50 or text.isdigit():
-        await update.message.reply_text("Пожалуйста, введите фамилию текстом (не менее 2 символов):")
+        await update.message.reply_text(
+            "❌ Пожалуйста, введите фамилию буквами (не цифрами), не менее 2 букв.\n\n"
+            "Например: Popescu\n\n"
+            "Попробуйте ещё раз — введите фамилию в поле сообщения."
+        )
         return ASK_REG_LAST_NAME
 
     logger.info(f"[REG] user_id={user_id} ищет фамилию '{text}'")
@@ -885,7 +891,8 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
         buttons = [[f"{w['last_name']} {w['first_name']} ({clean_position(w['position'])})"] for w in unregistered]
         buttons.append([CANCEL_TEXT])
         await update.message.reply_text(
-            "🔍 Найдено несколько сотрудников с такой фамилией. Выберите себя из списка:",
+            "🔍 Мы нашли несколько сотрудников с такой фамилией.\n\n"
+            "Найдите себя в списке ниже и нажмите на кнопку со своим именем.",
             reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True)
         )
         return ASK_REG_FIRST_NAME
@@ -899,8 +906,8 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
         )
         await _notify_admins_registration_issue(context, update, "already_registered", text, matches=already_registered)
         await update.message.reply_text(
-            "⚠️ Сотрудник с такой фамилией уже зарегистрирован в системе под другим аккаунтом.\n"
-            "Если это ошибка, обратитесь к администратору — ему уже отправлено уведомление.",
+            "⚠️ Сотрудник с такой фамилией уже зарегистрирован в системе.\n\n"
+            "Если это ошибка — не переживайте, администратор уже получил уведомление и свяжется с Вами.",
             reply_markup=menu_for_user(user_id)
         )
         context.user_data.clear()
@@ -911,9 +918,12 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
     context.user_data["reg_last_name_query"] = text
     await _notify_admins_registration_issue(context, update, "not_found", text)
     await update.message.reply_text(
-        f"❌ Сотрудник с фамилией <b>{html.escape(text)}</b> не найден в базе.\n\n"
-        f"Администратор уже уведомлён о вашем обращении и добавит вас в систему.\n"
-        f"При желании можете поделиться номером телефона — это поможет администратору связаться с вами быстрее:",
+        f"❌ Мы не смогли найти сотрудника с фамилией <b>{html.escape(text)}</b>.\n\n"
+        f"Проверьте правильность написания фамилии — используйте латинские буквы.\n"
+        f"Например: Popescu\n\n"
+        f"Администратор уже получил уведомление о Вашем обращении и добавит Вас в систему.\n\n"
+        f"Если хотите, поделитесь номером телефона — это поможет администратору связаться с Вами быстрее. "
+        f"Нажмите кнопку «📱 Поделиться контактом» внизу экрана, либо «Пропустить», если не хотите:",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardMarkup(
             [[KeyboardButton("📱 Поделиться контактом", request_contact=True)], ["Пропустить"]],
@@ -932,9 +942,16 @@ async def register_contact_received(update: Update, context: ContextTypes.DEFAUL
             context.user_data.get("reg_last_name_query", "?"),
             phone=contact.phone_number
         )
-        await update.message.reply_text("✅ Спасибо! Номер передан администратору.", reply_markup=menu_for_user(user_id))
+        await update.message.reply_text(
+            "✅ Спасибо! Ваш номер телефона передан администратору.\n\n"
+            "Администратор свяжется с Вами и добавит Вас в систему.",
+            reply_markup=menu_for_user(user_id)
+        )
     else:
-        await update.message.reply_text("Хорошо, администратор свяжется с вами по мере обработки заявки.", reply_markup=menu_for_user(user_id))
+        await update.message.reply_text(
+            "Хорошо. Администратор свяжется с Вами и добавит Вас в систему.",
+            reply_markup=menu_for_user(user_id)
+        )
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -955,7 +972,9 @@ async def register_firstname_received(update: Update, context: ContextTypes.DEFA
             matched_candidate = c
             break
     if not matched_candidate:
-        await update.message.reply_text("❌ Пожалуйста, выберите имя из списка кнопкой ниже.")
+        await update.message.reply_text(
+            "❌ Пожалуйста, нажмите на одну из кнопок со списком имён внизу экрана — не вводите текст вручную."
+        )
         return ASK_REG_FIRST_NAME
 
     return await _show_registration_confirm(update, context, matched_candidate)
@@ -972,7 +991,9 @@ async def register_confirm_received(update: Update, context: ContextTypes.DEFAUL
         except Exception as e:
             logger.error(f"[REG] Ошибка привязки user_id={user_id} к профилю ID={candidate.get('telegram_id')}: {e}")
             await update.message.reply_text(
-                "❌ Произошла ошибка при регистрации. Попробуйте ещё раз или обратитесь к администратору.",
+                "❌ Произошла ошибка при регистрации.\n\n"
+                "Пожалуйста, нажмите кнопку «🔑 Начать регистрацию» внизу экрана, чтобы попробовать ещё раз, "
+                "или обратитесь к администратору.",
                 reply_markup=ReplyKeyboardMarkup([["🔑 Начать регистрацию"]], resize_keyboard=True)
             )
             context.user_data.clear()
@@ -981,8 +1002,12 @@ async def register_confirm_received(update: Update, context: ContextTypes.DEFAUL
         w_fio = f"{candidate['last_name']} {candidate['first_name']}"
         logger.info(f"[REG] Успешная регистрация: user_id={user_id} привязан к профилю '{w_fio}' (был временный ID {candidate['telegram_id']})")
         await update.message.reply_text(
-            f"🎉 <b>Регистрация успешна!</b>\nВы привязаны к профилю: <b>{html.escape(w_fio)}</b>.\n"
-            f"Теперь вы можете отправлять видео-отчёты.",
+            f"<b>Шаг 3 из 3</b>\n\n"
+            f"✅ Регистрация успешно завершена!\n"
+            f"Вы привязаны к профилю: <b>{html.escape(w_fio)}</b>.\n\n"
+            f"Теперь Вы можете пользоваться ботом.\n\n"
+            f"Перед каждым временем сдачи отчёта Вы будете автоматически получать напоминание.\n"
+            f"После получения напоминания просто отправьте видео в этот чат — дождитесь результата проверки.",
             parse_mode="HTML",
             reply_markup=menu_for_user(user_id)
         )
@@ -992,7 +1017,8 @@ async def register_confirm_received(update: Update, context: ContextTypes.DEFAUL
     logger.info(f"[REG] user_id={user_id} не подтвердил найденного кандидата ({candidate.get('last_name') if candidate else '?'})")
     context.user_data.pop("reg_candidate", None)
     await update.message.reply_text(
-        "Хорошо, попробуйте ввести фамилию ещё раз, либо обратитесь к администратору:",
+        "Хорошо, попробуем ещё раз.\n\n"
+        "Введите Вашу фамилию латинскими буквами в поле сообщения внизу экрана, либо обратитесь к администратору:",
         reply_markup=CANCEL_KEYBOARD
     )
     return ASK_REG_LAST_NAME
