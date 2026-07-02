@@ -115,6 +115,7 @@ def init_db():
         ("sort_order", "INTEGER NOT NULL DEFAULT 0"),
         ("is_active", "INTEGER NOT NULL DEFAULT 1"),
         ("object_id", "TEXT NOT NULL DEFAULT 'Основной'"),
+        ("registered_at", "TEXT"),
     ]:
         if col not in cols:
             conn.execute(f"ALTER TABLE workers ADD COLUMN {col} {definition}")
@@ -263,10 +264,24 @@ def find_unregistered_workers_by_lastname(last_name: str):
     conn.close()
     return rows
 
-def bind_worker_id(old_id: int, new_id: int):
+def find_registered_workers_by_lastname(last_name: str):
+    """Workers matching the name that are already bound to a real Telegram account —
+    used to tell 'already registered' apart from 'not in the database at all'."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM workers WHERE telegram_id > 0 AND LOWER(last_name) = LOWER(?)",
+        (last_name.strip(),)
+    ).fetchall()
+    conn.close()
+    return rows
+
+def bind_worker_id(old_id: int, new_id: int, registered_at: str | None = None):
     conn = get_db()
     try:
-        conn.execute("UPDATE workers SET telegram_id = ? WHERE telegram_id = ?", (new_id, old_id))
+        conn.execute(
+            "UPDATE workers SET telegram_id = ?, registered_at = ? WHERE telegram_id = ?",
+            (new_id, registered_at, old_id)
+        )
         conn.execute("UPDATE reports SET telegram_id = ? WHERE telegram_id = ?", (new_id, old_id))
         conn.execute("UPDATE sent_reminders SET telegram_id = ? WHERE telegram_id = ?", (new_id, old_id))
         conn.execute("UPDATE sent_pre_reminders SET telegram_id = ? WHERE telegram_id = ?", (new_id, old_id))

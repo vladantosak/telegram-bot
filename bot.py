@@ -43,6 +43,7 @@ from admin_handlers import (
     edit_worker_not_working_days, edit_worker_not_working_reason,
     import_workers_start, import_workers_action, import_workers_file,
     register_start, register_lastname_received, register_firstname_received,
+    register_confirm_received, register_contact_received,
     settings_start, settings_action, cancel,
     export_reports_start, export_reports_choice, alert_time_start, alert_time_save,
     remind_all_start, remind_all_send,
@@ -53,7 +54,8 @@ from admin_handlers import (
     ASK_CONFIRM_DELETE, ASK_IMPORT_ACTION, ASK_IMPORT_FILE, ASK_GSHEETS_URL,
     ASK_GSHEETS_CREDS, ASK_REPORT_TIME, ASK_CONFIRM_REMIND, ASK_EXPORT_TYPE,
     ASK_LIST_WORKER, ASK_EDIT_FIELD, ASK_EDIT_VALUE, ASK_EDIT_SCHEDULE,
-    ASK_EDIT_DAILY_FACT, ASK_EDIT_STATUS_WORK, ASK_NOT_WORKING_DAYS, ASK_NOT_WORKING_REASON
+    ASK_EDIT_DAILY_FACT, ASK_EDIT_STATUS_WORK, ASK_NOT_WORKING_DAYS, ASK_NOT_WORKING_REASON,
+    ASK_REG_CONFIRM, ASK_REG_CONTACT
 )
 
 # Set up logging
@@ -517,6 +519,8 @@ def main():
         states={
             ASK_REG_LAST_NAME: [MessageHandler(safe_text_filter, register_lastname_received)],
             ASK_REG_FIRST_NAME: [MessageHandler(safe_text_filter, register_firstname_received)],
+            ASK_REG_CONFIRM: [MessageHandler(safe_text_filter, register_confirm_received)],
+            ASK_REG_CONTACT: [MessageHandler(filters.CONTACT | safe_text_filter, register_contact_received)],
         },
         fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )

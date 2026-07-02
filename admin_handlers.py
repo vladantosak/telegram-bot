@@ -7,12 +7,12 @@ import io
 from datetime import datetime
 import datetime as dt_module
 from openpyxl import load_workbook
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply, KeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
 
 from db import (
     get_db, run_db, get_worker, get_all_workers, get_workers_by_position, get_workers_by_object_id,
-    find_unregistered_workers_by_lastname, bind_worker_id, upsert_worker,
+    find_unregistered_workers_by_lastname, find_registered_workers_by_lastname, bind_worker_id, upsert_worker,
     delete_worker, update_worker_field, get_object_group, save_object_group, clean_position,
     get_group_name, get_group_name_async, fetch_and_save_group_name, get_all_group_names,
     get_setting, set_setting, calculate_worker_stats, SCHEDULES, SCHEDULE_A, DEFAULT_GROUP_ID,
@@ -80,7 +80,9 @@ CANCEL_TEXT = "❌ Отмена"
     ASK_CONFIRM_REMIND,
     ASK_NOT_WORKING_DAYS,
     ASK_NOT_WORKING_REASON,
-) = range(36)
+    ASK_REG_CONFIRM,
+    ASK_REG_CONTACT,
+) = range(38)
 
 def schedule_description_text() -> str:
     lines = []
@@ -634,20 +636,86 @@ async def import_workers_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"❌ Ошибка во время импорта: {e}", reply_markup=MAIN_MENU)
         return ConversationHandler.END
 
+async def _notify_admins_registration_issue(context, update, reason, entered_last_name, matches=None, phone=None):
+    user = update.effective_user
+    now_str = now_local().strftime("%d.%m.%Y %H:%M:%S")
+
+    lines = ["🆕 <b>Обращение по регистрации</b>"]
+    if reason == "not_found":
+        lines.append("Сотрудник не найден в базе данных.")
+    elif reason == "already_registered":
+        lines.append("⚠️ Попытка регистрации на фамилию, уже привязанную к другому Telegram-аккаунту.")
+    elif reason == "contact_shared":
+        lines.append("📱 Пользователь поделился номером телефона по предыдущему обращению.")
+
+    lines.append(f"Введённая фамилия: <b>{html.escape(entered_last_name)}</b>")
+    lines.append(f"Telegram ID: <code>{user.id}</code>")
+    lines.append(f"Username: {('@' + user.username) if user.username else 'нет'}")
+    tg_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "не указано"
+    lines.append(f"Имя в Telegram: {html.escape(tg_name)}")
+    if phone:
+        lines.append(f"Телефон: {html.escape(phone)}")
+    lines.append(f"Дата обращения: {now_str}")
+    if user.username:
+        lines.append(f"Профиль: https://t.me/{user.username}")
+    else:
+        lines.append(f"Профиль: tg://user?id={user.id} (откроется, если клиент поддерживает)")
+    if matches:
+        lines.append("\nУже зарегистрированы под этой фамилией:")
+        for m in matches:
+            lines.append(f"  • {m['last_name']} {m['first_name']} (ID: {m['telegram_id']})")
+    lines.append("\nЧтобы добавить сотрудника: «➕ Добавить сотрудника» → укажите Telegram ID выше.")
+
+    text = "\n".join(lines)
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
+        except Exception as e:
+            logger.error(f"[REG] Не удалось уведомить администратора {admin_id}: {e}")
+
+async def _show_registration_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, candidate: dict):
+    context.user_data["reg_candidate"] = candidate
+    fio = f"{candidate['last_name']} {candidate['first_name']}"
+    kbd = ReplyKeyboardMarkup([["✅ Да, это я", "❌ Нет, не я"]], resize_keyboard=True)
+    await update.message.reply_text(
+        f"Найден сотрудник:\n"
+        f"👤 <b>{html.escape(fio)}</b>\n"
+        f"💼 Должность: {html.escape(clean_position(candidate['position']))}\n"
+        f"🏢 Отдел: {html.escape(str(candidate['object_id'] or 'Основной'))}\n\n"
+        f"Это вы?",
+        parse_mode="HTML",
+        reply_markup=kbd
+    )
+    return ASK_REG_CONFIRM
+
 async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = update.effective_chat.type
     if chat_type != "private": return ConversationHandler.END
     user_id = update.effective_user.id
+    logger.info(f"[REG] Начало регистрации: user_id={user_id}, username=@{update.effective_user.username}")
+
     if is_admin(user_id):
         await update.message.reply_text("Привет! Выберите действие кнопкой ниже.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
-    worker = get_worker(user_id)
+
+    worker = await run_db(get_worker, user_id)
     if worker:
-        await update.message.reply_text("Привет! Отправьте видеоотчет, когда он будет готов.", reply_markup=menu_for_user(user_id, chat_type))
+        logger.info(f"[REG] user_id={user_id} уже зарегистрирован как {worker['last_name']} {worker['first_name']} — повторная регистрация не требуется")
+        await update.message.reply_text(
+            f"Вы уже зарегистрированы как <b>{html.escape(worker['last_name'])} {html.escape(worker['first_name'])}</b>.\n"
+            f"Отправьте видеоотчёт, когда он будет готов.",
+            parse_mode="HTML",
+            reply_markup=menu_for_user(user_id, chat_type)
+        )
         return ConversationHandler.END
+
+    context.user_data.clear()
     await update.message.reply_text(
-        "👋 *Добро пожаловать в систему сдачи отчетов!*\n\nПожалуйста, введите вашу **Фамилию** для поиска:",
-        parse_mode="Markdown", reply_markup=CANCEL_KEYBOARD
+        "👋 <b>Добро пожаловать в систему сдачи видео-отчётов!</b>\n\n"
+        "Этот бот принимает ваши видео-статусы, проверяет их и ведёт учёт сдачи отчётов бригадиру/контролю.\n"
+        "Чтобы начать пользоваться ботом, нужно один раз зарегистрироваться.\n\n"
+        "Пожалуйста, введите вашу <b>фамилию</b>:",
+        parse_mode="HTML", reply_markup=CANCEL_KEYBOARD
     )
     return ASK_REG_LAST_NAME
 
@@ -655,47 +723,143 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
     text = update.message.text.strip()
     user_id = update.effective_user.id
     if text == CANCEL_TEXT:
+        logger.info(f"[REG] user_id={user_id} отменил регистрацию на этапе ввода фамилии")
         await update.message.reply_text("Регистрация отменена.", reply_markup=menu_for_user(user_id))
+        context.user_data.clear()
         return ConversationHandler.END
-    
-    workers = await run_db(find_unregistered_workers_by_lastname, text)
-    if len(workers) == 0:
-        await update.message.reply_text(f"❌ Сотрудник с фамилией <b>{html.escape(text)}</b> не найден среди незарегистрированных.", parse_mode="HTML", reply_markup=menu_for_user(user_id))
+
+    if len(text) < 2 or len(text) > 50 or text.isdigit():
+        await update.message.reply_text("Пожалуйста, введите фамилию текстом (не менее 2 символов):")
+        return ASK_REG_LAST_NAME
+
+    logger.info(f"[REG] user_id={user_id} ищет фамилию '{text}'")
+    try:
+        unregistered = await run_db(find_unregistered_workers_by_lastname, text)
+    except Exception as e:
+        logger.error(f"[REG] Ошибка поиска по фамилии '{text}' для user_id={user_id}: {e}")
+        await update.message.reply_text("❌ Произошла ошибка поиска. Попробуйте ещё раз позже.", reply_markup=menu_for_user(user_id))
+        context.user_data.clear()
         return ConversationHandler.END
-    elif len(workers) == 1:
-        candidate = workers[0]
-        await run_db(bind_worker_id, candidate["telegram_id"], user_id)
-        w_fio = f"{candidate['last_name']} {candidate['first_name']}"
-        await update.message.reply_text(f"🎉 <b>Регистрация успешна!</b>\nВы привязаны к профилю: <b>{html.escape(w_fio)}</b>.", parse_mode="HTML", reply_markup=menu_for_user(user_id))
-        return ConversationHandler.END
-    else:
-        context.user_data["candidate_workers"] = [dict(w) for w in workers]
-        buttons = [[f"{w['last_name']} {w['first_name']}"] for w in workers]
+
+    if unregistered:
+        context.user_data["reg_last_name_query"] = text
+        if len(unregistered) == 1:
+            return await _show_registration_confirm(update, context, dict(unregistered[0]))
+        context.user_data["candidate_workers"] = [dict(w) for w in unregistered]
+        buttons = [[f"{w['last_name']} {w['first_name']} ({clean_position(w['position'])})"] for w in unregistered]
         buttons.append([CANCEL_TEXT])
-        await update.message.reply_text("🔍 Найдено несколько сотрудников. Выберите ваше имя на клавиатуре:", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True))
+        await update.message.reply_text(
+            "🔍 Найдено несколько сотрудников с такой фамилией. Выберите себя из списка:",
+            reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+        )
         return ASK_REG_FIRST_NAME
+
+    # Not among the unregistered placeholders — check whether it's already claimed by someone else
+    already_registered = await run_db(find_registered_workers_by_lastname, text)
+    if already_registered:
+        logger.warning(
+            f"[REG] user_id={user_id} (@{update.effective_user.username}) попытался зарегистрироваться на "
+            f"фамилию '{text}', уже привязанную к другому Telegram ID — возможная ошибка или дублирование"
+        )
+        await _notify_admins_registration_issue(context, update, "already_registered", text, matches=already_registered)
+        await update.message.reply_text(
+            "⚠️ Сотрудник с такой фамилией уже зарегистрирован в системе под другим аккаунтом.\n"
+            "Если это ошибка, обратитесь к администратору — ему уже отправлено уведомление.",
+            reply_markup=menu_for_user(user_id)
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    # Not found anywhere in the database
+    logger.warning(f"[REG] user_id={user_id} (@{update.effective_user.username}) не найден в базе по фамилии '{text}'")
+    context.user_data["reg_last_name_query"] = text
+    await _notify_admins_registration_issue(context, update, "not_found", text)
+    await update.message.reply_text(
+        f"❌ Сотрудник с фамилией <b>{html.escape(text)}</b> не найден в базе.\n\n"
+        f"Администратор уже уведомлён о вашем обращении и добавит вас в систему.\n"
+        f"При желании можете поделиться номером телефона — это поможет администратору связаться с вами быстрее:",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardMarkup(
+            [[KeyboardButton("📱 Поделиться контактом", request_contact=True)], ["Пропустить"]],
+            resize_keyboard=True
+        )
+    )
+    return ASK_REG_CONTACT
+
+async def register_contact_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    contact = update.message.contact
+    if contact and contact.user_id == user_id:
+        logger.info(f"[REG] user_id={user_id} поделился номером телефона по обращению без совпадения в базе")
+        await _notify_admins_registration_issue(
+            context, update, "contact_shared",
+            context.user_data.get("reg_last_name_query", "?"),
+            phone=contact.phone_number
+        )
+        await update.message.reply_text("✅ Спасибо! Номер передан администратору.", reply_markup=menu_for_user(user_id))
+    else:
+        await update.message.reply_text("Хорошо, администратор свяжется с вами по мере обработки заявки.", reply_markup=menu_for_user(user_id))
+    context.user_data.clear()
+    return ConversationHandler.END
 
 async def register_firstname_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.effective_user.id
     if text == CANCEL_TEXT:
+        logger.info(f"[REG] user_id={user_id} отменил выбор из списка кандидатов")
         await update.message.reply_text("Регистрация отменена.", reply_markup=menu_for_user(user_id))
+        context.user_data.clear()
         return ConversationHandler.END
-    
+
     candidates = context.user_data.get("candidate_workers", [])
     matched_candidate = None
     for c in candidates:
-        if text.lower() == f"{c['last_name']} {c['first_name']}".lower():
+        label = f"{c['last_name']} {c['first_name']} ({clean_position(c['position'])})"
+        if text.strip().lower() == label.lower():
             matched_candidate = c
             break
     if not matched_candidate:
-        await update.message.reply_text("❌ Пожалуйста, выберите имя из списка.")
+        await update.message.reply_text("❌ Пожалуйста, выберите имя из списка кнопкой ниже.")
         return ASK_REG_FIRST_NAME
-    
-    await run_db(bind_worker_id, matched_candidate["telegram_id"], user_id)
-    w_fio = f"{matched_candidate['last_name']} {matched_candidate['first_name']}"
-    await update.message.reply_text(f"🎉 <b>Регистрация успешна!</b>\nВы привязаны к профилю: <b>{html.escape(w_fio)}</b>.", parse_mode="HTML", reply_markup=menu_for_user(user_id))
-    return ConversationHandler.END
+
+    return await _show_registration_confirm(update, context, matched_candidate)
+
+async def register_confirm_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+    candidate = context.user_data.get("reg_candidate")
+
+    if text == "✅ Да, это я" and candidate:
+        try:
+            now_str = now_local().strftime("%Y-%m-%d %H:%M:%S")
+            await run_db(bind_worker_id, candidate["telegram_id"], user_id, now_str)
+        except Exception as e:
+            logger.error(f"[REG] Ошибка привязки user_id={user_id} к профилю ID={candidate.get('telegram_id')}: {e}")
+            await update.message.reply_text(
+                "❌ Произошла ошибка при регистрации. Попробуйте ещё раз или обратитесь к администратору.",
+                reply_markup=ReplyKeyboardMarkup([["🔑 Начать регистрацию"]], resize_keyboard=True)
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        w_fio = f"{candidate['last_name']} {candidate['first_name']}"
+        logger.info(f"[REG] Успешная регистрация: user_id={user_id} привязан к профилю '{w_fio}' (был временный ID {candidate['telegram_id']})")
+        await update.message.reply_text(
+            f"🎉 <b>Регистрация успешна!</b>\nВы привязаны к профилю: <b>{html.escape(w_fio)}</b>.\n"
+            f"Теперь вы можете отправлять видео-отчёты.",
+            parse_mode="HTML",
+            reply_markup=menu_for_user(user_id)
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    logger.info(f"[REG] user_id={user_id} не подтвердил найденного кандидата ({candidate.get('last_name') if candidate else '?'})")
+    context.user_data.pop("reg_candidate", None)
+    await update.message.reply_text(
+        "Хорошо, попробуйте ввести фамилию ещё раз, либо обратитесь к администратору:",
+        reply_markup=CANCEL_KEYBOARD
+    )
+    return ASK_REG_LAST_NAME
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip() if update.message.text else ""
