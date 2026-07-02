@@ -45,7 +45,7 @@ from admin_handlers import (
     register_start, register_lastname_received, register_firstname_received,
     register_confirm_received, register_contact_received,
     settings_start, settings_action, cancel,
-    export_reports_start, export_reports_choice, alert_time_start, alert_time_save,
+    export_reports_start, export_reports_choice, export_summary_date_received, alert_time_start, alert_time_save,
     remind_all_start, remind_all_send,
     save_gsheets_url, save_gsheets_creds, save_gsheets_creds_text,
     ASK_WORKER_ID, ASK_LASTNAME, ASK_FIRSTNAME, ASK_POSITION, ASK_GROUP,
@@ -56,7 +56,7 @@ from admin_handlers import (
     ASK_LIST_WORKER, ASK_EDIT_FIELD, ASK_EDIT_VALUE, ASK_EDIT_SCHEDULE,
     ASK_EDIT_DAILY_FACT, ASK_EDIT_STATUS_WORK, ASK_NOT_WORKING_DAYS, ASK_NOT_WORKING_REASON,
     ASK_REG_CONFIRM, ASK_REG_CONTACT, ASK_WORKER_DEPARTMENT,
-    ASK_DEPT_ACTION, ASK_DEPT_ADD_NAME, ASK_DEPT_DELETE_SELECT,
+    ASK_DEPT_ACTION, ASK_DEPT_ADD_NAME, ASK_DEPT_DELETE_SELECT, ASK_SUMMARY_DATE,
     department_manage_start, department_manage_action, department_add_received, department_delete_received
 )
 
@@ -78,22 +78,6 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
     if user_id not in user_locks:
         user_locks[user_id] = asyncio.Lock()
     return user_locks[user_id]
-
-def find_nearest_slot(schedule: list[str], now: datetime):
-    current_minutes = now.hour * 60 + now.minute
-    nearest_slot = None
-    nearest_diff = None
-
-    for slot in schedule:
-        hour, minute = map(int, slot.split(":"))
-        slot_minutes = hour * 60 + minute
-        diff = abs(current_minutes - slot_minutes)
-        if nearest_diff is None or diff < nearest_diff:
-            nearest_diff = diff
-            nearest_slot = slot
-
-    is_late = nearest_diff is not None and nearest_diff > LATE_THRESHOLD_MIN
-    return nearest_slot, is_late
 
 # Summary Schedules
 def reschedule_summary_jobs(application: Application):
@@ -122,11 +106,12 @@ def reschedule_summary_jobs(application: Application):
         except Exception as e:
             logger.error(f"Ошибка при планировании сводки на {t_str}: {e}")
 
-async def scheduled_summary_callback(context: ContextTypes.DEFAULT_TYPE):
-    now = now_local()
-    date_str = now.strftime("%Y-%m-%d")
-    current_mins = now.hour * 60 + now.minute
-
+async def build_missing_status_summary_text(date_str: str, now: datetime | None = None) -> str:
+    """Shared by the scheduled admin alert and the on-demand "Сводка сейчас"/"Сводка за
+    дату" buttons. When `now` is given (today, in progress), a slot only counts as missing
+    once it's overdue by more than LATE_THRESHOLD_MIN — matching the original scheduled
+    behaviour exactly. When `now` is None (a past date), the day is fully over, so every
+    slot not submitted counts as missing with no partial-day cutoff or overdue duration."""
     def _build_by_dept():
         conn = get_db()
         workers = conn.execute(
@@ -140,6 +125,7 @@ async def scheduled_summary_callback(context: ContextTypes.DEFAULT_TYPE):
         }
         conn.close()
 
+        current_mins = now.hour * 60 + now.minute if now else None
         result = {}
         for w in workers:
             if w["telegram_id"] in not_working_today:
@@ -149,6 +135,9 @@ async def scheduled_summary_callback(context: ContextTypes.DEFAULT_TYPE):
             missing = []
             for slot in slots:
                 if slot in submitted:
+                    continue
+                if current_mins is None:
+                    missing.append(f"{slot} — не сдано")
                     continue
                 hour, minute = map(int, slot.split(":"))
                 slot_mins = hour * 60 + minute
@@ -165,18 +154,23 @@ async def scheduled_summary_callback(context: ContextTypes.DEFAULT_TYPE):
     by_dept = await run_db(_build_by_dept)
 
     if not by_dept:
-        summary_text = f"✅ <b>Сводка за {date_str}</b>\nВсе сотрудники вовремя сдали статусы."
-    else:
-        lines = [f"⏰ <b>Не сдали статус за {date_str}:</b>\n"]
-        for dept, entries in sorted(by_dept.items()):
-            lines.append(f"🏢 <b>{html.escape(dept)}</b>")
-            for w, missing in entries:
-                name = html.escape(f"{w['last_name']} {w['first_name']} ({clean_position(w['position'])})")
-                lines.append(f"• {name}")
-                for slot_info in missing:
-                    lines.append(f"    ⛔ {html.escape(slot_info)}")
-            lines.append("")
-        summary_text = "\n".join(lines)
+        return f"✅ <b>Сводка за {date_str}</b>\nВсе сотрудники сдали все статусы."
+
+    lines = [f"⏰ <b>Не сдали статус за {date_str}:</b>\n"]
+    for dept, entries in sorted(by_dept.items()):
+        lines.append(f"🏢 <b>{html.escape(dept)}</b>")
+        for w, missing in entries:
+            name = html.escape(f"{w['last_name']} {w['first_name']} ({clean_position(w['position'])})")
+            lines.append(f"• {name}")
+            for slot_info in missing:
+                lines.append(f"    ⛔ {html.escape(slot_info)}")
+        lines.append("")
+    return "\n".join(lines)
+
+async def scheduled_summary_callback(context: ContextTypes.DEFAULT_TYPE):
+    now = now_local()
+    date_str = now.strftime("%Y-%m-%d")
+    summary_text = await build_missing_status_summary_text(date_str, now)
 
     for admin_id in ADMIN_IDS:
         try:
@@ -420,6 +414,7 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^📥 Выгрузить отчеты$"), export_reports_start)],
         states={
             ASK_EXPORT_TYPE: [MessageHandler(safe_text_filter, export_reports_choice)],
+            ASK_SUMMARY_DATE: [MessageHandler(safe_text_filter, export_summary_date_received)],
         },
         fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )

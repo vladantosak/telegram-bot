@@ -86,7 +86,8 @@ CANCEL_TEXT = "❌ Отмена"
     ASK_DEPT_ACTION,
     ASK_DEPT_ADD_NAME,
     ASK_DEPT_DELETE_SELECT,
-) = range(42)
+    ASK_SUMMARY_DATE,
+) = range(43)
 
 def schedule_description_text() -> str:
     lines = []
@@ -1017,6 +1018,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 EXPORT_MENU = ReplyKeyboardMarkup(
     [
         ["📊 Скачать Excel файл", "🔄 Синхронизировать сейчас"],
+        ["📋 Сводка сейчас", "📅 Сводка за дату"],
         ["❌ Назад"]
     ],
     resize_keyboard=True
@@ -1073,7 +1075,46 @@ async def export_reports_choice(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text(f"⚠️ **Ошибка синхронизации:**\n`{err}`", reply_markup=MAIN_MENU, parse_mode="Markdown")
         return ConversationHandler.END
 
+    if choice == "📋 Сводка сейчас":
+        from bot import build_missing_status_summary_text
+        now = now_local()
+        date_str = now.strftime("%Y-%m-%d")
+        summary_text = await build_missing_status_summary_text(date_str, now)
+        await update.message.reply_text(summary_text, parse_mode="HTML", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+
+    if choice == "📅 Сводка за дату":
+        await update.message.reply_text(
+            "Введите дату в формате ДД.ММ.ГГГГ (например, 01.07.2026):",
+            reply_markup=CANCEL_KEYBOARD
+        )
+        return ASK_SUMMARY_DATE
+
     return ASK_EXPORT_TYPE
+
+async def export_summary_date_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == CANCEL_TEXT:
+        await update.message.reply_text("Действие отменено.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+
+    try:
+        target_date = datetime.strptime(text, "%d.%m.%Y").date()
+    except ValueError:
+        await update.message.reply_text("Некорректный формат. Введите дату как ДД.ММ.ГГГГ (например, 01.07.2026):")
+        return ASK_SUMMARY_DATE
+
+    today = now_local().date()
+    if target_date > today:
+        await update.message.reply_text("Эта дата ещё не наступила. Введите сегодняшнюю дату или более раннюю:")
+        return ASK_SUMMARY_DATE
+
+    from bot import build_missing_status_summary_text
+    date_str = target_date.strftime("%Y-%m-%d")
+    now_for_calc = now_local() if target_date == today else None
+    summary_text = await build_missing_status_summary_text(date_str, now_for_calc)
+    await update.message.reply_text(summary_text, parse_mode="HTML", reply_markup=MAIN_MENU)
+    return ConversationHandler.END
 
 async def alert_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin_check(update): return ConversationHandler.END

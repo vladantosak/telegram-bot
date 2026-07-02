@@ -282,28 +282,41 @@ async def _flush_media_batch(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots: set):
-    current_mins = now.hour * 60 + now.minute
-    missing_passed = []
-    for slot in schedule:
-        if slot in submitted_slots:
-            continue
-        h, m = map(int, slot.split(":"))
-        if h * 60 + m <= current_mins:
-            missing_passed.append(slot)
-    if missing_passed:
-        # Attribute the report to the CLOSEST due-but-unsubmitted slot, not the oldest one —
-        # a video sent at 12:55 belongs to the 12:00 slot even if 10:00 was also never submitted.
-        # The 10:00 slot is left genuinely missing, which is correct: it wasn't reported on.
-        missing_passed.sort(key=lambda s: tuple(map(int, s.split(":"))))
-        target_slot = missing_passed[-1]
-        h, m = map(int, target_slot.split(":"))
-        is_late = current_mins > h * 60 + m + LATE_THRESHOLD_MIN
-        return target_slot, is_late
+SLOT_MATCH_WINDOW_MIN = 60  # +-1 час: видео, отправленное в пределах часа от планового времени слота, относится к этому слоту
 
-    # Otherwise find nearest
-    from bot import find_nearest_slot
-    return find_nearest_slot(schedule, now)
+def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots: set):
+    """Attributes a status video to the schedule slot closest to it in clock time, among
+    slots not yet submitted today. Pure nearest-by-distance — no "must already be due"
+    gate. The previous version only ever considered a slot once its clock time had
+    numerically passed, so a video sent a few minutes BEFORE the next slot (e.g. 11:58 for
+    a 12:00 slot) fell through to the older, already-passed 10:00 slot instead of the
+    obviously-intended 12:00 one. Distance-based matching fixes that at the root, for every
+    slot pair, instead of special-casing the boundary."""
+    current_mins = now.hour * 60 + now.minute
+    candidates = [s for s in schedule if s not in submitted_slots] or list(schedule)
+
+    best_slot, best_diff = None, None
+    for slot in candidates:
+        h, m = map(int, slot.split(":"))
+        diff = abs(current_mins - (h * 60 + m))
+        if best_diff is None or diff < best_diff:
+            best_slot, best_diff = slot, diff
+
+    h, m = map(int, best_slot.split(":"))
+    is_late = current_mins > h * 60 + m + LATE_THRESHOLD_MIN
+    within_window = best_diff <= SLOT_MATCH_WINDOW_MIN
+
+    logger.info(
+        "[Определение времени] Видео получено: "
+        f"дата={now.strftime('%d.%m.%Y')}, локальное время (Europe/Chisinau)={now.strftime('%H:%M:%S')}, "
+        f"расписание={schedule}, уже сдано сегодня={sorted(submitted_slots) or 'ничего'}, "
+        f"допустимое отклонение=±{SLOT_MATCH_WINDOW_MIN} мин. "
+        f"Определённое окно сдачи: {best_slot} (расстояние {best_diff} мин, "
+        f"{'в пределах допуска' if within_window else 'вне допуска — использован ближайший из доступных слотов'}). "
+        f"Результат: статус привязан к окну {best_slot}"
+        + (f", опоздание {current_mins - (h * 60 + m)} мин." if is_late else ", вовремя.")
+    )
+    return best_slot, is_late
 
 async def process_media_batch(user_id: int, items: list[dict], context: ContextTypes.DEFAULT_TYPE):
     worker = await run_db(get_worker, user_id)
