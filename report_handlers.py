@@ -56,7 +56,8 @@ from db import (
     get_db, run_db, is_admin, ADMIN_IDS, DEFAULT_GROUP_ID, SCHEDULES, SCHEDULE_A,
     LATE_THRESHOLD_MIN, now_local, is_quiet_mode_enabled, get_worker_target_group,
     get_group_name, get_pending_reason_requests, resolve_pending_reason_requests,
-    get_missed_status_reason, check_and_update_remark_alert_threshold, get_recent_remarks
+    get_missed_status_reason, check_and_update_remark_alert_threshold, get_recent_remarks,
+    is_message_already_processed
 )
 
 REMARK_REQUIRED_ACTION_TEXT = (
@@ -344,9 +345,17 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
 
         logger.info(f"[process_media_batch] Видео {idx}/{len(items)} пользователя {user_id}: текст='{text_content[:80]}'")
 
-        last_slot_time = now.replace(hour=last_hour, minute=last_minute, second=0, microsecond=0)
-        last_slot_limit = last_slot_time + dt_module.timedelta(minutes=STATUS_LATE_TOLERANCE_MIN)
-        forced_type = "status" if now <= last_slot_limit else None
+        if len(items) == 1:
+            # Single video: keep the proven time-based rule (it's overwhelmingly a status).
+            last_slot_time = now.replace(hour=last_hour, minute=last_minute, second=0, microsecond=0)
+            last_slot_limit = last_slot_time + dt_module.timedelta(minutes=STATUS_LATE_TOLERANCE_MIN)
+            forced_type = "status" if now <= last_slot_limit else None
+        else:
+            # Several videos arrive together with essentially the same timestamp, so time
+            # alone can't tell a "статус за 17:00" apart from a "факт дня" sent right after
+            # it — forcing every item to "status" here is exactly what made the bot merge
+            # them into one status report. Let content decide for each video individually.
+            forced_type = None
 
         ai_res_pre = await check_status_async(text_content, report_type_override=forced_type)
         report_type = ai_res_pre["report_type"]
@@ -774,6 +783,16 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif update.message.video_note: file_obj = update.message.video_note
 
             if file_obj:
+                already_processed = await run_db(
+                    is_message_already_processed, update.effective_chat.id, update.message.message_id
+                )
+                if already_processed:
+                    logger.warning(
+                        f"[dedup] Пропускаю повторно доставленное сообщение message_id={update.message.message_id} "
+                        f"от user_id={user_id} — это видео уже было обработано ранее."
+                    )
+                    return
+
                 await update.message.reply_text("📹 Видео получено, ожидайте оценки:")
                 tg_file = await context.bot.get_file(file_obj.file_id)
                 ext = "mp4" if update.message.video or update.message.video_note else "ogg"

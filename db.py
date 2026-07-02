@@ -673,6 +673,18 @@ def get_report_media(report_id: int):
     conn.close()
     return rows
 
+def is_message_already_processed(source_chat_id: int, source_message_id: int) -> bool:
+    """True if this exact Telegram message was already turned into a report (report_media
+    row exists for it) — guards against the same update being redelivered and processed
+    twice, e.g. if the bot restarts mid-flight before Telegram's update offset is advanced."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT 1 FROM report_media WHERE source_chat_id = ? AND source_message_id = ? LIMIT 1",
+        (source_chat_id, source_message_id)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
 def delete_report_media_rows(report_id: int):
     conn = get_db()
     conn.execute("DELETE FROM report_media WHERE report_id = ?", (report_id,))
