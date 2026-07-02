@@ -14,6 +14,7 @@ from db import (
     get_db, run_db, get_worker, get_all_workers, get_workers_by_position, get_workers_by_object_id,
     find_unregistered_workers_by_lastname, find_registered_workers_by_lastname, bind_worker_id, upsert_worker,
     delete_worker, update_worker_field, get_object_group, save_object_group, clean_position,
+    get_worker_target_group,
     get_group_name, get_group_name_async, fetch_and_save_group_name, get_all_group_names,
     get_setting, set_setting, calculate_worker_stats, SCHEDULES, SCHEDULE_A, DEFAULT_GROUP_ID,
     is_admin, ADMIN_IDS, get_pending_unregistered_user, delete_pending_unregistered_user,
@@ -404,8 +405,11 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
     )
     await run_db(delete_pending_unregistered_user, context.user_data["new_worker_id"])
     await fetch_and_save_group_name(context.bot, context.user_data["group_id"])
-    
-    target_group_id = context.user_data["group_id"] or DEFAULT_GROUP_ID
+
+    # LOGIC FIX: prefer the department's configured group (/set_object_group) over the
+    # group ID typed in during this flow, same resolution used everywhere else now.
+    new_worker_row = await run_db(get_worker, context.user_data["new_worker_id"])
+    target_group_id = await run_db(get_worker_target_group, new_worker_row)
     try:
         notify_msg = f"👤 {context.user_data['last_name']} {context.user_data['first_name']} добавлен в систему, ID: {context.user_data['new_worker_id']}"
         await context.bot.send_message(chat_id=target_group_id, text=notify_msg)

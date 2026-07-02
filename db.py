@@ -20,7 +20,13 @@ except ImportError:
 DB_PATH = os.environ.get("DB_PATH", "workers.db")
 DEFAULT_GROUP_ID = int(os.environ.get("GROUP_ID", "-1003804380536"))
 LOCAL_TZ = ZoneInfo("Europe/Chisinau")
-LATE_THRESHOLD_MIN = 15
+LATE_THRESHOLD_MIN = 15  # used for reminders / "expected" counting - when a slot is considered due
+# Acceptance window for an actually-submitted status: -30/+60 minutes around the slot's
+# clock time is still "on time" (just flagged late outside that). Single source of truth,
+# shared by report_handlers.py (slot attribution) and bot.py (missed-status reminder), so
+# the "still within your window" and "you missed it, explain why" checks can't disagree.
+STATUS_EARLY_TOLERANCE_MIN = 30
+STATUS_LATE_TOLERANCE_MIN = 60
 
 # Read ADMIN_IDS from environment variables
 ADMIN_IDS_RAW = os.environ.get("ADMIN_IDS", "")
@@ -1127,6 +1133,14 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
     if not spreadsheet_id or not creds_str:
         return False, "Настройки Google Таблицы или сервисного аккаунта не заданы."
 
+    # BUG FIX: conn/conn_sum are opened partway through the try block below and closed at a
+    # specific point in the normal flow: if an exception fires anywhere between open and
+    # that point (e.g. a bad query, or calculate_worker_stats raising outside its own
+    # per-worker guard), the function fell straight to `except Exception` and the
+    # connection was never closed. Pre-declared here so the finally block below can safely
+    # close whichever of them actually got opened, on every exit path.
+    conn = None
+    conn_sum = None
     try:
         creds_dict = json.loads(creds_str)
         scopes = [
@@ -1756,11 +1770,20 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                 sheet.batch_update({"requests": all_requests[i:i + 400]})
 
         return True, None
-        
+
     except Exception as e:
         import logging
         logging.getLogger(__name__).error(f"[GSheets Sync Error] {e}")
         return False, str(e)
+    finally:
+        # Safety net for the leak described above - a no-op if the normal flow already
+        # closed these (closing an already-closed sqlite3 connection is harmless).
+        for c in (conn, conn_sum):
+            if c is not None:
+                try:
+                    c.close()
+                except Exception:
+                    pass
 
 _gsheets_sync_lock = None
 _gsheets_sync_state_lock = None

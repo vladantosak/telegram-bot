@@ -19,7 +19,7 @@ from telegram.ext import (
 
 from db import (
     init_db, get_worker, get_all_workers, get_workers_by_position, get_db, run_db,
-    DEFAULT_GROUP_ID, LATE_THRESHOLD_MIN, LOCAL_TZ, SCHEDULES, SCHEDULE_A,
+    DEFAULT_GROUP_ID, LATE_THRESHOLD_MIN, STATUS_LATE_TOLERANCE_MIN, LOCAL_TZ, SCHEDULES, SCHEDULE_A,
     is_admin, ADMIN_IDS, save_scheduled_times, get_scheduled_times,
     get_group_name_async, now_local, get_submitted_status_slots, clean_position,
     has_pre_reminder_sent, mark_pre_reminder_sent,
@@ -308,8 +308,16 @@ async def missed_status_check_callback(context: ContextTypes.DEFAULT_TYPE):
                     continue
                 hour, minute = map(int, slot.split(":"))
                 mins_late = current_mins - (hour * 60 + minute)
-                # Fire once, shortly after the slot is officially considered missed
-                if LATE_THRESHOLD_MIN <= mins_late < LATE_THRESHOLD_MIN + 2:
+                # LOGIC FIX: this used to fire at LATE_THRESHOLD_MIN (15 min), demanding a
+                # written excuse and blocking new video submissions - while the actual
+                # acceptance window (pick_target_status_slot) still treats a status as
+                # legitimately "on time" up to STATUS_LATE_TOLERANCE_MIN (60 min) later. A
+                # worker running 20-50 minutes late was being told "you missed it, explain
+                # yourself" and locked out of sending video, even though their submission
+                # would have been accepted normally. Now only fires once the acceptance
+                # window has actually closed, so the two systems agree on what "missed"
+                # means.
+                if STATUS_LATE_TOLERANCE_MIN <= mins_late < STATUS_LATE_TOLERANCE_MIN + 2:
                     if has_pending_reason_request(w["telegram_id"], date_str, slot):
                         continue
                     found.append((w["telegram_id"], slot))

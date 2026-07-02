@@ -54,7 +54,8 @@ from db import (
     get_pending_unregistered_user, save_pending_unregistered_user,
     delete_pending_unregistered_user, bind_worker_id, async_sync_gsheets_background,
     get_db, run_db, is_admin, ADMIN_IDS, DEFAULT_GROUP_ID, SCHEDULES, SCHEDULE_A,
-    LATE_THRESHOLD_MIN, now_local, is_quiet_mode_enabled, get_worker_target_group,
+    STATUS_EARLY_TOLERANCE_MIN, STATUS_LATE_TOLERANCE_MIN,
+    now_local, is_quiet_mode_enabled, get_worker_target_group,
     get_group_name, get_pending_reason_requests, resolve_pending_reason_requests,
     get_missed_status_reason, check_and_update_remark_alert_threshold, get_recent_remarks,
     is_message_already_processed
@@ -283,9 +284,6 @@ async def _flush_media_batch(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-STATUS_EARLY_TOLERANCE_MIN = 30  # можно сдать до получаса раньше времени слота - это ещё "вовремя"
-STATUS_LATE_TOLERANCE_MIN = 60   # можно сдать до часа позже времени слота - это ещё "вовремя"
-
 def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots: set, worker_name: str = "?"):
     """Attributes a status video to the schedule slot closest to it in clock time, among
     slots not yet submitted today. Pure nearest-by-distance — no "must already be due"
@@ -331,7 +329,11 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
 
     sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
     w_name = f"{worker['last_name']} {worker['first_name']}"
-    dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
+    # LOGIC FIX: route by the worker's department group when one is configured (via
+    # /set_object_group), falling back to the worker's own group_id - previously this
+    # always used the worker's own group_id directly, so /set_object_group had no effect
+    # on where reports actually got sent.
+    dest_chat = await run_db(get_worker_target_group, worker)
 
     last_slot_time_str = sched_list[-1]
     last_hour, last_minute = map(int, last_slot_time_str.split(":"))
@@ -489,6 +491,15 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             error_count = overall_format_comment.lower().count("не ок")
             overall_required_action = REMARK_REQUIRED_ACTION_TEXT if error_count > 0 else "Ничего не предпринимать, всё в порядке"
 
+            # LOGIC FIX: only bump received_at to "now" for a genuine full merge (a new video
+            # arriving within MEDIA_MERGE_WINDOW_MINUTES of the first - still the same
+            # submission in progress). A later addendum outside that window kept the original
+            # received_at overwritten with the addendum's time, so a report submitted exactly
+            # on time could retroactively become "прислал поздно" in Сводка purely because a
+            # follow-up video arrived after the acceptance window - even though the original,
+            # on-time submission is what should count for timeliness.
+            received_at_to_store = status_now.strftime("%H:%M:%S") if do_full_merge else existing["received_at"]
+
             await run_db(
                 update_report_text_and_ai,
                 report_id=report_id,
@@ -496,7 +507,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 format_comment=overall_format_comment,
                 required_action=overall_required_action,
                 raw_text=combined_raw_text,
-                received_at=status_now.strftime("%H:%M:%S")
+                received_at=received_at_to_store
             )
         else:
             raw_text_parts = []
@@ -922,7 +933,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 
                 w_name = f"{worker['last_name']} {worker['first_name']}"
-                dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
+                dest_chat = await run_db(get_worker_target_group, worker)
                 notify_text = f"🛌 {w_name} сегодня не работает.\nПричина: {reason}"
                 try:
                     await context.bot.send_message(chat_id=dest_chat, text=notify_text)
@@ -1058,7 +1069,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(f"⚠️ Отчёт{info_suffix}.\nОценка отчета: {ai_res['employee_message']}", parse_mode="Markdown")
 
-        dest_chat = worker["group_id"] or DEFAULT_GROUP_ID
+        dest_chat = await run_db(get_worker_target_group, worker)
         title_text = f"Отчет обновлен: {w_name}" if is_addon else w_name
         notify_text = (
             f"{title_text}\n"
