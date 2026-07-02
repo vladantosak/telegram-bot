@@ -429,6 +429,10 @@ def set_setting(key: str, value: str):
 def delete_worker(telegram_id: int) -> bool:
     conn = get_db()
     try:
+        conn.execute(
+            "DELETE FROM report_media WHERE report_id IN (SELECT id FROM reports WHERE telegram_id = ?)",
+            (telegram_id,)
+        )
         conn.execute("DELETE FROM reports WHERE telegram_id = ?", (telegram_id,))
         conn.execute("DELETE FROM sent_reminders WHERE telegram_id = ?", (telegram_id,))
         conn.execute("DELETE FROM sent_pre_reminders WHERE telegram_id = ?", (telegram_id,))

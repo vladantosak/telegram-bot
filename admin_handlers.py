@@ -133,6 +133,10 @@ SETTINGS_KEYBOARD = ReplyKeyboardMarkup(
 
 def _cleanup_orphaned_records():
     conn = get_db()
+    conn.execute(
+        "DELETE FROM report_media WHERE report_id IN "
+        "(SELECT id FROM reports WHERE telegram_id NOT IN (SELECT telegram_id FROM workers))"
+    )
     deleted_reports = conn.execute(
         "DELETE FROM reports WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)"
     ).rowcount
@@ -144,9 +148,15 @@ def _cleanup_orphaned_records():
     ).rowcount
     conn.execute("DELETE FROM pending_reason_requests WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)")
     conn.execute("DELETE FROM missed_status_reasons WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)")
+    # pending_unregistered_users holds "temporary report" data for senders who aren't (yet) a
+    # worker. Rows for IDs that used to be a worker (now deleted) are pure ghosts — they were
+    # never swept here before, so re-adding that same ID kept resurfacing the old temp report.
+    deleted_pending = conn.execute(
+        "DELETE FROM pending_unregistered_users WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)"
+    ).rowcount
     conn.commit()
     conn.close()
-    return deleted_reports, deleted_reminders + deleted_pre_reminders
+    return deleted_reports, deleted_reminders + deleted_pre_reminders, deleted_pending
 
 async def settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin_check(update): return ConversationHandler.END
@@ -164,12 +174,13 @@ async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await department_manage_start(update, context)
 
     if choice == "🗑 Очистить базу от удалённых сотрудников":
-        deleted_reports, deleted_reminders = await run_db(_cleanup_orphaned_records)
+        deleted_reports, deleted_reminders, deleted_pending = await run_db(_cleanup_orphaned_records)
         async_sync_gsheets_background()
         await update.message.reply_text(
             f"✅ База очищена:\n"
             f"• Отчётов удалено: {deleted_reports}\n"
-            f"• Напоминаний удалено: {deleted_reminders}",
+            f"• Напоминаний удалено: {deleted_reminders}\n"
+            f"• Временных заявок удалено: {deleted_pending}",
             reply_markup=MAIN_MENU
         )
         return ConversationHandler.END
