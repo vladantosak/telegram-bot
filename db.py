@@ -116,6 +116,7 @@ def init_db():
         ("is_active", "INTEGER NOT NULL DEFAULT 1"),
         ("object_id", "TEXT NOT NULL DEFAULT 'Основной'"),
         ("registered_at", "TEXT"),
+        ("last_remark_alert_count", "INTEGER NOT NULL DEFAULT 0"),
     ]:
         if col not in cols:
             conn.execute(f"ALTER TABLE workers ADD COLUMN {col} {definition}")
@@ -471,6 +472,56 @@ def update_report_text_and_ai(report_id: int, is_ok: bool, format_comment: str, 
     )
     conn.commit()
     conn.close()
+
+def count_remarks(telegram_id: int) -> int:
+    """Total number of video-status reports with a remark (is_ok = 0) for this worker, all-time."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT COUNT(*) as c FROM reports WHERE telegram_id = ? AND report_type = 'status' AND is_ok = 0",
+        (telegram_id,)
+    ).fetchone()
+    conn.close()
+    return row["c"] if row else 0
+
+def get_recent_remarks(telegram_id: int, limit: int = 5) -> list:
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT report_date, slot_time, format_comment FROM reports "
+        "WHERE telegram_id = ? AND report_type = 'status' AND is_ok = 0 "
+        "ORDER BY report_date DESC, id DESC LIMIT ?",
+        (telegram_id, limit)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def check_and_update_remark_alert_threshold(telegram_id: int, threshold: int = 3) -> int | None:
+    """Returns the new total remark count if the worker just crossed another multiple of
+    `threshold` since the last alert, otherwise None. Updates the bookkeeping either way
+    is not needed on None; only advances last_remark_alert_count when an alert should fire,
+    so a worker can never be re-notified for the same tier."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT last_remark_alert_count FROM workers WHERE telegram_id = ?", (telegram_id,)
+    ).fetchone()
+    if row is None:
+        conn.close()
+        return None
+    last_alerted = row["last_remark_alert_count"] or 0
+
+    total = conn.execute(
+        "SELECT COUNT(*) as c FROM reports WHERE telegram_id = ? AND report_type = 'status' AND is_ok = 0",
+        (telegram_id,)
+    ).fetchone()["c"]
+
+    if total >= last_alerted + threshold:
+        new_tier = (total // threshold) * threshold
+        conn.execute("UPDATE workers SET last_remark_alert_count = ? WHERE telegram_id = ?", (new_tier, telegram_id))
+        conn.commit()
+        conn.close()
+        return total
+
+    conn.close()
+    return None
 
 def set_report_group_message(report_id: int, chat_id: int, message_id: int):
     conn = get_db()

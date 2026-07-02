@@ -56,8 +56,40 @@ from db import (
     get_db, run_db, is_admin, ADMIN_IDS, DEFAULT_GROUP_ID, SCHEDULES, SCHEDULE_A,
     LATE_THRESHOLD_MIN, now_local, is_quiet_mode_enabled, get_worker_target_group,
     get_group_name, get_pending_reason_requests, resolve_pending_reason_requests,
-    get_missed_status_reason
+    get_missed_status_reason, check_and_update_remark_alert_threshold, get_recent_remarks
 )
+
+REMARK_REQUIRED_ACTION_TEXT = (
+    "Сотруднику сделано замечание по выявленным нарушениям. "
+    "Необходимо проконтролировать исправление ошибок при следующих сдачах статусов."
+)
+
+async def notify_admins_if_remark_threshold_crossed(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, worker_name: str):
+    new_total = await run_db(check_and_update_remark_alert_threshold, telegram_id)
+    if new_total is None:
+        return
+
+    recent = await run_db(get_recent_remarks, telegram_id, 5)
+    lines = [
+        "⚠️ <b>Требуется внимание.</b>\n",
+        f"У сотрудника <b>{html.escape(worker_name)}</b> накопилось {new_total} замечаний при сдаче видео-статусов.\n",
+        "Рекомендуется обратить внимание на качество сдачи отчётов и при необходимости провести личную беседу с сотрудником.\n",
+        f"Всего замечаний: {new_total}",
+    ]
+    if recent:
+        lines.append("\nПоследние нарушения:")
+        for r in recent:
+            date_label = format_show_date(r["report_date"])
+            slot_label = f" ({r['slot_time']})" if r["slot_time"] else ""
+            comment = (r["format_comment"] or "").strip() or "без комментария"
+            lines.append(f"• {date_label}{slot_label} — {html.escape(comment)}")
+
+    alert_text = "\n".join(lines)
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=alert_text, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Не удалось отправить админу {admin_id} накопительное предупреждение о сотруднике {telegram_id}: {e}")
 
 from ai import (
     transcribe_audio, clean_report, check_status
@@ -260,8 +292,11 @@ def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots:
         if h * 60 + m <= current_mins:
             missing_passed.append(slot)
     if missing_passed:
+        # Attribute the report to the CLOSEST due-but-unsubmitted slot, not the oldest one —
+        # a video sent at 12:55 belongs to the 12:00 slot even if 10:00 was also never submitted.
+        # The 10:00 slot is left genuinely missing, which is correct: it wasn't reported on.
         missing_passed.sort(key=lambda s: tuple(map(int, s.split(":"))))
-        target_slot = missing_passed[0]
+        target_slot = missing_passed[-1]
         h, m = map(int, target_slot.split(":"))
         is_late = current_mins > h * 60 + m + LATE_THRESHOLD_MIN
         return target_slot, is_late
@@ -424,18 +459,8 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             cleaned_text = await clean_report_async(combined_raw_text)
             report_id = existing["id"]
 
-            required_actions = []
-            for idx, s_item in enumerate(status_items, start=1 + existing_media_count):
-                if not s_item["ai_res"]["is_ok"]:
-                    required_actions.append(f"Видео {idx}: {s_item['ai_res']['required_action']}")
             error_count = overall_format_comment.lower().count("не ок")
-            if error_count == 0:
-                overall_required_action = "Ничего не предпринимать, всё в порядке"
-            else:
-                prev_action = (existing["required_action"] or "").strip()
-                if prev_action.lower() in ("", "всё ок", "ничего не предпринимать, всё в порядке"):
-                    prev_action = ""
-                overall_required_action = "; ".join(([prev_action] if prev_action else []) + required_actions)
+            overall_required_action = REMARK_REQUIRED_ACTION_TEXT if error_count > 0 else "Ничего не предпринимать, всё в порядке"
 
             await run_db(
                 update_report_text_and_ai,
@@ -461,12 +486,8 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             overall_is_ok = any(x["ai_res"]["is_ok"] for x in status_items)
             cleaned_text = await clean_report_async(combined_raw_text)
 
-            required_actions = []
-            for idx, s_item in enumerate(status_items, start=1):
-                if not s_item["ai_res"]["is_ok"]:
-                    required_actions.append(f"Видео {idx}: {s_item['ai_res']['required_action']}")
             error_count = overall_format_comment.lower().count("не ок")
-            overall_required_action = "; ".join(required_actions) if error_count > 0 else "Ничего не предпринимать, всё в порядке"
+            overall_required_action = REMARK_REQUIRED_ACTION_TEXT if error_count > 0 else "Ничего не предпринимать, всё в порядке"
 
             report_id = await run_db(
                 save_report,
@@ -483,18 +504,8 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             )
         async_sync_gsheets_background()
 
-        if error_count > 3:
-            alert_text = (
-                f"🚨 <b>Требуется внимание к сотруднику</b>\n"
-                f"👤 {html.escape(w_name)}\n"
-                f"⚠️ Замечаний в отчёте: {error_count}\n\n"
-                f"Причины:\n" + "\n".join(f"• {html.escape(a)}" for a in required_actions)
-            )
-            for admin_id in ADMIN_IDS:
-                try:
-                    await context.bot.send_message(chat_id=admin_id, text=alert_text, parse_mode="HTML")
-                except Exception as e:
-                    logger.error(f"Не удалось отправить админу {admin_id} предупреждение о сотруднике {user_id}: {e}")
+        if error_count > 0:
+            await notify_admins_if_remark_threshold_crossed(context, user_id, w_name)
 
         copied_msg_ids = []
         if do_full_merge and old_media_rows:
@@ -961,19 +972,21 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ai_res = await check_status_async(text_content, report_type_override=report_type)
             cleaned_text = await clean_report_async(text_content)
             report_id = existing_report["id"]
+            action_text = REMARK_REQUIRED_ACTION_TEXT if (ai_res["report_type"] == "status" and not ai_res["is_ok"]) else ai_res["required_action"]
 
             await run_db(
                 update_report_text_and_ai,
                 report_id=report_id,
                 is_ok=ai_res["is_ok"],
                 format_comment=ai_res["format_comment"],
-                required_action=ai_res["required_action"],
+                required_action=action_text,
                 raw_text=text_content,
                 received_at=now.strftime("%H:%M:%S")
             )
         else:
             ai_res = ai_res_pre
             cleaned_text = await clean_report_async(text_content)
+            action_text = REMARK_REQUIRED_ACTION_TEXT if (ai_res["report_type"] == "status" and not ai_res["is_ok"]) else ai_res["required_action"]
             report_id = await run_db(
                 save_report,
                 telegram_id=user_id,
@@ -984,12 +997,14 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 is_ok=ai_res["is_ok"],
                 is_late=is_late if ai_res["report_type"] == "status" else 0,
                 format_comment=ai_res["format_comment"],
-                required_action=ai_res["required_action"],
+                required_action=action_text,
                 raw_text=text_content
             )
         async_sync_gsheets_background()
 
         w_name = f"{worker['last_name']} {worker['first_name']}"
+        if ai_res["report_type"] == "status" and not ai_res["is_ok"]:
+            await notify_admins_if_remark_threshold_crossed(context, user_id, w_name)
         time_str = now.strftime("%H:%M")
         if ai_res["report_type"] == "status" and nearest_slot:
             sh, sm = map(int, nearest_slot.split(":"))
