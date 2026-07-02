@@ -40,6 +40,7 @@ from admin_handlers import (
     delete_worker_confirm, department_workers_start, department_workers_show,
     edit_worker_select, edit_worker_field_chosen, edit_worker_value_received,
     edit_worker_schedule_received, edit_worker_daily_fact_received, edit_worker_status_received,
+    edit_worker_not_working_days, edit_worker_not_working_reason,
     import_workers_start, import_workers_action, import_workers_file,
     register_start, register_lastname_received, register_firstname_received,
     settings_start, settings_action, cancel,
@@ -52,7 +53,7 @@ from admin_handlers import (
     ASK_CONFIRM_DELETE, ASK_IMPORT_ACTION, ASK_IMPORT_FILE, ASK_GSHEETS_URL,
     ASK_GSHEETS_CREDS, ASK_REPORT_TIME, ASK_CONFIRM_REMIND, ASK_EXPORT_TYPE,
     ASK_LIST_WORKER, ASK_EDIT_FIELD, ASK_EDIT_VALUE, ASK_EDIT_SCHEDULE,
-    ASK_EDIT_DAILY_FACT, ASK_EDIT_STATUS_WORK
+    ASK_EDIT_DAILY_FACT, ASK_EDIT_STATUS_WORK, ASK_NOT_WORKING_DAYS, ASK_NOT_WORKING_REASON
 )
 
 # Set up logging
@@ -302,6 +303,31 @@ async def missed_status_check_callback(context: ContextTypes.DEFAULT_TYPE):
                     pass
                 create_pending_reason_request(w["telegram_id"], date_str, slot, now.strftime("%H:%M:%S"))
 
+async def nightly_backup_callback(context: ContextTypes.DEFAULT_TYPE):
+    from db import backup_database_to_file
+    now = now_local()
+    backup_path = f"backup_{now.strftime('%Y%m%d_%H%M%S')}.db"
+    try:
+        backup_database_to_file(backup_path)
+    except Exception as e:
+        logger.error(f"Ошибка создания бэкапа БД: {e}")
+        return
+
+    for admin_id in ADMIN_IDS:
+        try:
+            with open(backup_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=admin_id,
+                    document=f,
+                    filename=backup_path,
+                    caption=f"🗄 Ежедневный бэкап базы данных за {now.strftime('%d.%m.%Y %H:%M')}"
+                )
+        except Exception as e:
+            logger.error(f"Не удалось отправить бэкап админу {admin_id}: {e}")
+
+    if os.path.exists(backup_path):
+        os.remove(backup_path)
+
 async def post_init(application: Application):
     reschedule_summary_jobs(application)
     
@@ -335,6 +361,14 @@ async def post_init(application: Application):
                 name="missed_status_check"
             )
             logger.info("Missed-status reason request check scheduled every minute.")
+
+        if not job_queue.get_jobs_by_name("nightly_db_backup"):
+            job_queue.run_daily(
+                nightly_backup_callback,
+                time=dt_module.time(hour=3, minute=0, tzinfo=LOCAL_TZ),
+                name="nightly_db_backup"
+            )
+            logger.info("Nightly database backup scheduled at 03:00.")
 
 def main():
     init_db()
@@ -406,6 +440,8 @@ def main():
             ASK_EDIT_SCHEDULE: [MessageHandler(safe_text_filter, edit_worker_schedule_received)],
             ASK_EDIT_DAILY_FACT: [MessageHandler(safe_text_filter, edit_worker_daily_fact_received)],
             ASK_EDIT_STATUS_WORK: [MessageHandler(safe_text_filter, edit_worker_status_received)],
+            ASK_NOT_WORKING_DAYS: [MessageHandler(safe_text_filter, edit_worker_not_working_days)],
+            ASK_NOT_WORKING_REASON: [MessageHandler(safe_text_filter, edit_worker_not_working_reason)],
         },
         fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )

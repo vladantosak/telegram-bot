@@ -4,6 +4,7 @@ import sqlite3
 import json
 import hashlib
 import itertools
+import logging
 from datetime import datetime
 import datetime as dt_module
 from zoneinfo import ZoneInfo
@@ -74,6 +75,16 @@ def get_db():
 
 def now_local() -> datetime:
     return datetime.now(LOCAL_TZ)
+
+def backup_database_to_file(target_path: str):
+    """Consistent snapshot of the live DB (safe under WAL mode / concurrent writers)."""
+    source = sqlite3.connect(DB_PATH, timeout=30.0)
+    dest = sqlite3.connect(target_path)
+    try:
+        source.backup(dest)
+    finally:
+        dest.close()
+        source.close()
 
 async def run_db(func, *args, **kwargs):
     import asyncio
@@ -1107,28 +1118,33 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
         for w in workers:
             if not w["is_active"]:
                 continue
-            
-            stats_30 = calculate_worker_stats(w, start_30_days, end_date_str, conn)
-            stats_all = calculate_worker_stats(w, earliest_date_str, end_date_str, conn)
-            
-            rows_analytics.append([
-                str(w["object_id"] or "Основной"),
-                f"{w['last_name']} {w['first_name']}",
-                clean_position(w["position"]),
-                str(stats_30["expected"]),
-                str(stats_30["submitted"]),
-                str(stats_30["lates"]),
-                str(stats_30["remarks"]),
-                str(stats_30["missed"]),
-                f"{stats_30['percent']:.1f}%",
-                str(stats_all["expected"]),
-                str(stats_all["submitted"]),
-                str(stats_all["lates"]),
-                str(stats_all["remarks"]),
-                str(stats_all["missed"]),
-                f"{stats_all['percent']:.1f}%"
-            ])
-            
+
+            try:
+                stats_30 = calculate_worker_stats(w, start_30_days, end_date_str, conn)
+                stats_all = calculate_worker_stats(w, earliest_date_str, end_date_str, conn)
+
+                rows_analytics.append([
+                    str(w["object_id"] or "Основной"),
+                    f"{w['last_name']} {w['first_name']}",
+                    clean_position(w["position"]),
+                    str(stats_30["expected"]),
+                    str(stats_30["submitted"]),
+                    str(stats_30["lates"]),
+                    str(stats_30["remarks"]),
+                    str(stats_30["missed"]),
+                    f"{stats_30['percent']:.1f}%",
+                    str(stats_all["expected"]),
+                    str(stats_all["submitted"]),
+                    str(stats_all["lates"]),
+                    str(stats_all["remarks"]),
+                    str(stats_all["missed"]),
+                    f"{stats_all['percent']:.1f}%"
+                ])
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    f"[Аналитика] Пропущен сотрудник {w['telegram_id']} ({w['last_name']} {w['first_name']}) из-за ошибки: {exc}"
+                )
+
         conn.close()
         safe_update(ws_analytics, rows_analytics)
 
@@ -1244,6 +1260,188 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
             }
         })
 
+        def _process_worker(w):
+            slots = SCHEDULES.get(w["schedule"], SCHEDULE_A)
+            join_row = conn_sum.execute(
+                "SELECT MIN(report_date) as d FROM reports WHERE telegram_id = ?", (w["telegram_id"],)
+            ).fetchone()
+            hire_date = today_date
+            if join_row and join_row["d"]:
+                try:
+                    hire_date = datetime.strptime(join_row["d"], "%Y-%m-%d").date()
+                except ValueError:
+                    pass
+
+            start_str = date_list[0].strftime("%Y-%m-%d")
+            end_str = date_list[-1].strftime("%Y-%m-%d")
+            status_rows = conn_sum.execute(
+                "SELECT report_date, slot_time, received_at, is_ok, format_comment, required_action FROM reports "
+                "WHERE telegram_id = ? AND report_type = 'status' AND report_date >= ? AND report_date <= ?",
+                (w["telegram_id"], start_str, end_str)
+            ).fetchall()
+            status_map = {(r["report_date"], r["slot_time"]): r for r in status_rows}
+
+            not_working_rows = conn_sum.execute(
+                "SELECT report_date, format_comment FROM reports WHERE telegram_id = ? AND report_type = 'not_working' "
+                "AND report_date >= ? AND report_date <= ?",
+                (w["telegram_id"], start_str, end_str)
+            ).fetchall()
+            not_working_dates = {r["report_date"] for r in not_working_rows}
+            not_working_reasons = {r["report_date"]: r["format_comment"] for r in not_working_rows if r["format_comment"]}
+
+            missed_reasons = {
+                (r["report_date"], r["slot_time"]): r["reason"] for r in conn_sum.execute(
+                    "SELECT report_date, slot_time, reason FROM missed_status_reasons "
+                    "WHERE telegram_id = ? AND report_date >= ? AND report_date <= ?",
+                    (w["telegram_id"], start_str, end_str)
+                ).fetchall()
+            }
+
+            name_text = f"{w['last_name']} {w['first_name']} ({clean_position(w['position'])})"
+            worker_start_row = len(rows_summary)
+            first_tracked_col = None
+
+            for slot in slots:
+                row_cells = ["", slot]
+                hour, minute = map(int, slot.split(":"))
+                for col_idx, d in enumerate(date_list):
+                    abs_col = 2 + col_idx
+                    d_str = d.strftime("%Y-%m-%d")
+                    date_label = headers_summary[abs_col]
+                    old_entry = old_map.get((name_text, slot, date_label))
+                    fresh_note = None
+
+                    if d < hire_date:
+                        row_cells.append("-")
+                        continue
+
+                    if first_tracked_col is None or abs_col < first_tracked_col:
+                        first_tracked_col = abs_col
+
+                    if d_str in not_working_dates:
+                        cell_value = False
+                    elif d == today_date and (now.hour * 60 + now.minute) <= hour * 60 + minute + LATE_THRESHOLD_MIN:
+                        cell_value = ""
+                    else:
+                        rep = status_map.get((d_str, slot))
+                        if rep is not None:
+                            cell_value = True
+                            note_parts = []
+                            received_at = rep["received_at"] or ""
+                            is_late_submit = False
+                            try:
+                                rh, rm = int(received_at[0:2]), int(received_at[3:5])
+                                diff_mins = (rh * 60 + rm) - (hour * 60 + minute)
+                                if diff_mins < -30:
+                                    note_parts.append("Прислал рано")
+                                elif diff_mins > 60:
+                                    note_parts.append("Прислал с опозданием")
+                                    is_late_submit = True
+                            except (ValueError, IndexError):
+                                pass
+                            if not rep["is_ok"]:
+                                remark = (rep["format_comment"] or "").strip()
+                                action = (rep["required_action"] or "").strip()
+                                note_parts.append(f"Замечание: {remark}" if remark else "Есть замечание")
+                                if action:
+                                    note_parts.append(f"Требуется: {action}")
+                            if note_parts:
+                                fresh_note = "\n".join(note_parts)
+                            if is_late_submit:
+                                format_requests.append({
+                                    "repeatCell": {
+                                        "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
+                                                  "endRowIndex": len(rows_summary) + 1,
+                                                  "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
+                                        "cell": {"userEnteredFormat": {"backgroundColor": YELLOW}},
+                                        "fields": "userEnteredFormat(backgroundColor)"
+                                    }
+                                })
+                        else:
+                            cell_value = False
+                            if old_entry and old_entry.get("bool") is True:
+                                cell_value = True  # a manual tick in the sheet always wins over "missed"
+                            else:
+                                fresh_note = missed_reasons.get((d_str, slot))
+
+                    row_cells.append(cell_value)
+
+                    note_to_set = fresh_note or (old_entry.get("note") if old_entry else None)
+                    if note_to_set:
+                        note_requests.append({
+                            "updateCells": {
+                                "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
+                                          "endRowIndex": len(rows_summary) + 1,
+                                          "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
+                                "rows": [{"values": [{"note": note_to_set}]}],
+                                "fields": "note"
+                            }
+                        })
+
+                rows_summary.append(row_cells)
+
+            rows_summary[worker_start_row][0] = name_text
+            merge_requests.append({
+                "mergeCells": {
+                    "range": {"sheetId": ws_summary.id, "startRowIndex": worker_start_row,
+                              "endRowIndex": worker_start_row + len(slots),
+                              "startColumnIndex": 0, "endColumnIndex": 1},
+                    "mergeType": "MERGE_ALL"
+                }
+            })
+
+            if first_tracked_col is not None:
+                checkbox_ranges.append(
+                    (worker_start_row, worker_start_row + len(slots), first_tracked_col, len(headers_summary))
+                )
+
+            # Merge consecutive "not working" (vacation/sick leave) days into a single grey
+            # block spanning all of the worker's slot rows, instead of repeating the same
+            # grey cell on every row for every day off — one note explains the whole span.
+            not_working_col_idx = sorted(
+                idx for idx, d in enumerate(date_list) if d.strftime("%Y-%m-%d") in not_working_dates
+            )
+            ranges = []
+            for idx in not_working_col_idx:
+                if ranges and idx == ranges[-1][1] + 1:
+                    ranges[-1] = (ranges[-1][0], idx)
+                else:
+                    ranges.append((idx, idx))
+
+            for r_start, r_end in ranges:
+                c0, c1 = 2 + r_start, 2 + r_end + 1
+                reasons = []
+                for idx in range(r_start, r_end + 1):
+                    reason = not_working_reasons.get(date_list[idx].strftime("%Y-%m-%d"))
+                    if reason and reason not in reasons:
+                        reasons.append(reason)
+                merge_requests.append({
+                    "mergeCells": {
+                        "range": {"sheetId": ws_summary.id, "startRowIndex": worker_start_row,
+                                  "endRowIndex": worker_start_row + len(slots),
+                                  "startColumnIndex": c0, "endColumnIndex": c1},
+                        "mergeType": "MERGE_ALL"
+                    }
+                })
+                format_requests.append({
+                    "repeatCell": {
+                        "range": {"sheetId": ws_summary.id, "startRowIndex": worker_start_row,
+                                  "endRowIndex": worker_start_row + len(slots),
+                                  "startColumnIndex": c0, "endColumnIndex": c1},
+                        "cell": {"userEnteredFormat": {"backgroundColor": GREY}},
+                        "fields": "userEnteredFormat(backgroundColor)"
+                    }
+                })
+                note_requests.append({
+                    "updateCells": {
+                        "range": {"sheetId": ws_summary.id, "startRowIndex": worker_start_row,
+                                  "endRowIndex": worker_start_row + 1,
+                                  "startColumnIndex": c0, "endColumnIndex": c0 + 1},
+                        "rows": [{"values": [{"note": "; ".join(reasons) if reasons else "Выходной/отгул"}]}],
+                        "fields": "note"
+                    }
+                })
+
         for dept, dept_workers in itertools.groupby(
             (w for w in workers if w["is_active"]),
             key=lambda w: str(w["object_id"] or "Основной")
@@ -1276,139 +1474,11 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
             })
 
             for w in dept_workers:
-                slots = SCHEDULES.get(w["schedule"], SCHEDULE_A)
-                join_row = conn_sum.execute(
-                    "SELECT MIN(report_date) as d FROM reports WHERE telegram_id = ?", (w["telegram_id"],)
-                ).fetchone()
-                hire_date = today_date
-                if join_row and join_row["d"]:
-                    try:
-                        hire_date = datetime.strptime(join_row["d"], "%Y-%m-%d").date()
-                    except ValueError:
-                        pass
-
-                start_str = date_list[0].strftime("%Y-%m-%d")
-                end_str = date_list[-1].strftime("%Y-%m-%d")
-                status_rows = conn_sum.execute(
-                    "SELECT report_date, slot_time, received_at, is_ok, format_comment, required_action FROM reports "
-                    "WHERE telegram_id = ? AND report_type = 'status' AND report_date >= ? AND report_date <= ?",
-                    (w["telegram_id"], start_str, end_str)
-                ).fetchall()
-                status_map = {(r["report_date"], r["slot_time"]): r for r in status_rows}
-
-                not_working_dates = {
-                    r["report_date"] for r in conn_sum.execute(
-                        "SELECT report_date FROM reports WHERE telegram_id = ? AND report_type = 'not_working' "
-                        "AND report_date >= ? AND report_date <= ?",
-                        (w["telegram_id"], start_str, end_str)
-                    ).fetchall()
-                }
-
-                missed_reasons = {
-                    (r["report_date"], r["slot_time"]): r["reason"] for r in conn_sum.execute(
-                        "SELECT report_date, slot_time, reason FROM missed_status_reasons "
-                        "WHERE telegram_id = ? AND report_date >= ? AND report_date <= ?",
-                        (w["telegram_id"], start_str, end_str)
-                    ).fetchall()
-                }
-
-                name_text = f"{w['last_name']} {w['first_name']} ({clean_position(w['position'])})"
-                worker_start_row = len(rows_summary)
-                first_tracked_col = None
-
-                for slot in slots:
-                    row_cells = ["", slot]
-                    hour, minute = map(int, slot.split(":"))
-                    for col_idx, d in enumerate(date_list):
-                        abs_col = 2 + col_idx
-                        d_str = d.strftime("%Y-%m-%d")
-                        date_label = headers_summary[abs_col]
-                        old_entry = old_map.get((name_text, slot, date_label))
-                        fresh_note = None
-
-                        if d < hire_date:
-                            row_cells.append("-")
-                            continue
-
-                        if first_tracked_col is None or abs_col < first_tracked_col:
-                            first_tracked_col = abs_col
-
-                        if d_str in not_working_dates:
-                            cell_value = False
-                            fresh_note = "Выходной/отгул"
-                        elif d == today_date and (now.hour * 60 + now.minute) <= hour * 60 + minute + LATE_THRESHOLD_MIN:
-                            cell_value = ""
-                        else:
-                            rep = status_map.get((d_str, slot))
-                            if rep is not None:
-                                cell_value = True
-                                note_parts = []
-                                received_at = rep["received_at"] or ""
-                                is_late_submit = False
-                                try:
-                                    rh, rm = int(received_at[0:2]), int(received_at[3:5])
-                                    diff_mins = (rh * 60 + rm) - (hour * 60 + minute)
-                                    if diff_mins < -30:
-                                        note_parts.append("Прислал рано")
-                                    elif diff_mins > 60:
-                                        note_parts.append("Прислал с опозданием")
-                                        is_late_submit = True
-                                except (ValueError, IndexError):
-                                    pass
-                                if not rep["is_ok"]:
-                                    remark = (rep["format_comment"] or "").strip()
-                                    action = (rep["required_action"] or "").strip()
-                                    note_parts.append(f"Замечание: {remark}" if remark else "Есть замечание")
-                                    if action:
-                                        note_parts.append(f"Требуется: {action}")
-                                if note_parts:
-                                    fresh_note = "\n".join(note_parts)
-                                if is_late_submit:
-                                    format_requests.append({
-                                        "repeatCell": {
-                                            "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
-                                                      "endRowIndex": len(rows_summary) + 1,
-                                                      "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
-                                            "cell": {"userEnteredFormat": {"backgroundColor": YELLOW}},
-                                            "fields": "userEnteredFormat(backgroundColor)"
-                                        }
-                                    })
-                            else:
-                                cell_value = False
-                                if old_entry and old_entry.get("bool") is True:
-                                    cell_value = True  # a manual tick in the sheet always wins over "missed"
-                                else:
-                                    fresh_note = missed_reasons.get((d_str, slot))
-
-                        row_cells.append(cell_value)
-
-                        note_to_set = fresh_note or (old_entry.get("note") if old_entry else None)
-                        if note_to_set:
-                            note_requests.append({
-                                "updateCells": {
-                                    "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
-                                              "endRowIndex": len(rows_summary) + 1,
-                                              "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
-                                    "rows": [{"values": [{"note": note_to_set}]}],
-                                    "fields": "note"
-                                }
-                            })
-
-                    rows_summary.append(row_cells)
-
-                rows_summary[worker_start_row][0] = name_text
-                merge_requests.append({
-                    "mergeCells": {
-                        "range": {"sheetId": ws_summary.id, "startRowIndex": worker_start_row,
-                                  "endRowIndex": worker_start_row + len(slots),
-                                  "startColumnIndex": 0, "endColumnIndex": 1},
-                        "mergeType": "MERGE_ALL"
-                    }
-                })
-
-                if first_tracked_col is not None:
-                    checkbox_ranges.append(
-                        (worker_start_row, worker_start_row + len(slots), first_tracked_col, len(headers_summary))
+                try:
+                    _process_worker(w)
+                except Exception as exc:
+                    logging.getLogger(__name__).warning(
+                        f"[Сводка] Пропущен сотрудник {w['telegram_id']} ({w['last_name']} {w['first_name']}) из-за ошибки: {exc}"
                     )
 
         conn_sum.close()

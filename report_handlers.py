@@ -196,13 +196,7 @@ def menu_for_user(user_id: int, chat_type: str = "private"):
     if chat_type != "private":
         return ReplyKeyboardMarkup([], remove_keyboard=True)
     if get_worker(user_id) is not None:
-        return ReplyKeyboardMarkup(
-            [
-                ["📋 Инструкция по сдаче видео-статуса"],
-                ["🛌 Не работаю сегодня"]
-            ],
-            resize_keyboard=True
-        )
+        return ReplyKeyboardMarkup([["📤 Сдать статус"]], resize_keyboard=True)
     return ReplyKeyboardMarkup([["🔑 Начать регистрацию"]], resize_keyboard=True)
 
 async def transcribe_audio_async(file_path: str) -> str:
@@ -863,6 +857,14 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Действие отменено.", reply_markup=menu_for_user(user_id, update.effective_chat.type))
                 return
 
+        if text_content.strip() == "📤 Сдать статус":
+            await update.message.reply_text(
+                "📹 Нажмите на значок 📎 (скрепка) рядом с полем ввода и запишите или выберите видео с рабочего места.\n"
+                "После отправки видео дождитесь оценки — она придёт автоматически.",
+                reply_markup=menu_for_user(user_id, update.effective_chat.type)
+            )
+            return
+
         if text_content in ("🛌 Не работаю сегодня", "Не работаю сегодня") or text_content.lower() == "не работаю сегодня":
             now = now_local()
             date_str = now.strftime("%Y-%m-%d")
@@ -887,7 +889,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_media and text_content.strip() in ("❌ Отмена", "Да, я уверен"):
             await update.message.reply_text(
                 "Это была кнопка диалога, который уже завершился — отчётом она не считается.\n"
-                "Если хотите сдать отчёт, нажмите «📋 Инструкция по сдаче видео-статуса» или просто запишите видео.",
+                "Если хотите сдать отчёт, нажмите «📤 Сдать статус» или просто запишите видео.",
                 reply_markup=menu_for_user(user_id, update.effective_chat.type)
             )
             return

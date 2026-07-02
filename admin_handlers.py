@@ -20,7 +20,8 @@ from db import (
     export_workers_to_excel, read_excel, get_next_sort_order, fetch_export_data,
     generate_and_send_excel, generate_and_send_gsheets, get_violators_threshold,
     save_violators_threshold, now_local, set_quiet_mode, is_quiet_mode_enabled,
-    save_scheduled_times, get_scheduled_times, sync_gsheets_task, async_sync_gsheets_background
+    save_scheduled_times, get_scheduled_times, sync_gsheets_task, async_sync_gsheets_background,
+    save_report
 )
 
 from report_handlers import menu_for_user
@@ -77,7 +78,9 @@ CANCEL_TEXT = "❌ Отмена"
     ASK_SETTINGS_ACTION,
     ASK_IMPORT_ACTION,
     ASK_CONFIRM_REMIND,
-) = range(34)
+    ASK_NOT_WORKING_DAYS,
+    ASK_NOT_WORKING_REASON,
+) = range(36)
 
 def schedule_description_text() -> str:
     lines = []
@@ -475,10 +478,58 @@ async def edit_worker_status_received(update: Update, context: ContextTypes.DEFA
     raw = update.message.text.strip().lower()
     if raw not in ("да", "нет"):
         return ASK_EDIT_STATUS_WORK
+    if raw == "да":
+        worker = context.user_data.get("edit_worker")
+        update_worker_field(worker["telegram_id"], "is_active", True)
+        async_sync_gsheets_background()
+        await update.message.reply_text("✅ Сотрудник отмечен как работающий.", reply_markup=MAIN_MENU)
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "На сколько дней сотрудник не работает (считая сегодня)? Введите число:",
+        reply_markup=CANCEL_KEYBOARD
+    )
+    return ASK_NOT_WORKING_DAYS
+
+async def edit_worker_not_working_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        await update.message.reply_text("Введите положительное число дней.")
+        return ASK_NOT_WORKING_DAYS
+    context.user_data["not_working_days"] = int(raw)
+    await update.message.reply_text("Укажите причину (например: отпуск, больничный):", reply_markup=CANCEL_KEYBOARD)
+    return ASK_NOT_WORKING_REASON
+
+async def edit_worker_not_working_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reason = update.message.text.strip()
     worker = context.user_data.get("edit_worker")
-    update_worker_field(worker["telegram_id"], "is_active", raw == "да")
+    days = context.user_data.get("not_working_days")
+    if not worker or not days:
+        await update.message.reply_text("Сессия истекла, начните заново.", reply_markup=MAIN_MENU)
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    now = now_local()
+    for i in range(days):
+        d = now + dt_module.timedelta(days=i)
+        save_report(
+            telegram_id=worker["telegram_id"],
+            report_date=d.strftime("%Y-%m-%d"),
+            report_type="not_working",
+            slot_time=None,
+            received_at=now.strftime("%H:%M:%S"),
+            is_ok=True,
+            is_late=False,
+            format_comment=reason,
+            required_action="Не работает",
+            raw_text=f"Отмечено администратором: не работает. Причина: {reason}"
+        )
     async_sync_gsheets_background()
-    await update.message.reply_text("✅ Обновлено.", reply_markup=MAIN_MENU)
+    await update.message.reply_text(
+        f"✅ Сотрудник отмечен как не работающий на {days} дн. (с сегодняшнего дня). Причина: {reason}",
+        reply_markup=MAIN_MENU
+    )
     context.user_data.clear()
     return ConversationHandler.END
 
