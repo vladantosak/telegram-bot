@@ -34,7 +34,7 @@ from report_handlers import (
 
 from admin_handlers import (
     MAIN_MENU, CANCEL_KEYBOARD, CANCEL_TEXT, add_worker_start, add_worker_id,
-    add_worker_lastname, add_worker_firstname, add_worker_position,
+    add_worker_lastname, add_worker_firstname, add_worker_position, add_worker_department,
     add_worker_group, add_worker_schedule, add_worker_needs_daily_fact,
     delete_worker_start, delete_worker_department, delete_worker_finish,
     delete_worker_confirm, department_workers_start, department_workers_show,
@@ -55,7 +55,9 @@ from admin_handlers import (
     ASK_GSHEETS_CREDS, ASK_REPORT_TIME, ASK_CONFIRM_REMIND, ASK_EXPORT_TYPE,
     ASK_LIST_WORKER, ASK_EDIT_FIELD, ASK_EDIT_VALUE, ASK_EDIT_SCHEDULE,
     ASK_EDIT_DAILY_FACT, ASK_EDIT_STATUS_WORK, ASK_NOT_WORKING_DAYS, ASK_NOT_WORKING_REASON,
-    ASK_REG_CONFIRM, ASK_REG_CONTACT
+    ASK_REG_CONFIRM, ASK_REG_CONTACT, ASK_WORKER_DEPARTMENT,
+    ASK_DEPT_ACTION, ASK_DEPT_ADD_NAME, ASK_DEPT_DELETE_SELECT,
+    department_manage_start, department_manage_action, department_add_received, department_delete_received
 )
 
 # Set up logging
@@ -429,6 +431,7 @@ def main():
             ASK_LASTNAME: [MessageHandler(safe_text_filter, add_worker_lastname)],
             ASK_FIRSTNAME: [MessageHandler(safe_text_filter, add_worker_firstname)],
             ASK_POSITION: [MessageHandler(safe_text_filter, add_worker_position)],
+            ASK_WORKER_DEPARTMENT: [MessageHandler(safe_text_filter, add_worker_department)],
             ASK_GROUP: [MessageHandler(safe_text_filter, add_worker_group)],
             ASK_SCHEDULE: [MessageHandler(safe_text_filter, add_worker_schedule)],
             ASK_NEEDS_DAILY_FACT: [MessageHandler(safe_text_filter, add_worker_needs_daily_fact)],
@@ -488,6 +491,9 @@ def main():
                 MessageHandler(filters.Document.ALL, save_gsheets_creds),
                 MessageHandler(safe_text_filter, save_gsheets_creds_text),
             ],
+            ASK_DEPT_ACTION: [MessageHandler(safe_text_filter, department_manage_action)],
+            ASK_DEPT_ADD_NAME: [MessageHandler(safe_text_filter, department_add_received)],
+            ASK_DEPT_DELETE_SELECT: [MessageHandler(safe_text_filter, department_delete_received)],
         },
         fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )

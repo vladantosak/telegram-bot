@@ -21,7 +21,7 @@ from db import (
     generate_and_send_excel, generate_and_send_gsheets, get_violators_threshold,
     save_violators_threshold, now_local, set_quiet_mode, is_quiet_mode_enabled,
     save_scheduled_times, get_scheduled_times, sync_gsheets_task, async_sync_gsheets_background,
-    save_report
+    save_report, get_all_departments, add_department, delete_department, count_workers_in_department
 )
 
 from report_handlers import menu_for_user
@@ -82,7 +82,11 @@ CANCEL_TEXT = "❌ Отмена"
     ASK_NOT_WORKING_REASON,
     ASK_REG_CONFIRM,
     ASK_REG_CONTACT,
-) = range(38)
+    ASK_WORKER_DEPARTMENT,
+    ASK_DEPT_ACTION,
+    ASK_DEPT_ADD_NAME,
+    ASK_DEPT_DELETE_SELECT,
+) = range(42)
 
 def schedule_description_text() -> str:
     lines = []
@@ -117,52 +121,61 @@ async def require_admin_check(update: Update) -> bool:
         return False
     return True
 
+SETTINGS_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["📊 Настроить Google Таблицу", "🔗 Получить ссылку на таблицу"],
+        ["🏢 Редактировать отделы"],
+        ["🗑 Очистить базу от удалённых сотрудников"],
+        ["❌ Назад"]
+    ],
+    resize_keyboard=True
+)
+
+def _cleanup_orphaned_records():
+    conn = get_db()
+    deleted_reports = conn.execute(
+        "DELETE FROM reports WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)"
+    ).rowcount
+    deleted_reminders = conn.execute(
+        "DELETE FROM sent_reminders WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)"
+    ).rowcount
+    deleted_pre_reminders = conn.execute(
+        "DELETE FROM sent_pre_reminders WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)"
+    ).rowcount
+    conn.execute("DELETE FROM pending_reason_requests WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)")
+    conn.execute("DELETE FROM missed_status_reasons WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)")
+    conn.commit()
+    conn.close()
+    return deleted_reports, deleted_reminders + deleted_pre_reminders
+
 async def settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin_check(update): return ConversationHandler.END
-    kbd = ReplyKeyboardMarkup(
-        [["📊 Настроить Google Таблицу", "🔗 Получить ссылку на таблицу"], ["🗑 Очистить базу от удалённых сотрудников"], ["❌ Назад"]],
-        resize_keyboard=True
-    )
-    await update.message.reply_text("⚙️ Настройки бота. Выберите действие:", reply_markup=kbd)
+    await update.message.reply_text("⚙️ Настройки бота. Выберите действие:", reply_markup=SETTINGS_KEYBOARD)
     return ASK_SETTINGS_ACTION
 
 async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     choice = update.message.text.strip()
-    kbd = ReplyKeyboardMarkup(
-        [["📊 Настроить Google Таблицу", "🔗 Получить ссылку на таблицу"], ["🗑 Очистить базу от удалённых сотрудников"], ["❌ Назад"]],
-        resize_keyboard=True
-    )
+    kbd = SETTINGS_KEYBOARD
     if choice == "❌ Назад":
         await update.message.reply_text("Главное меню.", reply_markup=MAIN_MENU)
         return ConversationHandler.END
 
+    if choice == "🏢 Редактировать отделы":
+        return await department_manage_start(update, context)
+
     if choice == "🗑 Очистить базу от удалённых сотрудников":
-        # Cleanup everything left behind by workers that no longer exist in the workers table
-        conn = get_db()
-        deleted_reports = conn.execute(
-            "DELETE FROM reports WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)"
-        ).rowcount
-        deleted_reminders = conn.execute(
-            "DELETE FROM sent_reminders WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)"
-        ).rowcount
-        deleted_pre_reminders = conn.execute(
-            "DELETE FROM sent_pre_reminders WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)"
-        ).rowcount
-        conn.execute("DELETE FROM pending_reason_requests WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)")
-        conn.execute("DELETE FROM missed_status_reasons WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)")
-        conn.commit()
-        conn.close()
+        deleted_reports, deleted_reminders = await run_db(_cleanup_orphaned_records)
         async_sync_gsheets_background()
         await update.message.reply_text(
             f"✅ База очищена:\n"
             f"• Отчётов удалено: {deleted_reports}\n"
-            f"• Напоминаний удалено: {deleted_reminders + deleted_pre_reminders}",
+            f"• Напоминаний удалено: {deleted_reminders}",
             reply_markup=MAIN_MENU
         )
         return ConversationHandler.END
 
     if choice == "🔗 Получить ссылку на таблицу":
-        spreadsheet_id = get_setting("google_spreadsheet_id")
+        spreadsheet_id = await run_db(get_setting, "google_spreadsheet_id")
         if not spreadsheet_id:
             await update.message.reply_text(
                 "❌ Google Таблица не настроена. Пожалуйста, настройте её с помощью кнопки «📊 Настроить Google Таблицу».",
@@ -179,9 +192,9 @@ async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_SETTINGS_ACTION
 
     if choice == "📊 Настроить Google Таблицу":
-        spreadsheet_id = get_setting("google_spreadsheet_id", "Не задан")
+        spreadsheet_id = await run_db(get_setting, "google_spreadsheet_id", "Не задан")
         email = "Не задан"
-        service_account_str = get_setting("google_service_account")
+        service_account_str = await run_db(get_setting, "google_service_account")
         if service_account_str:
             try: email = json.loads(service_account_str).get("client_email", "Не задан")
             except Exception: pass
@@ -195,6 +208,81 @@ async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ASK_GSHEETS_URL
     return ASK_SETTINGS_ACTION
+
+DEPT_MANAGE_KEYBOARD = ReplyKeyboardMarkup(
+    [["➕ Добавить отдел", "➖ Удалить отдел"], ["❌ Назад"]],
+    resize_keyboard=True
+)
+
+async def department_manage_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    departments = await run_db(get_all_departments)
+    listing = "\n".join(f"  • {d}" for d in departments)
+    await update.message.reply_text(
+        f"🏢 <b>Текущие отделы:</b>\n{listing}\n\nВыберите действие:",
+        parse_mode="HTML",
+        reply_markup=DEPT_MANAGE_KEYBOARD
+    )
+    return ASK_DEPT_ACTION
+
+async def department_manage_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    choice = update.message.text.strip()
+    if choice == "❌ Назад":
+        await update.message.reply_text("⚙️ Настройки бота. Выберите действие:", reply_markup=SETTINGS_KEYBOARD)
+        return ASK_SETTINGS_ACTION
+
+    if choice == "➕ Добавить отдел":
+        await update.message.reply_text("Введите название нового отдела:", reply_markup=CANCEL_KEYBOARD)
+        return ASK_DEPT_ADD_NAME
+
+    if choice == "➖ Удалить отдел":
+        departments = await run_db(get_all_departments)
+        if not departments:
+            await update.message.reply_text("Список отделов пуст.", reply_markup=DEPT_MANAGE_KEYBOARD)
+            return ASK_DEPT_ACTION
+        buttons = [[d] for d in departments] + [["❌ Назад"]]
+        await update.message.reply_text(
+            "Выберите отдел для удаления:",
+            reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+        )
+        return ASK_DEPT_DELETE_SELECT
+
+    await update.message.reply_text("Выберите действие кнопкой ниже.", reply_markup=DEPT_MANAGE_KEYBOARD)
+    return ASK_DEPT_ACTION
+
+async def department_add_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if name == CANCEL_TEXT:
+        return await department_manage_start(update, context)
+    if not name or len(name) > 100:
+        await update.message.reply_text("Введите корректное название отдела (до 100 символов):")
+        return ASK_DEPT_ADD_NAME
+
+    await run_db(add_department, name)
+    logger.info(f"[DEPT] Администратор {update.effective_user.id} добавил отдел '{name}'")
+    await update.message.reply_text(f"✅ Отдел «{name}» добавлен.", reply_markup=DEPT_MANAGE_KEYBOARD)
+    return ASK_DEPT_ACTION
+
+async def department_delete_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if name == CANCEL_TEXT or name == "❌ Назад":
+        return await department_manage_start(update, context)
+
+    count = await run_db(count_workers_in_department, name)
+    if count > 0:
+        await update.message.reply_text(
+            f"❌ Нельзя удалить отдел «{name}» — в нём {count} сотрудник(ов).\n"
+            f"Сначала переназначьте их в другой отдел (через редактирование сотрудника).",
+            reply_markup=DEPT_MANAGE_KEYBOARD
+        )
+        return ASK_DEPT_ACTION
+
+    deleted = await run_db(delete_department, name)
+    if deleted:
+        logger.info(f"[DEPT] Администратор {update.effective_user.id} удалил отдел '{name}'")
+        await update.message.reply_text(f"✅ Отдел «{name}» удалён.", reply_markup=DEPT_MANAGE_KEYBOARD)
+    else:
+        await update.message.reply_text(f"❌ Не удалось удалить отдел «{name}».", reply_markup=DEPT_MANAGE_KEYBOARD)
+    return ASK_DEPT_ACTION
 
 async def add_worker_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin_check(update): return ConversationHandler.END
@@ -243,6 +331,31 @@ async def add_worker_firstname(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def add_worker_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["position"] = clean_position(update.message.text.strip())
+    departments = await run_db(get_all_departments)
+    buttons = [[d] for d in departments]
+    buttons.append(["➕ Другой (ввести вручную)"])
+    buttons.append(["❌ Отмена"])
+    await update.message.reply_text(
+        "Выберите отдел сотрудника (или введите новый вручную):",
+        reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+    )
+    return ASK_WORKER_DEPARTMENT
+
+async def add_worker_department(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "➕ Другой (ввести вручную)":
+        await update.message.reply_text("Введите название нового отдела:", reply_markup=CANCEL_KEYBOARD)
+        context.user_data["awaiting_new_department_name"] = True
+        return ASK_WORKER_DEPARTMENT
+
+    if context.user_data.pop("awaiting_new_department_name", False):
+        if not text or len(text) > 100:
+            await update.message.reply_text("Введите корректное название отдела:")
+            context.user_data["awaiting_new_department_name"] = True
+            return ASK_WORKER_DEPARTMENT
+        await run_db(add_department, text)
+
+    context.user_data["object_id"] = text
     await update.message.reply_text("Введите ID группы Telegram (или 0 для группы по умолчанию):", reply_markup=CANCEL_KEYBOARD)
     return ASK_GROUP
 
@@ -275,6 +388,7 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
         schedule=context.user_data["schedule"],
         needs_daily_fact=(raw == "да"),
         sort_order=next_order,
+        object_id=context.user_data.get("object_id", "Основной"),
     )
     await run_db(delete_pending_unregistered_user, context.user_data["new_worker_id"])
     await fetch_and_save_group_name(context.bot, context.user_data["group_id"])

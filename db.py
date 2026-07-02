@@ -225,6 +225,42 @@ def init_db():
     conn.commit()
     conn.close()
 
+def get_all_departments() -> list[str]:
+    """Union of formally-registered departments (objects table) and any department
+    name already in use on a worker record, so nothing existing is ever hidden."""
+    conn = get_db()
+    from_objects = {r["object_id"] for r in conn.execute("SELECT object_id FROM objects").fetchall()}
+    from_workers = {r["object_id"] for r in conn.execute("SELECT DISTINCT object_id FROM workers").fetchall() if r["object_id"]}
+    conn.close()
+    names = from_objects | from_workers | {"Основной"}
+    return sorted(names)
+
+def add_department(object_id: str):
+    object_id = object_id.strip()
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO objects (object_id, group_id) VALUES (?, 0) ON CONFLICT(object_id) DO NOTHING",
+        (object_id,)
+    )
+    conn.commit()
+    conn.close()
+
+def count_workers_in_department(object_id: str) -> int:
+    conn = get_db()
+    row = conn.execute("SELECT COUNT(*) as c FROM workers WHERE object_id = ?", (object_id,)).fetchone()
+    conn.close()
+    return row["c"] if row else 0
+
+def delete_department(object_id: str) -> bool:
+    """Refuses to delete a department that still has workers assigned to it."""
+    if count_workers_in_department(object_id) > 0:
+        return False
+    conn = get_db()
+    conn.execute("DELETE FROM objects WHERE object_id = ?", (object_id,))
+    conn.commit()
+    conn.close()
+    return True
+
 def get_worker(telegram_id: int):
     conn = get_db()
     row = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (telegram_id,)).fetchone()
