@@ -179,6 +179,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if is_admin(user_id) and chat_type == "private":
         await update.message.reply_text("Привет! Выберите действие кнопкой ниже.", reply_markup=MAIN_MENU)
+    elif chat_type == "private" and get_worker(user_id) is None:
+        await update.message.reply_text(
+            "👋 Добро пожаловать! Чтобы начать сдавать отчёты, сначала зарегистрируйтесь — нажмите кнопку ниже.",
+            reply_markup=menu_for_user(user_id, chat_type)
+        )
     else:
         await update.message.reply_text("Привет! Отправьте видеоотчет, когда он будет готов.", reply_markup=menu_for_user(user_id, chat_type))
 

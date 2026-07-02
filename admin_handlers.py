@@ -132,14 +132,26 @@ async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if choice == "🗑 Очистить базу от удалённых сотрудников":
-        # Cleanup orphaned reports
+        # Cleanup everything left behind by workers that no longer exist in the workers table
         conn = get_db()
-        cur = conn.execute("DELETE FROM reports WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)")
-        deleted = cur.rowcount
+        deleted_reports = conn.execute(
+            "DELETE FROM reports WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)"
+        ).rowcount
+        deleted_reminders = conn.execute(
+            "DELETE FROM sent_reminders WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)"
+        ).rowcount
+        deleted_pre_reminders = conn.execute(
+            "DELETE FROM sent_pre_reminders WHERE telegram_id NOT IN (SELECT telegram_id FROM workers)"
+        ).rowcount
         conn.commit()
         conn.close()
         async_sync_gsheets_background()
-        await update.message.reply_text(f"✅ Удалено {deleted} лишних записей отчетов.", reply_markup=MAIN_MENU)
+        await update.message.reply_text(
+            f"✅ База очищена:\n"
+            f"• Отчётов удалено: {deleted_reports}\n"
+            f"• Напоминаний удалено: {deleted_reminders + deleted_pre_reminders}",
+            reply_markup=MAIN_MENU
+        )
         return ConversationHandler.END
 
     if choice == "🔗 Получить ссылку на таблицу":
@@ -474,7 +486,15 @@ async def import_workers_start(update: Update, context: ContextTypes.DEFAULT_TYP
         [["📤 Скачать текущий список сотрудников"], ["📥 Загрузить обновления из файла"], ["❌ Отмена"]],
         resize_keyboard=True
     )
-    await update.message.reply_text("Выберите действие:", reply_markup=kbd)
+    await update.message.reply_text(
+        "📁 <b>Импорт/экспорт сотрудников через Excel</b>\n\n"
+        "1️⃣ Сначала скачайте файл со ВСЕМИ текущими сотрудниками — так вы не потеряете уже внесённые данные.\n"
+        "2️⃣ Отредактируйте его в Excel/Google Таблицах (можно менять данные, добавлять новые строки).\n"
+        "3️⃣ Отправьте изменённый файл боту — он обновит базу.\n\n"
+        "Выберите действие:",
+        reply_markup=kbd,
+        parse_mode="HTML"
+    )
     return ASK_IMPORT_ACTION
 
 async def import_workers_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -488,35 +508,55 @@ async def import_workers_action(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_document(
                 document=bio,
                 filename="workers.xlsx",
-                caption="📋 Текущий список сотрудников. Внесите изменения и отправьте файл обратно.",
-                reply_markup=MAIN_MENU
+                caption=(
+                    "📋 <b>Текущий список сотрудников</b>\n\n"
+                    "Как редактировать:\n"
+                    "• 1-я строка (тёмно-синяя) — названия колонок, не трогайте.\n"
+                    "• 2-я строка (голубая, курсив) — подсказка, что писать в колонке ниже, тоже не трогайте.\n"
+                    "• Столбец <b>Telegram ID</b> отмечен розовым «не менять» — если меняете существующего "
+                    "сотрудника, ID должен остаться прежним, иначе появится дубликат.\n"
+                    "• Чтобы добавить нового сотрудника — впишите новую строку снизу.\n"
+                    "• Столбец «Статус» — просто впишите словом: Работает / Отпуск / Больничный.\n\n"
+                    "Когда закончите — пришлите этот же файл боту через «📥 Загрузить обновления из файла»."
+                ),
+                reply_markup=MAIN_MENU,
+                parse_mode="HTML"
             )
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка при формировании файла: {e}", reply_markup=MAIN_MENU)
         return ConversationHandler.END
 
     if choice == "📥 Загрузить обновления из файла":
-        await update.message.reply_text("📎 Отправьте файл Excel (.xlsx) со списком сотрудников.", reply_markup=CANCEL_KEYBOARD)
+        await update.message.reply_text(
+            "📎 Отправьте файл Excel (.xlsx) со списком сотрудников.\n\n"
+            "Если вы ещё не скачивали текущий список — сначала нажмите «❌ Отмена» и выберите "
+            "«📤 Скачать текущий список сотрудников», чтобы не потерять данные.",
+            reply_markup=CANCEL_KEYBOARD
+        )
         return ASK_IMPORT_FILE
     return ConversationHandler.END
 
 async def import_workers_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc or not doc.file_name.lower().endswith(".xlsx"):
-        await update.message.reply_text("❌ Пожалуйста, отправьте файл типа документ (.xlsx).")
+        await update.message.reply_text("❌ Это не файл Excel. Пожалуйста, отправьте файл с расширением .xlsx.")
         return ASK_IMPORT_FILE
-    
-    await update.message.reply_text("⏳ Получение файла и импорт данных...")
+
+    await update.message.reply_text("⏳ Читаю файл и обновляю базу данных...")
     try:
         tg_file = await context.bot.get_file(doc.file_id)
         local_path = "workers_temp_import.xlsx"
         await tg_file.download_to_drive(local_path)
         workers = read_excel(local_path)
         if not workers:
-            await update.message.reply_text("⚠️ Не обнаружено записей в файле.", reply_markup=MAIN_MENU)
+            await update.message.reply_text(
+                "⚠️ В файле не найдено ни одной записи с заполненным Telegram ID.\n"
+                "Проверьте, что данные начинаются с 3-й строки (после заголовков и подсказки).",
+                reply_markup=MAIN_MENU
+            )
             if os.path.exists(local_path): os.remove(local_path)
             return ConversationHandler.END
-        
+
         for w in workers:
             upsert_worker(
                 telegram_id=w["telegram_id"], last_name=w["last_name"], first_name=w["first_name"],
@@ -526,7 +566,12 @@ async def import_workers_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         if os.path.exists(local_path): os.remove(local_path)
         async_sync_gsheets_background()
-        await update.message.reply_text(f"✅ Импорт успешно завершен! Загружено/обновлено: {len(workers)}.", reply_markup=MAIN_MENU)
+        await update.message.reply_text(
+            f"✅ <b>Импорт завершён!</b>\nОбработано строк: {len(workers)}.\n"
+            f"Все изменения уже применены и синхронизируются с Google Таблицей.",
+            reply_markup=MAIN_MENU,
+            parse_mode="HTML"
+        )
         return ConversationHandler.END
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка во время импорта: {e}", reply_markup=MAIN_MENU)
@@ -605,11 +650,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in (CANCEL_TEXT, "❌ Отмена", "❌ Назад"):
         await update.message.reply_text("Действие отменено.", reply_markup=menu_for_user(user_id, chat_type))
         return ConversationHandler.END
-        
-    if text == "📥 Выгрузить отчеты":
-        await export_reports_action(update, context)
-        return ConversationHandler.END
-        
+
     await update.message.reply_text(
         f"❌ Предыдущее действие отменено.\nПожалуйста, нажмите кнопку <b>«{html.escape(text)}»</b> ещё раз.",
         reply_markup=menu_for_user(user_id, chat_type),

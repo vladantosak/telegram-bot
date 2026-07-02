@@ -163,13 +163,13 @@ async def render_report_message_from_row(report: dict, worker_name: str) -> tupl
     ]
     
     is_status_with_videos = (report_type == "status" and ("Видео" in format_comment or ";" in format_comment))
-    
+
     if is_status_with_videos:
+        video_count = len([part for part in format_comment.split("; ") if part.strip()])
         notify_lines.append("")
-        notify_lines.append("📹 <b>Детали по видео-статусам:</b>")
-        for comment_item in format_comment.split("; "):
-            if comment_item.strip():
-                notify_lines.append(f"  • {html.escape(comment_item.strip())}")
+        for i in range(1, video_count + 1):
+            notify_lines.append(f"📹 Видео {i}")
+        notify_lines.append(f"Комментарий: {html.escape(format_comment)}")
     else:
         notify_lines.append(f"Комментарий: {html.escape(format_comment)}")
 
