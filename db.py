@@ -1396,6 +1396,14 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
             ).fetchall()
             status_map = {(r["report_date"], r["slot_time"]): r for r in status_rows}
 
+            fact_rows = conn_sum.execute(
+                "SELECT report_date, received_at, is_ok, format_comment, required_action FROM reports "
+                "WHERE telegram_id = ? AND report_type = 'daily_fact' AND report_date >= ? AND report_date <= ?",
+                (w["telegram_id"], start_str, end_str)
+            ).fetchall()
+            fact_map = {r["report_date"]: r for r in fact_rows}
+            include_fact_row = bool(w["needs_daily_fact"])
+
             not_working_rows = conn_sum.execute(
                 "SELECT report_date, format_comment FROM reports WHERE telegram_id = ? AND report_type = 'not_working' "
                 "AND report_date >= ? AND report_date <= ?",
@@ -1495,11 +1503,71 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
 
                 rows_summary.append(row_cells)
 
+            # "Факт дня" gets its own row per worker, independent of the per-slot status rows
+            # above — own checkboxes, own notes, sourced from report_type='daily_fact' instead
+            # of 'status'. Only shown for workers who are actually expected to submit one.
+            if include_fact_row:
+                row_cells = ["", "Факт дня"]
+                last_slot = slots[-1]
+                last_hour, last_minute = map(int, last_slot.split(":"))
+                for col_idx, d in enumerate(date_list):
+                    abs_col = 2 + col_idx
+                    d_str = d.strftime("%Y-%m-%d")
+                    date_label = headers_summary[abs_col]
+                    old_entry = old_map.get((name_text, "Факт дня", date_label))
+                    fresh_note = None
+
+                    if d < hire_date:
+                        row_cells.append("-")
+                        continue
+
+                    if first_tracked_col is None or abs_col < first_tracked_col:
+                        first_tracked_col = abs_col
+
+                    if d_str in not_working_dates:
+                        cell_value = False
+                    elif d == today_date and (now.hour * 60 + now.minute) <= last_hour * 60 + last_minute + 60:
+                        cell_value = ""
+                    else:
+                        rep = fact_map.get(d_str)
+                        if rep is not None:
+                            cell_value = True
+                            note_parts = []
+                            if not rep["is_ok"]:
+                                remark = (rep["format_comment"] or "").strip()
+                                action = (rep["required_action"] or "").strip()
+                                note_parts.append(f"Замечание: {remark}" if remark else "Есть замечание")
+                                if action:
+                                    note_parts.append(f"Требуется: {action}")
+                            if note_parts:
+                                fresh_note = "\n".join(note_parts)
+                        else:
+                            cell_value = False
+                            if old_entry and old_entry.get("bool") is True:
+                                cell_value = True  # a manual tick in the sheet always wins over "missed"
+
+                    row_cells.append(cell_value)
+
+                    note_to_set = fresh_note or (old_entry.get("note") if old_entry else None)
+                    if note_to_set:
+                        note_requests.append({
+                            "updateCells": {
+                                "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
+                                          "endRowIndex": len(rows_summary) + 1,
+                                          "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
+                                "rows": [{"values": [{"note": note_to_set}]}],
+                                "fields": "note"
+                            }
+                        })
+                rows_summary.append(row_cells)
+
+            row_count = len(slots) + (1 if include_fact_row else 0)
+
             rows_summary[worker_start_row][0] = name_text
             merge_requests.append({
                 "mergeCells": {
                     "range": {"sheetId": ws_summary.id, "startRowIndex": worker_start_row,
-                              "endRowIndex": worker_start_row + len(slots),
+                              "endRowIndex": worker_start_row + row_count,
                               "startColumnIndex": 0, "endColumnIndex": 1},
                     "mergeType": "MERGE_ALL"
                 }
@@ -1507,7 +1575,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
 
             if first_tracked_col is not None:
                 checkbox_ranges.append(
-                    (worker_start_row, worker_start_row + len(slots), first_tracked_col, len(headers_summary))
+                    (worker_start_row, worker_start_row + row_count, first_tracked_col, len(headers_summary))
                 )
 
             # Merge consecutive "not working" (vacation/sick leave) days into a single grey
@@ -1533,7 +1601,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                 merge_requests.append({
                     "mergeCells": {
                         "range": {"sheetId": ws_summary.id, "startRowIndex": worker_start_row,
-                                  "endRowIndex": worker_start_row + len(slots),
+                                  "endRowIndex": worker_start_row + row_count,
                                   "startColumnIndex": c0, "endColumnIndex": c1},
                         "mergeType": "MERGE_ALL"
                     }
@@ -1541,7 +1609,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                 format_requests.append({
                     "repeatCell": {
                         "range": {"sheetId": ws_summary.id, "startRowIndex": worker_start_row,
-                                  "endRowIndex": worker_start_row + len(slots),
+                                  "endRowIndex": worker_start_row + row_count,
                                   "startColumnIndex": c0, "endColumnIndex": c1},
                         "cell": {"userEnteredFormat": {"backgroundColor": GREY}},
                         "fields": "userEnteredFormat(backgroundColor)"
