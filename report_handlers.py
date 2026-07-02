@@ -425,13 +425,13 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 if not s_item["ai_res"]["is_ok"]:
                     required_actions.append(f"Видео {idx}: {s_item['ai_res']['required_action']}")
             error_count = overall_format_comment.lower().count("не ок")
-            if error_count > 3:
-                prev_action = existing["required_action"] or ""
-                if prev_action.strip().lower() in ("", "всё ок", "ничего не предпринимать, всё в порядке"):
-                    prev_action = ""
-                overall_required_action = (prev_action + " " + " ".join(required_actions)).strip() or "Ничего не предпринимать, всё в порядке"
-            else:
+            if error_count == 0:
                 overall_required_action = "Ничего не предпринимать, всё в порядке"
+            else:
+                prev_action = (existing["required_action"] or "").strip()
+                if prev_action.lower() in ("", "всё ок", "ничего не предпринимать, всё в порядке"):
+                    prev_action = ""
+                overall_required_action = "; ".join(([prev_action] if prev_action else []) + required_actions)
 
             await run_db(
                 update_report_text_and_ai,
@@ -462,7 +462,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 if not s_item["ai_res"]["is_ok"]:
                     required_actions.append(f"Видео {idx}: {s_item['ai_res']['required_action']}")
             error_count = overall_format_comment.lower().count("не ок")
-            overall_required_action = "; ".join(required_actions) if error_count > 3 else "Ничего не предпринимать, всё в порядке"
+            overall_required_action = "; ".join(required_actions) if error_count > 0 else "Ничего не предпринимать, всё в порядке"
 
             report_id = await run_db(
                 save_report,
@@ -478,6 +478,19 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 raw_text=combined_raw_text
             )
         async_sync_gsheets_background()
+
+        if error_count > 3:
+            alert_text = (
+                f"🚨 <b>Требуется внимание к сотруднику</b>\n"
+                f"👤 {html.escape(w_name)}\n"
+                f"⚠️ Замечаний в отчёте: {error_count}\n\n"
+                f"Причины:\n" + "\n".join(f"• {html.escape(a)}" for a in required_actions)
+            )
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(chat_id=admin_id, text=alert_text, parse_mode="HTML")
+                except Exception as e:
+                    logger.error(f"Не удалось отправить админу {admin_id} предупреждение о сотруднике {user_id}: {e}")
 
         copied_msg_ids = []
         if do_full_merge and old_media_rows:
