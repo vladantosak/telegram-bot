@@ -916,6 +916,19 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(user_id):
         return
 
+    # BUG FIX: only process a report sent as a private DM to the bot. A worker who sends
+    # their video/voice/text report into a group chat by mistake (the working group, the
+    # control department group, etc.) must not have it analyzed, saved to the DB, or
+    # announced anywhere - the bot stays completely silent, as if it never saw the message.
+    # Placed here (after the admin edit-comment/edit-time interception above, and after the
+    # "is_admin -> return" gate) rather than at the very top of the function, because those
+    # two admin flows legitimately happen IN the group chat - the "✏️ Изменить комментарий"/
+    # "🕐 Изменить время сдачи" ForceReply prompt is posted as a reply to the report card,
+    # which lives in the group, so the admin's reply also arrives there. By this point the
+    # sender is confirmed to be a non-admin worker, so this check only ever affects them.
+    if update.effective_chat.type != "private":
+        return
+
     from bot import get_user_lock
     lock = get_user_lock(user_id)
     await lock.acquire()
