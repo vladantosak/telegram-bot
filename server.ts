@@ -14,11 +14,6 @@ function runPythonQuery(pythonCode: string): Promise<any> {
     const py = spawn("python3", ["-c", pythonCode], { cwd: process.cwd() });
     let stdout = "";
     let stderr = "";
-    // BUG FIX: spawn() emits "error" (e.g. ENOENT if python3 isn't on PATH) as a distinct
-    // event from "close". An EventEmitter's unhandled "error" event throws and crashes the
-    // whole Node process by default - every /api/workers /reports /objects call would have
-    // taken the entire dashboard down with it if python3 were ever missing.
-    py.on("error", (err) => reject(err));
     py.stdout.on("data", (data) => (stdout += data.toString()));
     py.stderr.on("data", (data) => (stderr += data.toString()));
     py.on("close", (code) => {
@@ -52,63 +47,40 @@ let botProcess: ChildProcess | null = null;
 let botStatus = "Stopped";
 let botLogs: string[] = [];
 
-function startBot(): void {
-  const spawnNew = () => {
-    console.log("Starting Telegram Bot child process...");
-    botStatus = "Starting";
-
-    // Use absolute path or execute in current folder
-    botProcess = spawn("python3", ["bot.py"], { cwd: process.cwd() });
-    botStatus = "Running";
-
-    // BUG FIX: spawn() emits "error" separately from "close" (e.g. if python3 isn't found).
-    // Without a listener, that "error" event is unhandled and crashes the whole Node
-    // process - taking down the dashboard along with the bot it was trying to start.
-    botProcess.on("error", (err) => {
-      console.error("[Bot Err] Failed to start bot.py:", err);
-      botLogs.push(`[${new Date().toLocaleTimeString()} ERR] Failed to start: ${err.message}`);
-      botStatus = "Stopped";
-      botProcess = null;
-    });
-
-    botProcess.stdout?.on("data", (data) => {
-      const text = data.toString().trim();
-      if (text) {
-        console.log(`[Bot Out]: ${text}`);
-        botLogs.push(`[${new Date().toLocaleTimeString()}] ${text}`);
-        if (botLogs.length > 200) botLogs.shift();
-      }
-    });
-
-    botProcess.stderr?.on("data", (data) => {
-      const text = data.toString().trim();
-      if (text) {
-        console.error(`[Bot Err]: ${text}`);
-        botLogs.push(`[${new Date().toLocaleTimeString()} ERR] ${text}`);
-        if (botLogs.length > 200) botLogs.shift();
-      }
-    });
-
-    botProcess.on("close", (code) => {
-      console.log(`Telegram Bot stopped with code ${code}`);
-      botStatus = "Stopped";
-      botProcess = null;
-    });
-  };
-
+function startBot() {
   if (botProcess) {
-    // BUG FIX (race condition): kill() only sends SIGTERM - it doesn't wait for the
-    // process to actually exit. Spawning the replacement immediately after calling kill()
-    // could leave two bot.py instances polling Telegram's getUpdates at the same time,
-    // which Telegram answers with "Conflict: terminated by other getUpdates request" and
-    // can let both instances briefly handle the same incoming message. Wait for the old
-    // process to fully exit before starting the new one.
-    const old = botProcess;
-    old.once("close", spawnNew);
-    old.kill();
-  } else {
-    spawnNew();
+    botProcess.kill();
   }
+  console.log("Starting Telegram Bot child process...");
+  botStatus = "Starting";
+  
+  // Use absolute path or execute in current folder
+  botProcess = spawn("python3", ["bot.py"], { cwd: process.cwd() });
+  botStatus = "Running";
+
+  botProcess.stdout?.on("data", (data) => {
+    const text = data.toString().trim();
+    if (text) {
+      console.log(`[Bot Out]: ${text}`);
+      botLogs.push(`[${new Date().toLocaleTimeString()}] ${text}`);
+      if (botLogs.length > 200) botLogs.shift();
+    }
+  });
+
+  botProcess.stderr?.on("data", (data) => {
+    const text = data.toString().trim();
+    if (text) {
+      console.error(`[Bot Err]: ${text}`);
+      botLogs.push(`[${new Date().toLocaleTimeString()} ERR] ${text}`);
+      if (botLogs.length > 200) botLogs.shift();
+    }
+  });
+
+  botProcess.on("close", (code) => {
+    console.log(`Telegram Bot stopped with code ${code}`);
+    botStatus = "Stopped";
+    botProcess = null;
+  });
 }
 
 // Automatically start the bot
@@ -243,10 +215,4 @@ async function startServer() {
   });
 }
 
-// BUG FIX: startServer() is async and its rejection was never handled - if createViteServer()
-// or app.listen() ever throws, this becomes an unhandled promise rejection instead of a
-// visible startup error.
-startServer().catch((err) => {
-  console.error("Fatal error starting server:", err);
-  process.exit(1);
-});
+startServer();
