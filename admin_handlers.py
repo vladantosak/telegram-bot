@@ -22,7 +22,8 @@ from db import (
     generate_and_send_excel, generate_and_send_gsheets, get_violators_threshold,
     save_violators_threshold, now_local, set_quiet_mode, is_quiet_mode_enabled,
     save_scheduled_times, get_scheduled_times, sync_gsheets_task, async_sync_gsheets_background,
-    save_report, get_all_departments, add_department, delete_department, count_workers_in_department
+    save_report, get_all_departments, add_department, delete_department, count_workers_in_department,
+    get_departments_ordered, save_departments_order
 )
 
 from report_handlers import menu_for_user
@@ -88,7 +89,8 @@ CANCEL_TEXT = "❌ Отмена"
     ASK_DEPT_ADD_NAME,
     ASK_DEPT_DELETE_SELECT,
     ASK_SUMMARY_DATE,
-) = range(43)
+    ASK_DEPT_ORDER_ACTION,
+) = range(44)
 
 def schedule_description_text() -> str:
     lines = []
@@ -126,7 +128,7 @@ async def require_admin_check(update: Update) -> bool:
 SETTINGS_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["📊 Настроить Google Таблицу", "🔗 Получить ссылку на таблицу"],
-        ["🏢 Редактировать отделы"],
+        ["🏢 Редактировать отделы", "📊 Порядок отделов в таблице"],
         ["🗑 Очистить базу от удалённых сотрудников"],
         ["❌ Назад"]
     ],
@@ -174,6 +176,9 @@ async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if choice == "🏢 Редактировать отделы":
         return await department_manage_start(update, context)
+
+    if choice == "📊 Порядок отделов в таблице":
+        return await department_order_start(update, context)
 
     if choice == "🗑 Очистить базу от удалённых сотрудников":
         deleted_reports, deleted_reminders, deleted_pending = await run_db(_cleanup_orphaned_records)
@@ -296,6 +301,91 @@ async def department_delete_received(update: Update, context: ContextTypes.DEFAU
     else:
         await update.message.reply_text(f"❌ Не удалось удалить отдел «{name}».", reply_markup=DEPT_MANAGE_KEYBOARD)
     return ASK_DEPT_ACTION
+
+def _build_department_order_view(ordered: list[str], new_names: list[str] | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    """Renders the "📊 Порядок отделов в таблице" screen text + inline keyboard for the
+    current working order. Called both when the screen first opens and after every
+    up/down button press, so the numbered list and the keyboard always match."""
+    lines = []
+    if new_names:
+        names_str = ", ".join(new_names)
+        lines.append(f"⚠️ Обнаружен новый отдел, добавлен в конец списка: {names_str}. Вы можете изменить его позицию ниже.\n")
+    lines.append("Текущий порядок отделов:")
+    for i, name in enumerate(ordered, 1):
+        lines.append(f"{i}. {name}")
+    lines.append("\nИзмените порядок кнопками ниже, затем нажмите «✅ Сохранить».")
+    text = "\n".join(lines)
+
+    rows = []
+    for i, name in enumerate(ordered):
+        label = name if len(name) <= 30 else name[:29] + "…"
+        btns = []
+        if i > 0:
+            btns.append(InlineKeyboardButton(f"⬆️ {label}", callback_data=f"deptord_up_{i}"))
+        if i < len(ordered) - 1:
+            btns.append(InlineKeyboardButton(f"⬇️ {label}", callback_data=f"deptord_down_{i}"))
+        rows.append(btns)
+    rows.append([
+        InlineKeyboardButton("✅ Сохранить", callback_data="deptord_save"),
+        InlineKeyboardButton("❌ Отмена", callback_data="deptord_cancel"),
+    ])
+    return text, InlineKeyboardMarkup(rows)
+
+async def department_order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin_check(update): return ConversationHandler.END
+    ordered, new_names = await run_db(get_departments_ordered)
+    context.user_data["dept_order_working"] = ordered
+    text, kbd = _build_department_order_view(ordered, new_names)
+    await update.message.reply_text(text, reply_markup=kbd)
+    return ASK_DEPT_ORDER_ACTION
+
+async def department_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await query.answer("Это действие доступно только отделу контроля складовки.", show_alert=True)
+        return ASK_DEPT_ORDER_ACTION
+
+    data = query.data
+    ordered = context.user_data.get("dept_order_working")
+    if ordered is None:
+        return ASK_DEPT_ORDER_ACTION
+
+    if data == "deptord_cancel":
+        context.user_data.pop("dept_order_working", None)
+        await query.edit_message_text("Изменение порядка отделов отменено — сохранённый порядок не тронут.")
+        await query.message.reply_text("⚙️ Настройки бота. Выберите действие:", reply_markup=SETTINGS_KEYBOARD)
+        return ASK_SETTINGS_ACTION
+
+    if data == "deptord_save":
+        await run_db(save_departments_order, ordered)
+        async_sync_gsheets_background()
+        context.user_data.pop("dept_order_working", None)
+        lines = ["✅ Порядок отделов обновлён.", ""]
+        lines += [f"{i}. {name}" for i, name in enumerate(ordered, 1)]
+        await query.edit_message_text("\n".join(lines))
+        await query.message.reply_text("⚙️ Настройки бота. Выберите действие:", reply_markup=SETTINGS_KEYBOARD)
+        return ASK_SETTINGS_ACTION
+
+    if data.startswith("deptord_up_") or data.startswith("deptord_down_"):
+        try:
+            idx = int(data.rsplit("_", 1)[-1])
+        except ValueError:
+            return ASK_DEPT_ORDER_ACTION
+        swap_with = idx - 1 if data.startswith("deptord_up_") else idx + 1
+        if 0 <= idx < len(ordered) and 0 <= swap_with < len(ordered):
+            ordered[idx], ordered[swap_with] = ordered[swap_with], ordered[idx]
+            context.user_data["dept_order_working"] = ordered
+            text, kbd = _build_department_order_view(ordered)
+            try:
+                await query.edit_message_text(text, reply_markup=kbd)
+            except Exception as e:
+                logger.error(f"Ошибка при обновлении экрана порядка отделов: {e}")
+        return ASK_DEPT_ORDER_ACTION
+
+    return ASK_DEPT_ORDER_ACTION
 
 async def add_worker_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin_check(update): return ConversationHandler.END

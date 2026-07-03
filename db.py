@@ -150,6 +150,9 @@ def init_db():
             conn.execute(f"ALTER TABLE workers ADD COLUMN {col} {definition}")
 
     conn.execute("CREATE TABLE IF NOT EXISTS objects (object_id TEXT PRIMARY KEY, group_id INTEGER NOT NULL DEFAULT 0)")
+    cols_objects = {row["name"] for row in conn.execute("PRAGMA table_info(objects)").fetchall()}
+    if "sort_order" not in cols_objects:
+        conn.execute("ALTER TABLE objects ADD COLUMN sort_order INTEGER")
     conn.execute("CREATE TABLE IF NOT EXISTS groups (group_id INTEGER PRIMARY KEY, group_name TEXT NOT NULL)")
     conn.execute(
         """
@@ -284,6 +287,44 @@ def add_department(object_id: str):
         "INSERT INTO objects (object_id, group_id) VALUES (?, 0) ON CONFLICT(object_id) DO NOTHING",
         (object_id,)
     )
+    conn.commit()
+    conn.close()
+
+def get_departments_ordered() -> tuple[list[str], list[str]]:
+    """Returns (ordered_department_names, newly_appended_names). Any department that exists
+    (per get_all_departments - including "Основной", which doesn't necessarily have its own
+    objects row) but has no sort_order yet is assigned the next available rank, appended to
+    the end, and persisted immediately - covers both a brand new department and the one-time
+    backfill the first time this feature is used."""
+    all_names = get_all_departments()
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT object_id, sort_order FROM objects WHERE sort_order IS NOT NULL ORDER BY sort_order"
+    ).fetchall()
+    ordered = [r["object_id"] for r in rows if r["object_id"] in all_names]
+    known = set(ordered)
+    new_names = sorted(n for n in all_names if n not in known)
+    if new_names:
+        next_rank = max((r["sort_order"] for r in rows), default=-1) + 1
+        for i, name in enumerate(new_names):
+            conn.execute(
+                "INSERT INTO objects (object_id, group_id, sort_order) VALUES (?, 0, ?) "
+                "ON CONFLICT(object_id) DO UPDATE SET sort_order=excluded.sort_order",
+                (name, next_rank + i)
+            )
+        conn.commit()
+        ordered.extend(new_names)
+    conn.close()
+    return ordered, new_names
+
+def save_departments_order(ordered_names: list[str]):
+    conn = get_db()
+    for i, name in enumerate(ordered_names):
+        conn.execute(
+            "INSERT INTO objects (object_id, group_id, sort_order) VALUES (?, 0, ?) "
+            "ON CONFLICT(object_id) DO UPDATE SET sort_order=excluded.sort_order",
+            (name, i)
+        )
     conn.commit()
     conn.close()
 
@@ -1260,6 +1301,25 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
 
         # 1. Sync Workers to "Сотрудники"
         workers = get_all_workers()
+
+        # Apply the admin-configured department display order (⚙️ Настройки -> "📊 Порядок
+        # отделов в таблице"). get_all_workers() already orders by object_id (alphabetical),
+        # sort_order, last_name, first_name - re-sort here by the custom department rank
+        # instead, keeping the same secondary ordering within each department. This single
+        # re-sort flows through to every tab below (Сотрудники, Аналитика, Сводка) since they
+        # all just iterate this same `workers` list - no need to touch each one separately.
+        # Every full sync already rebuilds every tab from scratch, so this alone is enough to
+        # reorder rows that already exist - no separate "move existing rows" step is needed.
+        dept_order, _ = get_departments_ordered()
+        dept_rank = {name: i for i, name in enumerate(dept_order)}
+        workers = sorted(
+            workers,
+            key=lambda w: (
+                dept_rank.get(w["object_id"] or "Основной", len(dept_order)),
+                w["sort_order"], w["last_name"], w["first_name"]
+            )
+        )
+
         headers_workers = [
             "Отдел", "ФИО сотрудника", "Должность", "Telegram ID",
             "ID Группы", "График", "Факт", "Активен", "Порядок сортировки"

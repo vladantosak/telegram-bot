@@ -56,8 +56,9 @@ from admin_handlers import (
     ASK_LIST_WORKER, ASK_EDIT_FIELD, ASK_EDIT_VALUE, ASK_EDIT_SCHEDULE,
     ASK_EDIT_DAILY_FACT, ASK_EDIT_STATUS_WORK, ASK_NOT_WORKING_DAYS, ASK_NOT_WORKING_REASON,
     ASK_REG_CONFIRM, ASK_REG_CONTACT, ASK_WORKER_DEPARTMENT,
-    ASK_DEPT_ACTION, ASK_DEPT_ADD_NAME, ASK_DEPT_DELETE_SELECT, ASK_SUMMARY_DATE,
-    department_manage_start, department_manage_action, department_add_received, department_delete_received
+    ASK_DEPT_ACTION, ASK_DEPT_ADD_NAME, ASK_DEPT_DELETE_SELECT, ASK_SUMMARY_DATE, ASK_DEPT_ORDER_ACTION,
+    department_manage_start, department_manage_action, department_add_received, department_delete_received,
+    department_order_start, department_order_callback
 )
 
 # Set up logging
@@ -508,6 +509,7 @@ def main():
             ASK_DEPT_ACTION: [MessageHandler(safe_text_filter, department_manage_action)],
             ASK_DEPT_ADD_NAME: [MessageHandler(safe_text_filter, department_add_received)],
             ASK_DEPT_DELETE_SELECT: [MessageHandler(safe_text_filter, department_delete_received)],
+            ASK_DEPT_ORDER_ACTION: [CallbackQueryHandler(department_order_callback)],
         },
         fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )
