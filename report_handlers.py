@@ -218,10 +218,11 @@ async def render_report_message_from_row(report: dict, worker_name: str) -> tupl
     is_status_with_videos = (report_type == "status" and ("Видео" in format_comment or ";" in format_comment))
 
     if is_status_with_videos:
+        # Formatting change: a "📹 Видео N" line per video was replaced with a single count
+        # line - the actual per-video breakdown already lives in "Комментарий" below.
         video_count = len([part for part in format_comment.split("; ") if part.strip()])
         notify_lines.append("")
-        for i in range(1, video_count + 1):
-            notify_lines.append(f"📹 Видео {i}")
+        notify_lines.append(f"Количество видео: {video_count}")
         notify_lines.append(f"Комментарий: {html.escape(format_comment)}")
     else:
         notify_lines.append(f"Комментарий: {html.escape(format_comment)}")
@@ -486,6 +487,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
 
         do_full_merge = False
         old_media_rows = []
+        existing_media_count = 0
         if existing:
             try:
                 prev_h, prev_m, prev_s = map(int, existing["received_at"].split(":"))
@@ -493,11 +495,19 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 do_full_merge = 0 <= elapsed_minutes <= MEDIA_MERGE_WINDOW_MINUTES
             except Exception:
                 do_full_merge = False
+            # BUG FIX: the video count used to continue numbering ("Видео 3", "Видео 4", ...)
+            # was only ever fetched when do_full_merge was True (needed there to re-forward
+            # the old videos). A later addendum outside the merge window skipped this
+            # entirely, so existing_media_count silently stayed 0 and its new video(s) were
+            # numbered starting back at "Видео 1" - colliding with the numbering the
+            # original submission already used (both showing up as "Видео 1" in the
+            # Комментарий/Оригинальный текст fields). Fetch the real count unconditionally.
+            all_existing_media = await run_db(get_report_media, existing["id"])
+            existing_media_count = len(all_existing_media)
             if do_full_merge:
-                old_media_rows = await run_db(get_report_media, existing["id"])
+                old_media_rows = all_existing_media
 
         if existing:
-            existing_media_count = len(old_media_rows) if old_media_rows else 0
             raw_text_parts = []
             for idx, s_item in enumerate(status_items, start=1 + existing_media_count):
                 raw_text_parts.append(f"[Видео {idx}]: {s_item['text_content']}")
@@ -598,8 +608,11 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 except Exception as e:
                     logger.error(f"Ошибка повторной пересылки видео {pos}: {e}")
         else:
-            # Forward only new videos
-            existing_media_count = len(old_media_rows) if old_media_rows else 0
+            # Forward only new videos. existing_media_count was already computed above from
+            # the real report_media count (not just old_media_rows, which is only populated
+            # for a full merge) - same fix as the numbering bug, applied here so a later
+            # addendum's report_media rows get positions that continue after the existing
+            # ones instead of restarting at 1 and colliding with them.
             for idx, s_item in enumerate(status_items, start=1):
                 upd = s_item["upd"]
                 try:
