@@ -137,7 +137,17 @@ def normalize_ai_result(data: dict, source_text: str, report_type: str | None = 
 
     # Rule-based overrides for silence/unintelligibility
     lower_src = source_text.lower().strip()
-    if not lower_src or any(x in lower_src for x in ("на видео молчал", "[без звука]", "[тишина]", "[вздох]", "без звука", "тишина", "музыка", "молчание", "молчал", "молчит", "шум")):
+    # Whisper hallucinates stock subtitle-outro phrases like "продолжение следует" when the
+    # audio has no real speech (silence/near-silence) - treat that as the same "couldn't
+    # make out a report" case rather than showing the hallucinated text as if it were what
+    # the worker actually said.
+    if "продолжение следует" in lower_src:
+        is_ok = False
+        issue = "в видео был неразборчивый звук или на видео молчал"
+        format_comment = issue
+        required_action = f"сделал замечание: {issue}"
+        employee_message = "В видео был неразборчивый звук или на видео молчал. Пожалуйста, перезапишите отчёт."
+    elif not lower_src or any(x in lower_src for x in ("на видео молчал", "[без звука]", "[тишина]", "[вздох]", "без звука", "тишина", "музыка", "молчание", "молчал", "молчит", "шум")):
         is_ok = False
         issue = "на видео молчал"
         format_comment = "на видео молчал"
