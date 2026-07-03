@@ -233,10 +233,10 @@ async def render_report_message_from_row(report: dict, worker_name: str) -> tupl
     notify_lines.append(f"⚡ Требуемое действие: {html.escape(required_action)}")
 
     notify_lines.append("")
-    notify_lines.append("📝 <b>Официальный отчет:</b>")
+    notify_lines.append("📝 <b>Обработанный отчет:</b>")
     notify_lines.append(f"\"{html.escape(cleaned_text)}\"")
     notify_lines.append("")
-    notify_lines.append("🗣 <b>Оригинальный текст:</b>")
+    notify_lines.append("🗣 <b>Оригинальный отчёт:</b>")
     notify_lines.append(f"\"{html.escape(raw_text)}\"")
     
     notify_text = "\n".join(notify_lines)
@@ -516,7 +516,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             # entirely, so existing_media_count silently stayed 0 and its new video(s) were
             # numbered starting back at "Видео 1" - colliding with the numbering the
             # original submission already used (both showing up as "Видео 1" in the
-            # Комментарий/Оригинальный текст fields). Fetch the real count unconditionally.
+            # Комментарий/Оригинальный отчёт fields). Fetch the real count unconditionally.
             all_existing_media = await run_db(get_report_media, existing["id"])
             existing_media_count = len(all_existing_media)
             if do_full_merge:
@@ -1265,8 +1265,8 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{format_status_or_fact_line(ai_res['report_type'], nearest_slot if ai_res['report_type'] == 'status' else None, date_str)}\n"
             f"Оценка ИИ: {'ОК' if ai_res['is_ok'] else 'НЕ ОК'}\n"
             f"Комментарий ИИ: {ai_res['format_comment']}\n\n"
-            f"📝 Официальный отчет:\n\"{cleaned_text}\"\n\n"
-            f"🗣 Оригинальный текст:\n\"{text_content}\""
+            f"📝 Обработанный отчет:\n\"{cleaned_text}\"\n\n"
+            f"🗣 Оригинальный отчёт:\n\"{text_content}\""
         )
         
         inline_kbd = make_report_keyboard(report_id, ai_res["report_type"])
