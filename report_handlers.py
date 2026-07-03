@@ -110,6 +110,24 @@ def format_show_date(date_str: str) -> str:
     except Exception:
         return date_str
 
+def _short_issue_text(ai_results) -> str:
+    """Turns one or more AI result dicts into a short, plain-language pointer at what was
+    wrong (e.g. "На видео не слышно голоса.") for the employee's personal message - never
+    the full technical remark list, which stays in the group/Sheets notification."""
+    issues = []
+    for res in ai_results:
+        if res.get("is_ok"):
+            continue
+        issue = (res.get("issue") or "").strip()
+        if not issue:
+            continue
+        issue_cap = issue[0].upper() + issue[1:]
+        if issue_cap not in issues:
+            issues.append(issue_cap)
+    if not issues:
+        return "Обнаружены недочёты."
+    return "; ".join(issues).rstrip(".") + "."
+
 def format_status_or_fact_line(report_type: str, slot_time: str | None, report_date: str) -> str:
     formatted_date = format_show_date(report_date)
     if report_type == "daily_fact":
@@ -446,10 +464,10 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 await upd.message.reply_text("✅ Факт получен и принят без замечаний.")
             else:
                 await upd.message.reply_text(
-                    "❌ Факт проверен.\n"
-                    "Факт НЕ ОК.\n"
-                    "Пожалуйста, самостоятельно просмотрите отправленное видео. "
-                    "Вероятно, при записи отчета были допущены ошибки."
+                    f"❌ Факт НЕ ОК. {_short_issue_text([ai_res])}\n"
+                    "Сотрудник контроля свяжется с вами и скажет замечания.\n"
+                    "Напоминаем, что при частом допущении ошибок в сдаче отчетов, "
+                    "проблема будет делегироваться руководству."
                 )
         except Exception as e:
             logger.warning(f"Не удалось отправить личный фидбек по факту пользователю {user_id}: {e}")
@@ -648,10 +666,10 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 personal_text += " Статус получен позже установленного времени."
         else:
             personal_text = (
-                "❌ Статус проверен.\n"
-                "Статус НЕ ОК.\n"
-                "Пожалуйста, самостоятельно просмотрите отправленное видео. "
-                "Вероятно, при записи отчета были допущены ошибки."
+                f"❌ Статус НЕ ОК. {_short_issue_text(res['ai_res'] for res in status_items)}\n"
+                "Сотрудник контроля свяжется с вами и скажет замечания.\n"
+                "Напоминаем, что при частом допущении ошибок в сдаче отчетов, "
+                "проблема будет делегироваться руководству."
             )
 
         for s_item in status_items:
@@ -1097,10 +1115,10 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(personal_text)
         else:
             await update.message.reply_text(
-                f"❌ {label} проверен.\n"
-                f"{label} НЕ ОК.\n"
-                f"Пожалуйста, самостоятельно просмотрите отправленное видео. "
-                f"Вероятно, при записи отчета были допущены ошибки."
+                f"❌ {label} НЕ ОК. {_short_issue_text([ai_res])}\n"
+                "Сотрудник контроля свяжется с вами и скажет замечания.\n"
+                "Напоминаем, что при частом допущении ошибок в сдаче отчетов, "
+                "проблема будет делегироваться руководству."
             )
 
         dest_chat = await run_db(get_worker_target_group, worker)
