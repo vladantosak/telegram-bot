@@ -1,0 +1,4 @@
+﻿workers.db
+backup_*.db
+__pycache__/
+*.pyc
