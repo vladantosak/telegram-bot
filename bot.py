@@ -311,12 +311,12 @@ async def missed_status_check_callback(context: ContextTypes.DEFAULT_TYPE):
                 # LOGIC FIX: this used to fire at LATE_THRESHOLD_MIN (15 min), demanding a
                 # written excuse and blocking new video submissions - while the actual
                 # acceptance window (pick_target_status_slot) still treats a status as
-                # legitimately "on time" up to STATUS_LATE_TOLERANCE_MIN (60 min) later. A
-                # worker running 20-50 minutes late was being told "you missed it, explain
-                # yourself" and locked out of sending video, even though their submission
-                # would have been accepted normally. Now only fires once the acceptance
-                # window has actually closed, so the two systems agree on what "missed"
-                # means.
+                # legitimately "on time" up to STATUS_LATE_TOLERANCE_MIN (the grace period)
+                # later. A worker still within the grace period was being told "you missed
+                # it, explain yourself" and locked out of sending video, even though their
+                # submission would have been accepted normally. Now only fires once the
+                # acceptance window has actually closed, so the two systems agree on what
+                # "missed" means.
                 if STATUS_LATE_TOLERANCE_MIN <= mins_late < STATUS_LATE_TOLERANCE_MIN + 2:
                     if has_pending_reason_request(w["telegram_id"], date_str, slot):
                         continue

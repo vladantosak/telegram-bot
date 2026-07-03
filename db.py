@@ -21,11 +21,14 @@ DB_PATH = os.environ.get("DB_PATH", "workers.db")
 DEFAULT_GROUP_ID = int(os.environ.get("GROUP_ID", "-1003804380536"))
 LOCAL_TZ = ZoneInfo("Europe/Chisinau")
 LATE_THRESHOLD_MIN = 15  # used for reminders / "expected" counting - when a slot is considered due
-# How many minutes after a slot's clock time a status is still accepted as "on time" (an
-# early submission is never late, no matter how early). Single source of truth, shared by
-# report_handlers.py (slot attribution) and bot.py (missed-status reminder), so the "still
-# within your window" and "you missed it, explain why" checks can't disagree.
-STATUS_LATE_TOLERANCE_MIN = 60
+# Grace period: how many minutes after a slot's anchor time a status is still accepted as
+# "on time" (an early submission is never late, no matter how early — see
+# pick_target_status_slot). Single, sole source of truth for this threshold across the
+# project (report_handlers.py's slot attribution, bot.py's missed-status reminder, and
+# db.py's own Сводка "still pending" gate below all import/reference this one constant),
+# so "still within your window" and "you missed it" can't disagree, and there's exactly one
+# place to change the grace period.
+STATUS_LATE_TOLERANCE_MIN = 30
 
 # Read ADMIN_IDS from environment variables
 ADMIN_IDS_RAW = os.environ.get("ADMIN_IDS", "")
@@ -69,7 +72,6 @@ def extract_issue_lines(format_comment: str) -> list[str]:
             lines.append(part[0].upper() + part[1:])
     return lines
 
-STATUS_ACCEPT_WINDOW_MIN = 60  # сколько ждать после времени слота, прежде чем считать статус несданным
 
 ENCRYPTED_SETTING_KEYS = {"google_service_account"}
 _fernet = None
@@ -1489,7 +1491,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
 
                     if d_str in not_working_dates:
                         cell_value = False
-                    elif d == today_date and (now.hour * 60 + now.minute) <= hour * 60 + minute + STATUS_ACCEPT_WINDOW_MIN:
+                    elif d == today_date and (now.hour * 60 + now.minute) <= hour * 60 + minute + STATUS_LATE_TOLERANCE_MIN:
                         cell_value = ""
                     else:
                         rep = status_map.get((d_str, slot))

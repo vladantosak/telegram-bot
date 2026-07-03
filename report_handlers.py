@@ -311,8 +311,10 @@ def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots:
     obviously-intended 12:00 one. Distance-based matching fixes that at the root, for every
     slot pair, instead of special-casing the boundary.
 
-    Once a slot is picked, "вовремя" means received within [slot-30мин, slot+60мин] — the
-    asymmetric acceptance window; anything outside it (early or late) is "прислал поздно"."""
+    Once a slot is picked, "вовремя" means received any time up to and including
+    STATUS_LATE_TOLERANCE_MIN (grace period) minutes after the slot's clock time — an early
+    submission is never late, no matter how early; only later than the grace period counts
+    as "прислал поздно" (опоздание)."""
     current_mins = now.hour * 60 + now.minute
     candidates = [s for s in schedule if s not in submitted_slots] or list(schedule)
 
