@@ -4,7 +4,6 @@ import re
 import asyncio
 import logging
 from datetime import datetime
-import datetime as dt_module
 from telegram import ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply, Update
 from telegram.ext import ContextTypes, ConversationHandler
 
@@ -94,7 +93,7 @@ async def notify_admins_if_remark_threshold_crossed(context: ContextTypes.DEFAUL
             logger.error(f"Не удалось отправить админу {admin_id} накопительное предупреждение о сотруднике {telegram_id}: {e}")
 
 from ai import (
-    transcribe_audio, clean_report, check_status
+    transcribe_audio, clean_report, check_status, classify_report_type
 )
 
 logger = logging.getLogger(__name__)
@@ -212,9 +211,11 @@ async def render_report_message_from_row(report: dict, worker_name: str) -> tupl
     status_line = format_status_or_fact_line(report_type, slot_time, report_date)
     status_emoji = "✅" if is_ok else "⚠️"
     
+    type_label = {"status": "Статус", "daily_fact": "Факт", "undetermined": "Не определено"}.get(report_type, report_type)
     notify_lines = [
         f"👤 <b>{html.escape(worker_name)}</b>",
         f"📍 {html.escape(status_line)}",
+        f"Тип: {type_label}",
         f"Оценка: {status_emoji} {'ОК' if is_ok else 'НЕ ОК'}",
     ]
     
@@ -263,6 +264,9 @@ async def clean_report_async(text: str) -> str:
 
 async def check_status_async(text: str, report_type_override: str | None = None) -> dict:
     return await asyncio.to_thread(check_status, text, report_type_override)
+
+async def classify_report_type_async(text: str) -> dict:
+    return await asyncio.to_thread(classify_report_type, text)
 
 async def enqueue_media_report_item(user_id: int, context: ContextTypes.DEFAULT_TYPE, update: Update, text_content: str, now: datetime):
     buf = MEDIA_BATCH_BUFFERS.setdefault(user_id, {"items": [], "task": None})
@@ -375,10 +379,14 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
     # on where reports actually got sent.
     dest_chat = await run_db(get_worker_target_group, worker)
 
-    last_slot_time_str = sched_list[-1]
-    last_hour, last_minute = map(int, last_slot_time_str.split(":"))
-
+    # LOGIC CHANGE: type (status vs факт) is now decided purely by the meaning of what the
+    # worker said (classify_report_type), never by submission time - see classify_report_
+    # type's docstring in ai.py. A single video can also come back "mixed" (split into two
+    # separate evaluated items feeding the same status_items/fact_items pipeline below,
+    # unchanged) or "undetermined" (never guessed - saved and flagged for manual review,
+    # kept out of status_items/fact_items entirely).
     evaluated_items = []
+    undetermined_items = []
     for idx, item in enumerate(items, start=1):
         text_content = item["text_content"]
         now = item["now"]
@@ -387,30 +395,77 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
 
         logger.info(f"[process_media_batch] Видео {idx}/{len(items)} пользователя {user_id}: текст='{text_content[:80]}'")
 
-        if len(items) == 1:
-            # Single video: keep the proven time-based rule (it's overwhelmingly a status).
-            last_slot_time = now.replace(hour=last_hour, minute=last_minute, second=0, microsecond=0)
-            last_slot_limit = last_slot_time + dt_module.timedelta(minutes=STATUS_LATE_TOLERANCE_MIN)
-            forced_type = "status" if now <= last_slot_limit else None
+        classification = await classify_report_type_async(text_content)
+        kind = classification["classification"]
+        logger.info(f"[Классификация статус/факт] Видео {idx}/{len(items)} пользователя {user_id}: {kind}")
+
+        if kind == "mixed":
+            status_text = classification["status_part"] or text_content
+            fact_text = classification["fact_part"] or text_content
+            status_ai = await check_status_async(status_text, report_type_override="status")
+            fact_ai = await check_status_async(fact_text, report_type_override="daily_fact")
+            evaluated_items.append({
+                "item": item, "ai_res": status_ai, "report_type": "status",
+                "text_content": status_text, "now": now, "upd": upd, "date_str": date_str
+            })
+            evaluated_items.append({
+                "item": item, "ai_res": fact_ai, "report_type": "daily_fact",
+                "text_content": fact_text, "now": now, "upd": upd, "date_str": date_str
+            })
+        elif kind == "undetermined":
+            undetermined_items.append({"item": item, "text_content": text_content, "now": now, "upd": upd, "date_str": date_str})
         else:
-            # Several videos arrive together with essentially the same timestamp, so time
-            # alone can't tell a "статус за 17:00" apart from a "факт дня" sent right after
-            # it — forcing every item to "status" here is exactly what made the bot merge
-            # them into one status report. Let content decide for each video individually.
-            forced_type = None
+            ai_res_pre = await check_status_async(text_content, report_type_override=kind)
+            evaluated_items.append({
+                "item": item, "ai_res": ai_res_pre, "report_type": kind,
+                "text_content": text_content, "now": now, "upd": upd, "date_str": date_str
+            })
 
-        ai_res_pre = await check_status_async(text_content, report_type_override=forced_type)
-        report_type = ai_res_pre["report_type"]
-
-        evaluated_items.append({
-            "item": item,
-            "ai_res": ai_res_pre,
-            "report_type": report_type,
-            "text_content": text_content,
-            "now": now,
-            "upd": upd,
-            "date_str": date_str
-        })
+    # Undetermined items are never guessed into status/факт - save them for the record and
+    # flag them to the control department for a human to decide, instead of blocking the
+    # rest of the batch or silently dropping the report.
+    for u_item in undetermined_items:
+        upd = u_item["upd"]
+        now = u_item["now"]
+        date_str = u_item["date_str"]
+        text_content = u_item["text_content"]
+        report_id = await run_db(
+            save_report,
+            telegram_id=user_id,
+            report_date=date_str,
+            report_type="undetermined",
+            slot_time=None,
+            received_at=now.strftime("%H:%M:%S"),
+            is_ok=False,
+            is_late=0,
+            format_comment="не удалось определить тип отчёта (статус/факт)",
+            required_action="Требуется ручная проверка отделом контроля",
+            raw_text=text_content
+        )
+        try:
+            copied_msg = await context.bot.copy_message(
+                chat_id=dest_chat, from_chat_id=upd.effective_chat.id, message_id=upd.message.message_id
+            )
+            await run_db(add_report_media, report_id, upd.effective_chat.id, upd.message.message_id, copied_msg.message_id, 1, now.strftime("%H:%M:%S"))
+            await context.bot.send_message(
+                chat_id=dest_chat,
+                text=(
+                    f"⚠️ <b>Не удалось определить тип отчёта</b> — {w_name}\n"
+                    f"Не понятно, это статус или факт дня. Требуется ручная проверка.\n\n"
+                    f"🗣 Оригинальный текст:\n\"{html.escape(text_content)}\""
+                ),
+                reply_to_message_id=copied_msg.message_id,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Ошибка отправки неопределённого отчёта в чат {dest_chat}: {e}")
+        try:
+            await upd.message.reply_text(
+                "⚠️ Не удалось точно понять, статус это или факт дня. "
+                "Отдел контроля проверит запись вручную."
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось отправить личный фидбек по неопределённому отчёту пользователю {user_id}: {e}")
 
     # Separate status items and daily facts
     status_items = [x for x in evaluated_items if x["report_type"] == "status"]
@@ -1192,111 +1247,151 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Handle purely text status report (worker typewriting)
         date_str = now.strftime("%Y-%m-%d")
         sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
-        
-        last_slot_time_str = sched_list[-1]
-        last_hour, last_minute = map(int, last_slot_time_str.split(":"))
-        last_slot_time = now.replace(hour=last_hour, minute=last_minute, second=0, microsecond=0)
-        last_slot_limit = last_slot_time + dt_module.timedelta(minutes=STATUS_LATE_TOLERANCE_MIN)
+        w_name = f"{worker['last_name']} {worker['first_name']}"
 
-        report_type_override = "status" if now <= last_slot_limit else None
+        async def _process_one_text_report(rt: str, part_text: str):
+            """Processes a single classified report (status or daily_fact) from a text
+            message - the same save-or-merge-then-notify logic used regardless of whether
+            classify_report_type found exactly one type or split a "mixed" message into two.
+            """
+            if rt == "status":
+                submitted_slots = await run_db(get_submitted_status_slots, user_id, date_str)
+                nearest_slot, is_late = pick_target_status_slot(sched_list, now, submitted_slots, w_name)
+            else:
+                nearest_slot, is_late = None, False
 
-        ai_res_pre = await check_status_async(text_content, report_type_override=report_type_override)
-        report_type = ai_res_pre["report_type"]
+            existing_report = await run_db(get_existing_report_row, user_id, date_str, rt, nearest_slot)
 
-        if report_type == "status":
-            submitted_slots = await run_db(get_submitted_status_slots, user_id, date_str)
-            nearest_slot, is_late = pick_target_status_slot(
-                sched_list, now, submitted_slots, f"{worker['last_name']} {worker['first_name']}"
+            is_addon = False
+            if existing_report:
+                is_addon = True
+                ai_res = await check_status_async(part_text, report_type_override=rt)
+                cleaned_text = await clean_report_async(part_text)
+                report_id = existing_report["id"]
+                action_text = REMARK_REQUIRED_ACTION_TEXT if (ai_res["report_type"] == "status" and not ai_res["is_ok"]) else ai_res["required_action"]
+
+                await run_db(
+                    update_report_text_and_ai,
+                    report_id=report_id,
+                    is_ok=ai_res["is_ok"],
+                    format_comment=ai_res["format_comment"],
+                    required_action=action_text,
+                    raw_text=part_text,
+                    received_at=now.strftime("%H:%M:%S")
+                )
+            else:
+                ai_res = await check_status_async(part_text, report_type_override=rt)
+                cleaned_text = await clean_report_async(part_text)
+                action_text = REMARK_REQUIRED_ACTION_TEXT if (ai_res["report_type"] == "status" and not ai_res["is_ok"]) else ai_res["required_action"]
+                report_id = await run_db(
+                    save_report,
+                    telegram_id=user_id,
+                    report_date=date_str,
+                    report_type=ai_res["report_type"],
+                    slot_time=nearest_slot if ai_res["report_type"] == "status" else None,
+                    received_at=now.strftime("%H:%M:%S"),
+                    is_ok=ai_res["is_ok"],
+                    is_late=is_late if ai_res["report_type"] == "status" else 0,
+                    format_comment=ai_res["format_comment"],
+                    required_action=action_text,
+                    raw_text=part_text
+                )
+            async_sync_gsheets_background()
+
+            if ai_res["report_type"] == "status" and not ai_res["is_ok"]:
+                await notify_admins_if_remark_threshold_crossed(context, user_id, w_name)
+            is_status = ai_res["report_type"] == "status" and nearest_slot
+            label = "Статус" if is_status else "Факт"
+
+            if ai_res["is_ok"]:
+                if is_status:
+                    personal_text = f"✅ Статус за {nearest_slot} принят без замечаний."
+                    if is_late:
+                        personal_text += " Статус получен позже установленного времени."
+                else:
+                    personal_text = "✅ Факт получен и принят без замечаний."
+                await update.message.reply_text(personal_text)
+            else:
+                await update.message.reply_text(
+                    f"❌ {label} НЕ ОК. {_short_issue_text([ai_res])}\n"
+                    "Сотрудник контроля свяжется с вами и скажет замечания.\n"
+                    "Напоминаем, что при частом допущении ошибок в сдаче отчетов, "
+                    "проблема будет делегироваться руководству."
+                )
+
+            dest_chat = await run_db(get_worker_target_group, worker)
+            title_text = f"Отчет обновлен: {w_name}" if is_addon else w_name
+            notify_text = (
+                f"{title_text}\n"
+                f"{format_status_or_fact_line(ai_res['report_type'], nearest_slot if ai_res['report_type'] == 'status' else None, date_str)}\n"
+                f"Тип: {'Статус' if ai_res['report_type'] == 'status' else 'Факт'}\n"
+                f"Оценка ИИ: {'ОК' if ai_res['is_ok'] else 'НЕ ОК'}\n"
+                f"Комментарий ИИ: {ai_res['format_comment']}\n\n"
+                f"📝 Обработанный отчет:\n\"{cleaned_text}\"\n\n"
+                f"🗣 Оригинальный отчёт:\n\"{part_text}\""
             )
-        else:
-            nearest_slot, is_late = None, False
 
-        existing_report = await run_db(get_existing_report_row, user_id, date_str, report_type, nearest_slot)
+            inline_kbd = make_report_keyboard(report_id, ai_res["report_type"])
 
-        is_addon = False
-        if existing_report:
-            is_addon = True
-            ai_res = await check_status_async(text_content, report_type_override=report_type)
-            cleaned_text = await clean_report_async(text_content)
-            report_id = existing_report["id"]
-            action_text = REMARK_REQUIRED_ACTION_TEXT if (ai_res["report_type"] == "status" and not ai_res["is_ok"]) else ai_res["required_action"]
+            if is_addon and existing_report and existing_report["group_chat_id"] and existing_report["group_message_id"]:
+                try:
+                    await context.bot.delete_message(chat_id=existing_report["group_chat_id"], message_id=existing_report["group_message_id"])
+                except Exception:
+                    pass
 
-            await run_db(
-                update_report_text_and_ai,
-                report_id=report_id,
-                is_ok=ai_res["is_ok"],
-                format_comment=ai_res["format_comment"],
-                required_action=action_text,
-                raw_text=text_content,
-                received_at=now.strftime("%H:%M:%S")
-            )
-        else:
-            ai_res = ai_res_pre
-            cleaned_text = await clean_report_async(text_content)
-            action_text = REMARK_REQUIRED_ACTION_TEXT if (ai_res["report_type"] == "status" and not ai_res["is_ok"]) else ai_res["required_action"]
+            try:
+                sent_notify_msg = await context.bot.send_message(
+                    chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd, parse_mode="Markdown"
+                )
+                await run_db(set_report_group_message, report_id, dest_chat, sent_notify_msg.message_id)
+            except Exception as e:
+                logger.error(f"Ошибка отправки оценки в чат {dest_chat}: {e}")
+
+        # LOGIC CHANGE: type is decided purely by meaning (classify_report_type), never by
+        # submission time - same classification step as the video path above. "mixed" runs
+        # _process_one_text_report twice (once per part), "undetermined" is saved and
+        # flagged for manual review instead of being guessed into status or факт.
+        classification = await classify_report_type_async(text_content)
+        kind = classification["classification"]
+        logger.info(f"[Классификация статус/факт] Текстовый отчёт пользователя {user_id}: {kind}")
+
+        if kind == "mixed":
+            await _process_one_text_report("status", classification["status_part"] or text_content)
+            await _process_one_text_report("daily_fact", classification["fact_part"] or text_content)
+        elif kind == "undetermined":
             report_id = await run_db(
                 save_report,
                 telegram_id=user_id,
                 report_date=date_str,
-                report_type=ai_res["report_type"],
-                slot_time=nearest_slot if ai_res["report_type"] == "status" else None,
+                report_type="undetermined",
+                slot_time=None,
                 received_at=now.strftime("%H:%M:%S"),
-                is_ok=ai_res["is_ok"],
-                is_late=is_late if ai_res["report_type"] == "status" else 0,
-                format_comment=ai_res["format_comment"],
-                required_action=action_text,
+                is_ok=False,
+                is_late=0,
+                format_comment="не удалось определить тип отчёта (статус/факт)",
+                required_action="Требуется ручная проверка отделом контроля",
                 raw_text=text_content
             )
-        async_sync_gsheets_background()
-
-        w_name = f"{worker['last_name']} {worker['first_name']}"
-        if ai_res["report_type"] == "status" and not ai_res["is_ok"]:
-            await notify_admins_if_remark_threshold_crossed(context, user_id, w_name)
-        is_status = ai_res["report_type"] == "status" and nearest_slot
-        label = "Статус" if is_status else "Факт"
-
-        if ai_res["is_ok"]:
-            if is_status:
-                personal_text = f"✅ Статус за {nearest_slot} принят без замечаний."
-                if is_late:
-                    personal_text += " Статус получен позже установленного времени."
-            else:
-                personal_text = "✅ Факт получен и принят без замечаний."
-            await update.message.reply_text(personal_text)
-        else:
-            await update.message.reply_text(
-                f"❌ {label} НЕ ОК. {_short_issue_text([ai_res])}\n"
-                "Сотрудник контроля свяжется с вами и скажет замечания.\n"
-                "Напоминаем, что при частом допущении ошибок в сдаче отчетов, "
-                "проблема будет делегироваться руководству."
-            )
-
-        dest_chat = await run_db(get_worker_target_group, worker)
-        title_text = f"Отчет обновлен: {w_name}" if is_addon else w_name
-        notify_text = (
-            f"{title_text}\n"
-            f"{format_status_or_fact_line(ai_res['report_type'], nearest_slot if ai_res['report_type'] == 'status' else None, date_str)}\n"
-            f"Оценка ИИ: {'ОК' if ai_res['is_ok'] else 'НЕ ОК'}\n"
-            f"Комментарий ИИ: {ai_res['format_comment']}\n\n"
-            f"📝 Обработанный отчет:\n\"{cleaned_text}\"\n\n"
-            f"🗣 Оригинальный отчёт:\n\"{text_content}\""
-        )
-        
-        inline_kbd = make_report_keyboard(report_id, ai_res["report_type"])
-
-        if is_addon and existing_report and existing_report["group_chat_id"] and existing_report["group_message_id"]:
+            async_sync_gsheets_background()
+            dest_chat = await run_db(get_worker_target_group, worker)
             try:
-                await context.bot.delete_message(chat_id=existing_report["group_chat_id"], message_id=existing_report["group_message_id"])
-            except Exception:
-                pass
-
-        try:
-            sent_notify_msg = await context.bot.send_message(
-                chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd, parse_mode="Markdown"
+                await context.bot.send_message(
+                    chat_id=dest_chat,
+                    text=(
+                        f"⚠️ <b>Не удалось определить тип отчёта</b> — {w_name}\n"
+                        f"Не понятно, это статус или факт дня. Требуется ручная проверка.\n\n"
+                        f"🗣 Оригинальный текст:\n\"{html.escape(text_content)}\""
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Ошибка отправки неопределённого отчёта в чат {dest_chat}: {e}")
+            await update.message.reply_text(
+                "⚠️ Не удалось точно понять, статус это или факт дня. "
+                "Отдел контроля проверит запись вручную."
             )
-            await run_db(set_report_group_message, report_id, dest_chat, sent_notify_msg.message_id)
-        except Exception as e:
-            logger.error(f"Ошибка отправки оценки в чат {dest_chat}: {e}")
+        else:
+            await _process_one_text_report(kind, text_content)
     finally:
         try:
             lock.release()

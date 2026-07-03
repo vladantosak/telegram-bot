@@ -11,6 +11,18 @@ groq_client = Groq(api_key=GROQ_API_KEY, timeout=120.0) if GROQ_API_KEY else Non
 
 _ai_status_cache = {}
 _ai_clean_cache = {}
+_ai_classify_cache = {}
+
+# Same silence/hallucination signal words normalize_ai_result() already treats as "no real
+# report to analyze" - classify_report_type() checks this FIRST so a silent/garbled video
+# still goes straight to that existing, already-correct handling instead of being routed
+# into the new "undetermined, needs manual review" path (which is for genuinely ambiguous
+# real speech, not for videos with no real content at all).
+_NO_CONTENT_MARKERS = (
+    "продолжение следует", "на видео молчал", "[без звука]", "[тишина]", "[вздох]",
+    "без звука", "тишина", "музыка", "молчание", "молчал", "молчит", "шум",
+    "неразборчиво", "неразборчивый текст", "шумы", "помехи", "неразборчивая речь",
+)
 
 def get_md5(text: str) -> str:
     return hashlib.md5(text.strip().encode("utf-8")).hexdigest()
@@ -78,6 +90,83 @@ CHECK_PROMPT_TEMPLATE = """
 Отчёт:
 {text}
 """
+
+CLASSIFY_PROMPT_TEMPLATE = """
+Ты определяешь тип отчёта строительного рабочего по СМЫСЛУ его речи — СТАТУС, ФАКТ, или оба сразу.
+
+СТАТУС — рабочий рассказывает, что делал за КОРОТКИЙ, недавний период (последние 1-2 часа,
+с утра, прямо сейчас).
+Слова-сигналы: "за последние 2 часа", "за последний час", "с утра", "только что", "сейчас", "буквально".
+
+ФАКТ — рабочий подводит ИТОГ ВСЕГО рабочего дня целиком: что сделано за весь день.
+Слова-сигналы: "за весь день", "на сегодня", "по итогам дня", "весь день", "в целом за день".
+
+Определяй не только по этим словам буквально, но и по смыслу — если рабочий сказал то же
+самое другими словами (например, "с самого начала смены" — это тоже про весь день = ФАКТ).
+
+Если рабочий В ОДНОМ сообщении говорит И про короткий период (статус), И про итог всего дня
+(факт) — раздели его речь на два отдельных фрагмента и верни classification = "mixed".
+
+Если по тексту невозможно понять, идёт речь о коротком периоде или о всём дне (нет ни
+слов-сигналов, ни ясного смысла периода) — верни classification = "undetermined". НЕ угадывай
+в этом случае.
+
+Ответь только JSON:
+{{
+"classification": "status" или "daily_fact" или "mixed" или "undetermined",
+"status_part": "часть текста про короткий период, если classification = status или mixed, иначе пустая строка",
+"fact_part": "часть текста про итог дня, если classification = daily_fact или mixed, иначе пустая строка"
+}}
+
+Текст рабочего:
+{text}
+"""
+
+def classify_report_type(text: str) -> dict:
+    """Dedicated classification step, run BEFORE the quality check (check_status) and
+    BEFORE any time-based assumption. Decides purely by meaning/trigger words whether a
+    report is about a short recent period (status) or the whole day (daily_fact) - the
+    submission time no longer forces the type. Can also detect a single message that mixes
+    both ("mixed", split into status_part/fact_part) or one where the period genuinely
+    can't be told ("undetermined" - never guessed, flagged for manual review instead)."""
+    default = {"classification": "undetermined", "status_part": "", "fact_part": ""}
+    lower_src = text.lower().strip()
+    if not lower_src or any(marker in lower_src for marker in _NO_CONTENT_MARKERS):
+        # No real speech to classify - let check_status's existing silence/hallucination
+        # handling take over exactly as before; "status" here is an arbitrary placeholder,
+        # normalize_ai_result's override produces the same result/message either way.
+        return {"classification": "status", "status_part": text, "fact_part": ""}
+    if groq_client is None:
+        return default
+    h = get_md5(f"classify:{text}")
+    if h in _ai_classify_cache:
+        return _ai_classify_cache[h]
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "Отвечай только валидным JSON без Markdown."},
+                {"role": "user", "content": CLASSIFY_PROMPT_TEMPLATE.format(text=text)},
+            ],
+            max_tokens=300,
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content.strip()
+        data = json.loads(raw)
+        classification = str(data.get("classification", "")).strip().lower()
+        if classification not in ("status", "daily_fact", "mixed", "undetermined"):
+            classification = "undetermined"
+        result = {
+            "classification": classification,
+            "status_part": str(data.get("status_part") or "").strip(),
+            "fact_part": str(data.get("fact_part") or "").strip(),
+        }
+        _ai_classify_cache[h] = result
+        return result
+    except Exception as e:
+        logger.error(f"Ошибка классификации типа отчёта (статус/факт): {e}")
+        return default
 
 CLEAN_REPORT_PROMPT = """
 Ты — технический специалист, который оформляет отчёты строительной бригады.
