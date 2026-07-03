@@ -304,23 +304,35 @@ async def _flush_media_batch(user_id: int, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots: set, worker_name: str = "?"):
-    """Attributes a status video to the schedule slot closest to it in clock time, among
-    slots not yet submitted today. Pure nearest-by-distance — no "must already be due"
-    gate. The previous version only ever considered a slot once its clock time had
+    """Attributes a status video to the schedule slot closest to it in clock time — always
+    the globally nearest slot, submitted or not. Pure nearest-by-distance, no "must already
+    be due" gate. The previous version only ever considered a slot once its clock time had
     numerically passed, so a video sent a few minutes BEFORE the next slot (e.g. 11:58 for
     a 12:00 slot) fell through to the older, already-passed 10:00 slot instead of the
     obviously-intended 12:00 one. Distance-based matching fixes that at the root, for every
     slot pair, instead of special-casing the boundary.
+
+    BUG FIX: this used to exclude already-submitted slots from consideration entirely
+    (`[s for s in schedule if s not in submitted_slots]`). That meant a second video sent
+    for a slot that was already submitted just minutes earlier - e.g. one more clip at
+    12:00 when 12:00 was already recorded - got excluded and reattributed to the nearest
+    UNSUBMITTED slot instead, which can be hours away (observed: a video at 12:00 with
+    12:00 already submitted got attributed to 10:00, 120 minutes off, purely because 12:00
+    was filtered out of the candidate list). There was never a real need for this filter:
+    once the nearest slot is chosen (submitted or not), the caller's existing-report lookup
+    (get_existing_report_row) is exactly what decides whether this is a fresh report or a
+    merge/addendum to the one already there - that's the correct place to react to "already
+    submitted", not here. submitted_slots is kept as a parameter purely for the diagnostic
+    log line below.
 
     Once a slot is picked, "вовремя" means received any time up to and including
     STATUS_LATE_TOLERANCE_MIN (grace period) minutes after the slot's clock time — an early
     submission is never late, no matter how early; only later than the grace period counts
     as "прислал поздно" (опоздание)."""
     current_mins = now.hour * 60 + now.minute
-    candidates = [s for s in schedule if s not in submitted_slots] or list(schedule)
 
     best_slot, best_diff = None, None
-    for slot in candidates:
+    for slot in schedule:
         h, m = map(int, slot.split(":"))
         diff = abs(current_mins - (h * 60 + m))
         if best_diff is None or diff < best_diff:
