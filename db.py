@@ -21,11 +21,10 @@ DB_PATH = os.environ.get("DB_PATH", "workers.db")
 DEFAULT_GROUP_ID = int(os.environ.get("GROUP_ID", "-1003804380536"))
 LOCAL_TZ = ZoneInfo("Europe/Chisinau")
 LATE_THRESHOLD_MIN = 15  # used for reminders / "expected" counting - when a slot is considered due
-# Acceptance window for an actually-submitted status: -30/+60 minutes around the slot's
-# clock time is still "on time" (just flagged late outside that). Single source of truth,
-# shared by report_handlers.py (slot attribution) and bot.py (missed-status reminder), so
-# the "still within your window" and "you missed it, explain why" checks can't disagree.
-STATUS_EARLY_TOLERANCE_MIN = 30
+# How many minutes after a slot's clock time a status is still accepted as "on time" (an
+# early submission is never late, no matter how early). Single source of truth, shared by
+# report_handlers.py (slot attribution) and bot.py (missed-status reminder), so the "still
+# within your window" and "you missed it, explain why" checks can't disagree.
 STATUS_LATE_TOLERANCE_MIN = 60
 
 # Read ADMIN_IDS from environment variables
@@ -1502,9 +1501,10 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                             try:
                                 rh, rm = int(received_at[0:2]), int(received_at[3:5])
                                 diff_mins = (rh * 60 + rm) - (hour * 60 + minute)
-                                # Acceptance window for a slot: -30/+60 минут от планового времени.
-                                # Всё за пределами окна (и рано, и поздно) — единая пометка "Прислал поздно".
-                                if diff_mins < -30 or diff_mins > 60:
+                                # BUG FIX: an early submission (diff_mins negative) must never
+                                # be labelled "Прислал поздно" - опоздание only means sent
+                                # LATER than the acceptance window (+60 мин от слота).
+                                if diff_mins > STATUS_LATE_TOLERANCE_MIN:
                                     note_parts.append(f"Прислал поздно, в {received_at[:5]}")
                                     is_late_submit = True
                             except (ValueError, IndexError):

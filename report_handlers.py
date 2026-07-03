@@ -54,7 +54,7 @@ from db import (
     get_pending_unregistered_user, save_pending_unregistered_user,
     delete_pending_unregistered_user, bind_worker_id, async_sync_gsheets_background,
     get_db, run_db, is_admin, ADMIN_IDS, DEFAULT_GROUP_ID, SCHEDULES, SCHEDULE_A,
-    STATUS_EARLY_TOLERANCE_MIN, STATUS_LATE_TOLERANCE_MIN,
+    STATUS_LATE_TOLERANCE_MIN,
     now_local, is_quiet_mode_enabled, get_worker_target_group,
     get_group_name, get_pending_reason_requests, resolve_pending_reason_requests,
     get_missed_status_reason, check_and_update_remark_alert_threshold, get_recent_remarks,
@@ -116,7 +116,7 @@ def format_status_or_fact_line(report_type: str, slot_time: str | None, report_d
         return f"Факт за {formatted_date}"
     else:
         slot_str = slot_time or "Неизвестно"
-        return f"Статус за {slot_str} за {formatted_date}"
+        return f"Статус за {formatted_date} в {slot_str}"
 
 def update_message_metadata(original_text: str, is_ok: bool | None = None, comment: str | None = None, status_val: str | None = None, is_manual: bool = False) -> str:
     lines = original_text.split("\n")
@@ -308,14 +308,18 @@ def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots:
     h, m = map(int, best_slot.split(":"))
     slot_mins = h * 60 + m
     signed_diff = current_mins - slot_mins
-    is_late = signed_diff < -STATUS_EARLY_TOLERANCE_MIN or signed_diff > STATUS_LATE_TOLERANCE_MIN
+    # BUG FIX: "опоздание" must only mean sent LATER than the acceptance window - an early
+    # submission (signed_diff negative) is never late, no matter how early. The previous
+    # version also flagged anything sent too far EARLY as "late", which is exactly backwards
+    # (e.g. a video sent at 08:10 for a 10:00 slot was being marked "прислал поздно").
+    is_late = signed_diff > STATUS_LATE_TOLERANCE_MIN
 
     logger.info(
         "[Определение времени] Получено видео. "
         f"Сотрудник: {worker_name}. "
         f"Время Telegram (локальное, Europe/Chisinau): {now.strftime('%H:%M:%S')} ({now.strftime('%d.%m.%Y')}). "
         f"Расписание: {schedule}. Уже сдано сегодня: {sorted(submitted_slots) or 'ничего'}. "
-        f"Допустимые рамки приёма: -{STATUS_EARLY_TOLERANCE_MIN}/+{STATUS_LATE_TOLERANCE_MIN} мин от времени слота. "
+        f"Допустимое опоздание: до +{STATUS_LATE_TOLERANCE_MIN} мин от времени слота (ранняя отправка опозданием не считается). "
         f"Определено окно сдачи: {best_slot} (расстояние {best_diff} мин). "
         f"Результат: видео успешно привязано к статусу за {best_slot}"
         + (f", прислал поздно (получено в {now.strftime('%H:%M')})." if is_late else ", вовремя.")
@@ -439,9 +443,14 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
 
         try:
             if ai_res["is_ok"]:
-                await upd.message.reply_text(f"✅ Факт получен и принят без замечаний!", parse_mode="Markdown")
+                await upd.message.reply_text("✅ Факт получен и принят без замечаний.")
             else:
-                await upd.message.reply_text(f"⚠️ Факт получен.\n{ai_res['employee_message']}", parse_mode="Markdown")
+                await upd.message.reply_text(
+                    "❌ Факт проверен.\n"
+                    "Факт НЕ ОК.\n"
+                    "Пожалуйста, самостоятельно просмотрите отправленное видео. "
+                    "Вероятно, при записи отчета были допущены ошибки."
+                )
         except Exception as e:
             logger.warning(f"Не удалось отправить личный фидбек по факту пользователю {user_id}: {e}")
 
@@ -630,26 +639,25 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         # So we DO NOT forward the evaluation text of "status" reports to admins in their personal chats!
         # Status reports won't spam admins anymore.
 
-        # Reply directly to the employee in their DM for each video
-        employee_messages = []
-        for idx, s_item in enumerate(status_items, start=1):
-            res = s_item["ai_res"]
-            if not res["is_ok"]:
-                employee_messages.append(f"Видео {idx}: {res['employee_message']}")
-
-        suffix_tail = f" (видео 1-{len(status_items)})" if len(status_items) > 1 else ""
-        time_str = status_now.strftime("%H:%M")
-        late_str = " — прислал поздно" if is_late else ""
-        info_suffix = f" за статус *{slot_time}*{suffix_tail} принят в *{time_str}*{late_str}"
+        # Reply directly to the employee in their DM for each video.
+        # Short, non-technical wording only - the detailed per-video remarks stay in the
+        # group/Sheets notification, not in the employee's personal feedback.
+        if overall_is_ok:
+            personal_text = f"✅ Статус за {slot_time} принят без замечаний."
+            if is_late:
+                personal_text += " Статус получен позже установленного времени."
+        else:
+            personal_text = (
+                "❌ Статус проверен.\n"
+                "Статус НЕ ОК.\n"
+                "Пожалуйста, самостоятельно просмотрите отправленное видео. "
+                "Вероятно, при записи отчета были допущены ошибки."
+            )
 
         for s_item in status_items:
             upd = s_item["upd"]
             try:
-                if overall_is_ok:
-                    await upd.message.reply_text(f"✅ Отчёт{info_suffix} принят без замечаний!", parse_mode="Markdown")
-                else:
-                    msg = "Есть замечания по видео-статусам:\n" + "\n".join(employee_messages)
-                    await upd.message.reply_text(f"⚠️ Отчёт{info_suffix}.\n{msg}", parse_mode="Markdown")
+                await upd.message.reply_text(personal_text)
             except Exception as e:
                 logger.warning(f"Не удалось отправить личный фидбек по статусу пользователю {user_id}: {e}")
 
@@ -709,14 +717,14 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 new_format_comment = rebuild_format_comment(video_items)
                 new_overall_ok = all(item["is_ok"] for item in video_items)
-                new_action = f"Комментарий видео {video_num} изменен администратором вручную: {new_comment}"
+                new_action = f"Комментарий видео {video_num} изменен отделом контроля складовки вручную: {new_comment}"
                 conn.execute(
                     "UPDATE reports SET format_comment = ?, is_ok = ?, required_action = ? WHERE id = ?",
                     (new_format_comment, 1 if new_overall_ok else 0, new_action, report_id)
                 )
             else:
                 # We are editing the overall / general comment!
-                new_action = f"Комментарий изменен администратором вручную: {new_comment}"
+                new_action = f"Комментарий изменен отделом контроля складовки вручную: {new_comment}"
                 conn.execute(
                     "UPDATE reports SET format_comment = ?, required_action = ? WHERE id = ?",
                     (new_comment, new_action, report_id)
@@ -777,12 +785,31 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if update.message.text:
                     reason_text = update.message.text.strip()
                     if reason_text and reason_text != "❌ Отмена":
-                        await run_db(resolve_pending_reason_requests, user_id, reason_text)
+                        resolved_slots = await run_db(resolve_pending_reason_requests, user_id, reason_text)
                         async_sync_gsheets_background()
                         await update.message.reply_text(
                             "✅ Спасибо, причина зафиксирована. Теперь можете отправить видео-отчёт.",
                             reply_markup=menu_for_user(user_id, update.effective_chat.type)
                         )
+                        # Forward the reason to the control department group, tagged to the
+                        # exact missed slot(s) it was given for (already stored per-slot in
+                        # missed_status_reasons, not against "now").
+                        w_name = f"{worker['last_name']} {worker['first_name']}"
+                        dest_chat = await run_db(get_worker_target_group, worker)
+                        slots_str = ", ".join(
+                            f"{p['slot_time']} ({format_show_date(p['report_date'])})" for p in resolved_slots
+                        )
+                        try:
+                            await context.bot.send_message(
+                                chat_id=dest_chat,
+                                text=(
+                                    f"📋 Причина несдачи статуса — {w_name}\n"
+                                    f"Пропущено: {slots_str}\n"
+                                    f"Причина: {reason_text}"
+                                )
+                            )
+                        except Exception as e:
+                            logger.error(f"Не удалось переслать причину несдачи статуса в группу: {e}")
                         return
 
         if update.message.text:
@@ -878,7 +905,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await update.message.reply_text(
                 "Ошибка: Вы не зарегистрированы в системе авторизации бота.\n"
-                "Ваш отчет отправлен администраторам как временный.\n\n"
+                "Ваш отчет отправлен в отдел контроля складовки как временный.\n\n"
                 "Нажмите кнопку ниже, чтобы зарегистрироваться:",
                 reply_markup=ReplyKeyboardMarkup([["🔑 Начать регистрацию"]], resize_keyboard=True)
             )
@@ -1057,17 +1084,24 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         w_name = f"{worker['last_name']} {worker['first_name']}"
         if ai_res["report_type"] == "status" and not ai_res["is_ok"]:
             await notify_admins_if_remark_threshold_crossed(context, user_id, w_name)
-        time_str = now.strftime("%H:%M")
-        if ai_res["report_type"] == "status" and nearest_slot:
-            late_str = " — прислал поздно" if is_late else ""
-            info_suffix = f" за статус *{nearest_slot}* принят в *{time_str}*{late_str}"
-        else:
-            info_suffix = f" — факт получен в *{time_str}*"
+        is_status = ai_res["report_type"] == "status" and nearest_slot
+        label = "Статус" if is_status else "Факт"
 
         if ai_res["is_ok"]:
-            await update.message.reply_text(f"✅ Отчёт{info_suffix} успешно проверен ИИ и принят без замечаний! Спасибо.", parse_mode="Markdown")
+            if is_status:
+                personal_text = f"✅ Статус за {nearest_slot} принят без замечаний."
+                if is_late:
+                    personal_text += " Статус получен позже установленного времени."
+            else:
+                personal_text = "✅ Факт получен и принят без замечаний."
+            await update.message.reply_text(personal_text)
         else:
-            await update.message.reply_text(f"⚠️ Отчёт{info_suffix}.\nОценка отчета: {ai_res['employee_message']}", parse_mode="Markdown")
+            await update.message.reply_text(
+                f"❌ {label} проверен.\n"
+                f"{label} НЕ ОК.\n"
+                f"Пожалуйста, самостоятельно просмотрите отправленное видео. "
+                f"Вероятно, при записи отчета были допущены ошибки."
+            )
 
         dest_chat = await run_db(get_worker_target_group, worker)
         title_text = f"Отчет обновлен: {w_name}" if is_addon else w_name
@@ -1112,7 +1146,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await query.answer("У вас нет прав администратора.", show_alert=True)
+        await query.answer("Это действие доступно только отделу контроля складовки.", show_alert=True)
         return
         
     data = query.data

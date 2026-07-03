@@ -205,13 +205,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id) and await run_db(get_worker, user_id) is None:
-        await update.message.reply_text("Эта команда доступна только сотрудникам и администраторам.")
+        await update.message.reply_text("Эта команда доступна только сотрудникам и отделу контроля складовки.")
         return
     await update.message.reply_text("🏆 Рейтинг лучших сотрудников формируется в Google Таблице во вкладке 'Аналитика'.")
 
 async def set_object_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Эта команда доступна только администраторам.")
+        await update.message.reply_text("Эта команда доступна только отделу контроля складовки.")
         return
     args = context.args
     if not args:

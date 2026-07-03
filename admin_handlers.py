@@ -113,7 +113,7 @@ def numbered_workers_keyboard(rows):
 async def require_admin_check(update: Update) -> bool:
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("Эта функция доступна только администраторам.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("Эта функция доступна только отделу контроля складовки.", reply_markup=ReplyKeyboardRemove())
         return False
     if update.effective_chat.type != "private":
         try:
@@ -411,7 +411,10 @@ async def add_worker_needs_daily_fact(update: Update, context: ContextTypes.DEFA
     new_worker_row = await run_db(get_worker, context.user_data["new_worker_id"])
     target_group_id = await run_db(get_worker_target_group, new_worker_row)
     try:
-        notify_msg = f"👤 {context.user_data['last_name']} {context.user_data['first_name']} добавлен в систему, ID: {context.user_data['new_worker_id']}"
+        notify_msg = (
+            f"✅ В чат успешно добавлен новый сотрудник.\n"
+            f"{context.user_data['last_name']} {context.user_data['first_name']}"
+        )
         await context.bot.send_message(chat_id=target_group_id, text=notify_msg)
     except Exception:
         pass
@@ -667,7 +670,7 @@ async def edit_worker_not_working_reason(update: Update, context: ContextTypes.D
             is_late=False,
             format_comment=reason,
             required_action="Не работает",
-            raw_text=f"Отмечено администратором: не работает. Причина: {reason}"
+            raw_text=f"Отмечено отделом контроля складовки: не работает. Причина: {reason}"
         )
     async_sync_gsheets_background()
     await update.message.reply_text(
@@ -853,10 +856,9 @@ async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data.clear()
     await update.message.reply_text(
-        "<b>Шаг 1 из 3</b>\n\n"
-        "Пожалуйста, введите Вашу фамилию латинскими буквами, как она записана в базе сотрудников.\n\n"
-        "Например: <b>Popescu</b>\n\n"
-        "Введите фамилию в поле сообщения внизу экрана и нажмите «Отправить».",
+        "Пожалуйста, введите Вашу фамилию латинскими буквами.\n\n"
+        "Например: <b>Ivanov</b>\n\n"
+        "Затем введите Вашу фамилию в поле сообщения и нажмите кнопку «Отправить».",
         parse_mode="HTML", reply_markup=CANCEL_KEYBOARD
     )
     return ASK_REG_LAST_NAME
@@ -911,7 +913,7 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
         await _notify_admins_registration_issue(context, update, "already_registered", text, matches=already_registered)
         await update.message.reply_text(
             "⚠️ Сотрудник с такой фамилией уже зарегистрирован в системе.\n\n"
-            "Если это ошибка — не переживайте, администратор уже получил уведомление и свяжется с Вами.",
+            "Если это ошибка — не переживайте, отдел контроля складовки уже получил уведомление и свяжется с Вами.",
             reply_markup=menu_for_user(user_id)
         )
         context.user_data.clear()
@@ -925,8 +927,8 @@ async def register_lastname_received(update: Update, context: ContextTypes.DEFAU
         f"❌ Мы не смогли найти сотрудника с фамилией <b>{html.escape(text)}</b>.\n\n"
         f"Проверьте правильность написания фамилии — используйте латинские буквы.\n"
         f"Например: Popescu\n\n"
-        f"Администратор уже получил уведомление о Вашем обращении и добавит Вас в систему.\n\n"
-        f"Если хотите, поделитесь номером телефона — это поможет администратору связаться с Вами быстрее. "
+        f"Отдел контроля складовки уже получил уведомление о Вашем обращении и добавит Вас в систему.\n\n"
+        f"Если хотите, поделитесь номером телефона — это поможет отделу контроля складовки связаться с Вами быстрее. "
         f"Нажмите кнопку «📱 Поделиться контактом» внизу экрана, либо «Пропустить», если не хотите:",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardMarkup(
@@ -947,13 +949,13 @@ async def register_contact_received(update: Update, context: ContextTypes.DEFAUL
             phone=contact.phone_number
         )
         await update.message.reply_text(
-            "✅ Спасибо! Ваш номер телефона передан администратору.\n\n"
-            "Администратор свяжется с Вами и добавит Вас в систему.",
+            "✅ Спасибо! Ваш номер телефона передан в отдел контроля складовки.\n\n"
+            "Отдел контроля складовки свяжется с Вами и добавит Вас в систему.",
             reply_markup=menu_for_user(user_id)
         )
     else:
         await update.message.reply_text(
-            "Хорошо. Администратор свяжется с Вами и добавит Вас в систему.",
+            "Хорошо. Отдел контроля складовки свяжется с Вами и добавит Вас в систему.",
             reply_markup=menu_for_user(user_id)
         )
     context.user_data.clear()
@@ -997,7 +999,7 @@ async def register_confirm_received(update: Update, context: ContextTypes.DEFAUL
             await update.message.reply_text(
                 "❌ Произошла ошибка при регистрации.\n\n"
                 "Пожалуйста, нажмите кнопку «🔑 Начать регистрацию» внизу экрана, чтобы попробовать ещё раз, "
-                "или обратитесь к администратору.",
+                "или обратитесь в отдел контроля складовки.",
                 reply_markup=ReplyKeyboardMarkup([["🔑 Начать регистрацию"]], resize_keyboard=True)
             )
             context.user_data.clear()
@@ -1022,7 +1024,7 @@ async def register_confirm_received(update: Update, context: ContextTypes.DEFAUL
     context.user_data.pop("reg_candidate", None)
     await update.message.reply_text(
         "Хорошо, попробуем ещё раз.\n\n"
-        "Введите Вашу фамилию латинскими буквами в поле сообщения внизу экрана, либо обратитесь к администратору:",
+        "Введите Вашу фамилию латинскими буквами в поле сообщения внизу экрана, либо обратитесь в отдел контроля складовки:",
         reply_markup=CANCEL_KEYBOARD
     )
     return ASK_REG_LAST_NAME
