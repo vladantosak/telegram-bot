@@ -247,6 +247,19 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sheet_cell_sync (
+            telegram_id INTEGER,
+            report_date TEXT,
+            slot_label TEXT,
+            checked INTEGER,
+            note TEXT,
+            color_tag TEXT,
+            PRIMARY KEY (telegram_id, report_date, slot_label)
+        )
+        """
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_date ON reports(report_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_worker_date ON reports(telegram_id, report_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_workers_pos ON workers(position)")
@@ -1119,8 +1132,85 @@ def read_excel(file_path: str) -> list[dict]:
                 row_dict["sort_order"] = 0
                 
             workers.append(row_dict)
-            
+
     return workers
+
+# Known Сводка cell background colors the bot itself paints (see sync_gsheets_task) - used
+# to tell "this color is one the bot could have set" apart from a manually chosen highlight.
+_KNOWN_CELL_COLOR_TAGS = {
+    "yellow": {"red": 1.0, "green": 0.95, "blue": 0.6},
+    "pink": {"red": 0.96, "green": 0.78, "blue": 0.78},
+    "grey": {"red": 0.85, "green": 0.85, "blue": 0.85},
+}
+
+def _color_to_tag(color: dict | None) -> str:
+    """Turns a Sheets backgroundColor object into "none"/"yellow"/"pink"/"grey", or a
+    "custom:r,g,b" tag for any other color a human chose by hand, so it can be told apart
+    from the bot's own palette and restored exactly if it needs to be preserved."""
+    if not color:
+        return "none"
+    for tag, known in _KNOWN_CELL_COLOR_TAGS.items():
+        if all(abs(color.get(k, 0) - known[k]) < 0.01 for k in ("red", "green", "blue")):
+            return tag
+    r, g, b = color.get("red", 1), color.get("green", 1), color.get("blue", 1)
+    return f"custom:{r:.3f},{g:.3f},{b:.3f}"
+
+def _color_tag_to_dict(tag: str | None) -> dict | None:
+    if not tag or tag == "none":
+        return None
+    if tag in _KNOWN_CELL_COLOR_TAGS:
+        return _KNOWN_CELL_COLOR_TAGS[tag]
+    if tag.startswith("custom:"):
+        try:
+            r, g, b = (float(x) for x in tag[len("custom:"):].split(","))
+            return {"red": r, "green": g, "blue": b}
+        except (ValueError, IndexError):
+            return None
+    return None
+
+def _resolve_manual_preserving_cell(sync_map: dict, old_entry: dict | None, key: tuple,
+                                     fresh_checked: bool, fresh_note: str | None, fresh_color_tag: str) -> tuple:
+    """Core of the "не перезаписывать ручные изменения" fix. Compares what the sheet
+    currently shows for this cell (old_entry, read fresh from the sheet right before this
+    sync) against what the bot itself last wrote there (sync_map, our own persistent
+    record in sheet_cell_sync). If the two match, nothing has happened to this cell by hand
+    since our last write, so it's safe to apply the newly computed value/note/color. If they
+    differ, someone (отдел контроля) changed the checkbox, note or highlight color directly
+    in Google Sheets since then - their edit is kept exactly as-is and adopted as the new
+    baseline, instead of being silently reverted on this sync.
+    Returns (final_checked, final_note, final_color_tag)."""
+    sheet_checked = old_entry.get("bool") if old_entry else None
+    sheet_note = (old_entry.get("note") if old_entry else None) or ""
+    sheet_color_tag = (old_entry.get("color_tag") if old_entry else None) or "none"
+
+    sync_entry = sync_map.get(key)
+    if sync_entry is None:
+        # First time this cell has ever been tracked (new deploy, or a brand new cell) -
+        # nothing to compare against yet, so there's nothing manual to protect.
+        unchanged_since_last_sync = True
+    else:
+        unchanged_since_last_sync = (
+            bool(sync_entry.get("checked")) == bool(sheet_checked)
+            and (sync_entry.get("note") or "") == sheet_note
+            and (sync_entry.get("color_tag") or "none") == sheet_color_tag
+        )
+
+    if unchanged_since_last_sync:
+        return fresh_checked, fresh_note, fresh_color_tag
+    return (sheet_checked if sheet_checked is not None else fresh_checked), (sheet_note or None), sheet_color_tag
+
+def get_sheet_cell_sync_map(telegram_id: int, start_date: str, end_date: str) -> dict:
+    """What the bot itself last wrote to each Сводка cell for this worker - the baseline
+    used to tell a genuine data update apart from a manual edit made directly in the sheet
+    (see _process_worker in sync_gsheets_task)."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT report_date, slot_label, checked, note, color_tag FROM sheet_cell_sync "
+        "WHERE telegram_id = ? AND report_date >= ? AND report_date <= ?",
+        (telegram_id, start_date, end_date)
+    ).fetchall()
+    conn.close()
+    return {(r["report_date"], r["slot_label"]): dict(r) for r in rows}
 
 def sync_gsheets_task() -> tuple[bool, str | None]:
     try:
@@ -1358,9 +1448,11 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                         if idx >= len(vals):
                             continue
                         cell = vals[idx]
+                        cell_format = cell.get("effectiveFormat", {}) or {}
                         old_map[(current_name, slot_cell_text, date_label)] = {
                             "bool": cell.get("effectiveValue", {}).get("boolValue"),
-                            "note": cell.get("note")
+                            "note": cell.get("note"),
+                            "color_tag": _color_to_tag(cell_format.get("backgroundColor"))
                         }
         except Exception:
             old_map = {}
@@ -1398,6 +1490,7 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
         format_requests = []
         note_requests = []
         checkbox_ranges = []
+        sheet_sync_updates = []  # (telegram_id, report_date, slot_label, checked, note, color_tag)
 
         # Legend rows, matching the reference sheet: a colored swatch in column A, label in column B
         rows_summary = []
@@ -1468,6 +1561,13 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                 ).fetchall()
             }
 
+            sync_rows = conn_sum.execute(
+                "SELECT report_date, slot_label, checked, note, color_tag FROM sheet_cell_sync "
+                "WHERE telegram_id = ? AND report_date >= ? AND report_date <= ?",
+                (w["telegram_id"], start_str, end_str)
+            ).fetchall()
+            sync_map = {(r["report_date"], r["slot_label"]): dict(r) for r in sync_rows}
+
             name_text = f"{w['last_name']} {w['first_name']} ({clean_position(w['position'])})"
             worker_start_row = len(rows_summary)
             first_tracked_col = None
@@ -1496,10 +1596,10 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                     else:
                         rep = status_map.get((d_str, slot))
                         if rep is not None:
-                            cell_value = True
+                            fresh_checked = True
                             note_parts = []
+                            fresh_color_tag = "none"
                             received_at = rep["received_at"] or ""
-                            is_late_submit = False
                             try:
                                 rh, rm = int(received_at[0:2]), int(received_at[3:5])
                                 diff_mins = (rh * 60 + rm) - (hour * 60 + minute)
@@ -1508,50 +1608,50 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                                 # LATER than the acceptance window (+60 мин от слота).
                                 if diff_mins > STATUS_LATE_TOLERANCE_MIN:
                                     note_parts.append(f"Прислал поздно, в {received_at[:5]}")
-                                    is_late_submit = True
+                                    fresh_color_tag = "yellow"
                             except (ValueError, IndexError):
                                 pass
                             if not rep["is_ok"]:
                                 issues = extract_issue_lines(rep["format_comment"])
                                 note_parts.extend(issues if issues else ["Есть замечание"])
-                            if note_parts:
-                                fresh_note = "\n".join(note_parts)
-                            if is_late_submit:
-                                format_requests.append({
-                                    "repeatCell": {
-                                        "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
-                                                  "endRowIndex": len(rows_summary) + 1,
-                                                  "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
-                                        "cell": {"userEnteredFormat": {"backgroundColor": YELLOW}},
-                                        "fields": "userEnteredFormat(backgroundColor)"
-                                    }
-                                })
+                            fresh_note = "\n".join(note_parts) if note_parts else None
                         else:
-                            cell_value = False
-                            if old_entry and old_entry.get("bool") is True:
-                                cell_value = True  # a manual tick in the sheet always wins over "missed"
-                            else:
-                                fresh_note = missed_reasons.get((d_str, slot))
-                                format_requests.append({
-                                    "repeatCell": {
-                                        "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
-                                                  "endRowIndex": len(rows_summary) + 1,
-                                                  "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
-                                        "cell": {"userEnteredFormat": {"backgroundColor": PINK}},
-                                        "fields": "userEnteredFormat(backgroundColor)"
-                                    }
-                                })
+                            fresh_checked = False
+                            fresh_note = missed_reasons.get((d_str, slot))
+                            fresh_color_tag = "pink"
+
+                        # MAIN FIX: don't blindly apply the freshly computed value - only do
+                        # so if this cell is unchanged since the bot's own last sync. If
+                        # отдел контроля already ticked/unticked the box, edited the note, or
+                        # changed the highlight color directly in Sheets since then, that
+                        # manual edit is kept exactly as-is here instead of being overwritten.
+                        cell_value, fresh_note, color_tag = _resolve_manual_preserving_cell(
+                            sync_map, old_entry, (d_str, slot), fresh_checked, fresh_note, fresh_color_tag
+                        )
+                        color_dict = _color_tag_to_dict(color_tag)
+                        if color_dict:
+                            format_requests.append({
+                                "repeatCell": {
+                                    "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
+                                              "endRowIndex": len(rows_summary) + 1,
+                                              "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
+                                    "cell": {"userEnteredFormat": {"backgroundColor": color_dict}},
+                                    "fields": "userEnteredFormat(backgroundColor)"
+                                }
+                            })
+                        sheet_sync_updates.append(
+                            (w["telegram_id"], d_str, slot, int(bool(cell_value)), fresh_note, color_tag)
+                        )
 
                     row_cells.append(cell_value)
 
-                    note_to_set = fresh_note or (old_entry.get("note") if old_entry else None)
-                    if note_to_set:
+                    if fresh_note:
                         note_requests.append({
                             "updateCells": {
                                 "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
                                           "endRowIndex": len(rows_summary) + 1,
                                           "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
-                                "rows": [{"values": [{"note": note_to_set}]}],
+                                "rows": [{"values": [{"note": fresh_note}]}],
                                 "fields": "note"
                             }
                         })
@@ -1586,38 +1686,46 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                     else:
                         rep = fact_map.get(d_str)
                         if rep is not None:
-                            cell_value = True
+                            fresh_checked = True
                             note_parts = []
                             if not rep["is_ok"]:
                                 issues = extract_issue_lines(rep["format_comment"])
                                 note_parts.extend(issues if issues else ["Есть замечание"])
-                            if note_parts:
-                                fresh_note = "\n".join(note_parts)
+                            fresh_note = "\n".join(note_parts) if note_parts else None
+                            fresh_color_tag = "none"
                         else:
-                            cell_value = False
-                            if old_entry and old_entry.get("bool") is True:
-                                cell_value = True  # a manual tick in the sheet always wins over "missed"
-                            else:
-                                format_requests.append({
-                                    "repeatCell": {
-                                        "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
-                                                  "endRowIndex": len(rows_summary) + 1,
-                                                  "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
-                                        "cell": {"userEnteredFormat": {"backgroundColor": PINK}},
-                                        "fields": "userEnteredFormat(backgroundColor)"
-                                    }
-                                })
+                            fresh_checked = False
+                            fresh_note = None
+                            fresh_color_tag = "pink"
+
+                        # Same manual-edit-preserving check as the status rows above.
+                        cell_value, fresh_note, color_tag = _resolve_manual_preserving_cell(
+                            sync_map, old_entry, (d_str, "Факт"), fresh_checked, fresh_note, fresh_color_tag
+                        )
+                        color_dict = _color_tag_to_dict(color_tag)
+                        if color_dict:
+                            format_requests.append({
+                                "repeatCell": {
+                                    "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
+                                              "endRowIndex": len(rows_summary) + 1,
+                                              "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
+                                    "cell": {"userEnteredFormat": {"backgroundColor": color_dict}},
+                                    "fields": "userEnteredFormat(backgroundColor)"
+                                }
+                            })
+                        sheet_sync_updates.append(
+                            (w["telegram_id"], d_str, "Факт", int(bool(cell_value)), fresh_note, color_tag)
+                        )
 
                     row_cells.append(cell_value)
 
-                    note_to_set = fresh_note or (old_entry.get("note") if old_entry else None)
-                    if note_to_set:
+                    if fresh_note:
                         note_requests.append({
                             "updateCells": {
                                 "range": {"sheetId": ws_summary.id, "startRowIndex": len(rows_summary),
                                           "endRowIndex": len(rows_summary) + 1,
                                           "startColumnIndex": abs_col, "endColumnIndex": abs_col + 1},
-                                "rows": [{"values": [{"note": note_to_set}]}],
+                                "rows": [{"values": [{"note": fresh_note}]}],
                                 "fields": "note"
                             }
                         })
@@ -1726,6 +1834,17 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
                         f"[Сводка] Пропущен сотрудник {w['telegram_id']} ({w['last_name']} {w['first_name']}) из-за ошибки: {exc}"
                     )
 
+        # Persist what was actually rendered for every cell as the new "last known" baseline,
+        # so the next sync can tell a genuine data update apart from a manual sheet edit.
+        if sheet_sync_updates:
+            conn_sum.executemany(
+                "INSERT INTO sheet_cell_sync (telegram_id, report_date, slot_label, checked, note, color_tag) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(telegram_id, report_date, slot_label) DO UPDATE SET "
+                "checked=excluded.checked, note=excluded.note, color_tag=excluded.color_tag",
+                sheet_sync_updates
+            )
+        conn_sum.commit()
         conn_sum.close()
 
         grid_last_row = len(rows_summary)
