@@ -163,15 +163,18 @@ def make_report_keyboard(report_id: int, report_type: str | None = None) -> Inli
             report_type = "status"
             
     type_btn_text = "📋 Сделать Итогом дня" if report_type == "status" else "⏱ Сделать Статусом"
-    return InlineKeyboardMarkup([
+    rows = [
         [
             InlineKeyboardButton("🔄 Изменить оценку (ОК / НЕ ОК)", callback_data=f"fix_toggle_{report_id}"),
             InlineKeyboardButton("✏️ Изменить комментарий", callback_data=f"edit_comment_{report_id}")
         ],
-        [
-            InlineKeyboardButton(type_btn_text, callback_data=f"toggle_type_{report_id}")
-        ]
-    ])
+    ]
+    if report_type == "status":
+        # Lets an admin correct a report misattributed to the wrong schedule slot (e.g. the
+        # "nearest slot" pick landed on the wrong one) without having to delete and redo it.
+        rows.append([InlineKeyboardButton("🕐 Изменить время сдачи", callback_data=f"edit_time_{report_id}")])
+    rows.append([InlineKeyboardButton(type_btn_text, callback_data=f"toggle_type_{report_id}")])
+    return InlineKeyboardMarkup(rows)
 
 def make_video_selection_keyboard(report_id: int, action_type: str, video_items: list[dict]) -> InlineKeyboardMarkup:
     prefix = "tg" if action_type == "toggle" else "ed"
@@ -803,6 +806,113 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Ошибка при обновлении сообщения после редактирования комментария: {e}")
         return
 
+    if is_admin(user_id) and context.user_data.get("editing_slot_time_report_id"):
+        report_id = context.user_data["editing_slot_time_report_id"]
+        original_chat_id = context.user_data.get("editing_slot_time_chat_id")
+        original_msg_id = context.user_data.get("editing_slot_time_message_id")
+
+        context.user_data.pop("editing_slot_time_report_id", None)
+        context.user_data.pop("editing_slot_time_chat_id", None)
+        context.user_data.pop("editing_slot_time_message_id", None)
+        prompt_message_id = context.user_data.pop("editing_slot_time_prompt_message_id", None)
+
+        if prompt_message_id and original_chat_id:
+            try:
+                await context.bot.delete_message(chat_id=original_chat_id, message_id=prompt_message_id)
+            except Exception:
+                pass
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        new_time = update.message.text.strip() if update.message.text else ""
+        if not new_time or new_time.lower() in ("отмена", "❌ отмена"):
+            return
+
+        def _apply_manual_slot_time():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            if not r:
+                conn.close()
+                return None, None, None, "not_found"
+            w = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (r["telegram_id"],)).fetchone()
+            schedule = SCHEDULES.get(w["schedule"], SCHEDULE_A) if w else SCHEDULE_A
+
+            if new_time not in schedule:
+                conn.close()
+                return r, w, schedule, "invalid_time"
+
+            if new_time != r["slot_time"]:
+                # Guard against creating a second report for a slot that already has one -
+                # exactly the kind of duplicate-slot mess this button exists to clean up
+                # after, not create more of.
+                conflict = conn.execute(
+                    "SELECT id FROM reports WHERE telegram_id = ? AND report_date = ? "
+                    "AND report_type = 'status' AND slot_time = ? AND id != ?",
+                    (r["telegram_id"], r["report_date"], new_time, report_id)
+                ).fetchone()
+                if conflict:
+                    conn.close()
+                    return r, w, schedule, "conflict"
+
+            new_is_late = bool(r["is_late"])
+            try:
+                rh, rm = int(r["received_at"][0:2]), int(r["received_at"][3:5])
+                h, m = map(int, new_time.split(":"))
+                diff = (rh * 60 + rm) - (h * 60 + m)
+                new_is_late = diff > STATUS_LATE_TOLERANCE_MIN
+            except Exception:
+                pass
+
+            conn.execute("UPDATE reports SET slot_time = ?, is_late = ? WHERE id = ?", (new_time, int(new_is_late), report_id))
+            conn.commit()
+            r2 = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            conn.close()
+            return r2, w, schedule, "ok"
+
+        report, worker, schedule, status = await run_db(_apply_manual_slot_time)
+        if not report:
+            return
+
+        if status == "invalid_time":
+            try:
+                await context.bot.send_message(
+                    chat_id=original_chat_id or user_id,
+                    text=f"❌ Неверное время. Введите одно из значений расписания сотрудника: {', '.join(schedule)}."
+                )
+            except Exception:
+                pass
+            return
+
+        if status == "conflict":
+            try:
+                await context.bot.send_message(
+                    chat_id=original_chat_id or user_id,
+                    text=f"❌ У сотрудника уже есть отдельный отчёт за {new_time} в этот день. Слияние вручную не производится."
+                )
+            except Exception:
+                pass
+            return
+
+        async_sync_gsheets_background()
+
+        worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+        text, kbd = await render_report_message_from_row(report, worker_name)
+
+        if original_chat_id and original_msg_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=original_chat_id,
+                    message_id=original_msg_id,
+                    text=text,
+                    reply_markup=kbd,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Ошибка при обновлении сообщения после изменения времени сдачи: {e}")
+        return
+
     if is_admin(user_id):
         return
 
@@ -1255,6 +1365,33 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
         except Exception as e:
             logger.error(f"Ошибка при изменении типа отчета: {e}")
+        return
+
+    # 2b. Edit slot time -> ask for the correct time from this worker's own schedule
+    if data.startswith("edit_time_"):
+        report_id = int(data.split("_")[-1])
+
+        def _fetch_report_and_worker_for_time():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            w = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (r["telegram_id"],)).fetchone() if r else None
+            conn.close()
+            return r, w
+
+        report, worker = await run_db(_fetch_report_and_worker_for_time)
+        if not report or report["report_type"] != "status":
+            return
+
+        schedule = SCHEDULES.get(worker["schedule"], SCHEDULE_A) if worker else SCHEDULE_A
+        context.user_data["editing_slot_time_report_id"] = report_id
+        context.user_data["editing_slot_time_chat_id"] = query.message.chat.id
+        context.user_data["editing_slot_time_message_id"] = query.message.message_id
+
+        prompt_msg = await query.message.reply_text(
+            f"🕐 Введите правильное время сдачи из расписания сотрудника ({', '.join(schedule)}):\n(или введите «Отмена»)",
+            reply_markup=ForceReply(selective=True)
+        )
+        context.user_data["editing_slot_time_prompt_message_id"] = prompt_msg.message_id
         return
 
     # 3. Main Toggle Button -> Choose overall or video
