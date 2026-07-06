@@ -4,7 +4,7 @@ import re
 import asyncio
 import logging
 from datetime import datetime
-from telegram import ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply, Update
+from telegram import ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes, ConversationHandler
 
 def parse_video_comments(format_comment_str: str) -> list[dict]:
@@ -211,6 +211,15 @@ def make_report_actions_expanded_keyboard(report_id: int, report_type: str | Non
     rows.append(second_row)
     rows.append([InlineKeyboardButton("◀️ Свернуть", callback_data=f"actions_collapse_{report_id}")])
     return InlineKeyboardMarkup(rows)
+
+def make_cancel_edit_keyboard(report_id: int) -> InlineKeyboardMarkup:
+    """Real inline "❌ Отмена" button shown on a text-input prompt (edit comment/slot time),
+    replacing the old "(или введите «Отмена»)" text hint. A message can't carry both a
+    ForceReply and an inline keyboard, so these prompts are now sent as plain messages -
+    typing still works exactly as before (any next text from this admin is still picked up
+    by the editing_comment_*/editing_slot_time_* check in handle_report), this button is
+    just a faster, unambiguous way to back out."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data=f"cancel_edit_{report_id}")]])
 
 def make_video_selection_keyboard(report_id: int, action_type: str, video_items: list[dict]) -> InlineKeyboardMarkup:
     prefix = "tg" if action_type == "toggle" else "ed"
@@ -997,7 +1006,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
         position = clean_position(worker["position"]) if worker else "?"
         text, kbd = await render_report_message_from_row(report, worker_name, position)
-        
+
         if original_chat_id and original_msg_id:
             try:
                 await context.bot.edit_message_text(
@@ -1009,6 +1018,12 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as e:
                 logger.error(f"Ошибка при обновлении сообщения после редактирования комментария: {e}")
+
+        confirm_text = f"✅ Комментарий для Видео {video_num} обновлён." if video_num is not None else "✅ Комментарий обновлён."
+        try:
+            await context.bot.send_message(chat_id=original_chat_id or user_id, text=confirm_text)
+        except Exception as e:
+            logger.warning(f"Не удалось отправить подтверждение изменения комментария: {e}")
         return
 
     if is_admin(user_id) and context.user_data.get("editing_slot_time_report_id"):
@@ -1117,6 +1132,11 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as e:
                 logger.error(f"Ошибка при обновлении сообщения после изменения времени сдачи: {e}")
+
+        try:
+            await context.bot.send_message(chat_id=original_chat_id or user_id, text=f"✅ Время сдачи изменено на {new_time}.")
+        except Exception as e:
+            logger.warning(f"Не удалось отправить подтверждение изменения времени сдачи: {e}")
         return
 
     if is_admin(user_id):
@@ -1129,7 +1149,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Placed here (after the admin edit-comment/edit-time interception above, and after the
     # "is_admin -> return" gate) rather than at the very top of the function, because those
     # two admin flows legitimately happen IN the group chat - the "✏️ Изменить комментарий"/
-    # "🕐 Изменить время сдачи" ForceReply prompt is posted as a reply to the report card,
+    # "🕐 Изменить время сдачи" text-input prompt is posted as a reply to the report card,
     # which lives in the group, so the admin's reply also arrives there. By this point the
     # sender is confirmed to be a non-admin worker, so this check only ever affects them.
     if update.effective_chat.type != "private":
@@ -1583,6 +1603,55 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             logger.error(f"Ошибка при сворачивании меню действий отчёта {report_id}: {e}")
         return
 
+    # 0c. Cancel a pending text-input edit (comment - overall or a specific video - or slot
+    # time). Works no matter which of those was in flight (only one can be at a time per
+    # admin), pops every possible editing_* key defensively, deletes the prompt message this
+    # button lives on, and restores the report card to its normal collapsed state. No changes
+    # are saved.
+    if data.startswith("cancel_edit_"):
+        report_id = int(data.split("_")[-1])
+        original_chat_id = (
+            context.user_data.get("editing_comment_chat_id")
+            or context.user_data.get("editing_slot_time_chat_id")
+        )
+        original_msg_id = (
+            context.user_data.get("editing_comment_message_id")
+            or context.user_data.get("editing_slot_time_message_id")
+        )
+        for key in (
+            "editing_comment_report_id", "editing_comment_video_num", "editing_comment_chat_id",
+            "editing_comment_message_id", "editing_comment_original_text", "editing_comment_prompt_message_id",
+            "editing_slot_time_report_id", "editing_slot_time_chat_id", "editing_slot_time_message_id",
+            "editing_slot_time_prompt_message_id",
+        ):
+            context.user_data.pop(key, None)
+
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+        def _fetch_report_and_worker_for_cancel():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            w = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (r["telegram_id"],)).fetchone() if r else None
+            conn.close()
+            return r, w
+
+        report, worker = await run_db(_fetch_report_and_worker_for_cancel)
+        if report and original_chat_id and original_msg_id:
+            worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+            position = clean_position(worker["position"]) if worker else "?"
+            text, kbd = await render_report_message_from_row(report, worker_name, position)
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=original_chat_id, message_id=original_msg_id,
+                    text=text, reply_markup=kbd, parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Ошибка при восстановлении карточки отчёта {report_id} после отмены редактирования: {e}")
+        return
+
     # 1. Back to main menu
     if data.startswith("back_to_main_"):
         report_id = int(data.split("_")[-1])
@@ -1664,9 +1733,18 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data["editing_slot_time_chat_id"] = query.message.chat.id
         context.user_data["editing_slot_time_message_id"] = query.message.message_id
 
+        # Disable the card's own buttons while a text reply is pending - otherwise the
+        # expanded action menu stays live and clickable, and a second tap on it (e.g.
+        # "🕒 Изменить время" again, or another action) would silently overwrite this
+        # editing session instead of being blocked.
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
         prompt_msg = await query.message.reply_text(
-            f"🕐 Введите правильное время сдачи из расписания сотрудника ({', '.join(schedule)}):\n(или введите «Отмена»)",
-            reply_markup=ForceReply(selective=True)
+            f"🕐 Введите правильное время сдачи из расписания сотрудника ({', '.join(schedule)}):",
+            reply_markup=make_cancel_edit_keyboard(report_id)
         )
         context.user_data["editing_slot_time_prompt_message_id"] = prompt_msg.message_id
         return
@@ -1832,10 +1910,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             context.user_data["editing_comment_chat_id"] = query.message.chat.id
             context.user_data["editing_comment_message_id"] = query.message.message_id
             context.user_data["editing_comment_original_text"] = query.message.text
-            
+
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
             prompt_msg = await query.message.reply_text(
-                "✏️ Введите новый комментарий к отчету:\n(или введите «Отмена»)",
-                reply_markup=ForceReply(selective=True)
+                "✏️ Введите новый комментарий к отчету:",
+                reply_markup=make_cancel_edit_keyboard(report_id)
             )
             context.user_data["editing_comment_prompt_message_id"] = prompt_msg.message_id
         return
@@ -1848,10 +1931,18 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data["editing_comment_chat_id"] = query.message.chat.id
         context.user_data["editing_comment_message_id"] = query.message.message_id
         context.user_data["editing_comment_original_text"] = query.message.text
-        
+
+        # Disable the still-live "Видео 1/2/3" selection menu the moment ONE option is
+        # picked - this is what prevents a second, overlapping tap (e.g. on "Видео 2" while
+        # this prompt is pending) from silently hijacking the pending text capture.
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
         prompt_msg = await query.message.reply_text(
-            "✏️ Введите новый общий комментарий к отчету:\n(или введите «Отмена»)",
-            reply_markup=ForceReply(selective=True)
+            "✏️ Введите новый общий комментарий к отчету:",
+            reply_markup=make_cancel_edit_keyboard(report_id)
         )
         context.user_data["editing_comment_prompt_message_id"] = prompt_msg.message_id
         return
@@ -1861,16 +1952,23 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         parts = data.split("_")
         report_id = int(parts[2])
         video_num = int(parts[3])
-        
+
         context.user_data["editing_comment_report_id"] = report_id
         context.user_data["editing_comment_video_num"] = video_num
         context.user_data["editing_comment_chat_id"] = query.message.chat.id
         context.user_data["editing_comment_message_id"] = query.message.message_id
         context.user_data["editing_comment_original_text"] = query.message.text
+
+        # Same as ed_overall_ above - disable the video-selection menu immediately so a
+        # second "Видео N" tap can't land while this one's answer is still pending.
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         
         prompt_msg = await query.message.reply_text(
-            f"✏️ Введите новый комментарий для Видео {video_num}:\n(или введите «Отмена»)",
-            reply_markup=ForceReply(selective=True)
+            f"✏️ Введите новый комментарий для Видео {video_num}:",
+            reply_markup=make_cancel_edit_keyboard(report_id)
         )
         context.user_data["editing_comment_prompt_message_id"] = prompt_msg.message_id
         return
