@@ -1,4 +1,5 @@
 import os
+import re
 import hashlib
 import json
 import logging
@@ -14,15 +15,60 @@ _ai_clean_cache = {}
 _ai_classify_cache = {}
 
 # Same silence/hallucination signal words normalize_ai_result() already treats as "no real
-# report to analyze" - classify_report_type() checks this FIRST so a silent/garbled video
-# still goes straight to that existing, already-correct handling instead of being routed
-# into the new "undetermined, needs manual review" path (which is for genuinely ambiguous
-# real speech, not for videos with no real content at all).
+# report to analyze" - assess_transcription_quality() checks this FIRST, BEFORE the type
+# (status/fact) is ever considered, so a silent/garbled/meaningless video is recognized as a
+# speech-recognition problem at its own dedicated pipeline stage instead of being fed into
+# type classification at all.
 _NO_CONTENT_MARKERS = (
     "продолжение следует", "на видео молчал", "[без звука]", "[тишина]", "[вздох]",
     "без звука", "тишина", "музыка", "молчание", "молчал", "молчит", "шум",
     "неразборчиво", "неразборчивый текст", "шумы", "помехи", "неразборчивая речь",
 )
+
+# Prefixes transcribe_audio() itself uses to report a technical failure (API error, missing
+# key) rather than an actual transcription - treated as the same "couldn't get usable
+# speech" outcome as silence/noise, not as real (if odd) report content.
+_TRANSCRIPTION_ERROR_PREFIXES = (
+    "Ошибка распознавания аудио",
+    "Не задан GROQ_API_KEY",
+)
+
+# Tunable thresholds for assess_transcription_quality(). Both are 0 (no minimum) per current
+# product decision: rather than reject on an arbitrary duration/word-count cutoff, quality is
+# judged by whether the transcription is genuinely empty, is a known silence/noise marker, or
+# is a technical transcription error - a real (even if short/terse) transcribed report is
+# left for the normal is_ok/issue content check further down the pipeline, not rejected here.
+MIN_REPORT_DURATION_SECONDS = 0
+MIN_MEANINGFUL_WORDS = 0
+
+def assess_transcription_quality(text: str, duration_seconds: float | None = None) -> dict:
+    """Dedicated speech-recognition quality gate, run BEFORE type classification and BEFORE
+    the content (is_ok) check. Answers exactly one question: is there usable, real speech to
+    analyze at all? This is deliberately separate from "what type is this report" and "is the
+    described work good enough" - those are different questions asked by later stages, only
+    once this one has already passed.
+    Returns {"ok": True} when there is real speech to work with, or {"ok": False, "reason":
+    one of "too_short_duration"/"empty"/"no_content_marker"/"transcription_error"/
+    "too_few_words"} when speech recognition itself failed and the report needs a human to
+    listen to the original video instead of being auto-analyzed."""
+    if duration_seconds is not None and duration_seconds <= MIN_REPORT_DURATION_SECONDS:
+        return {"ok": False, "reason": "too_short_duration"}
+
+    lower_src = (text or "").lower().strip()
+    if not lower_src:
+        return {"ok": False, "reason": "empty"}
+
+    if any((text or "").startswith(prefix) for prefix in _TRANSCRIPTION_ERROR_PREFIXES):
+        return {"ok": False, "reason": "transcription_error"}
+
+    if any(marker in lower_src for marker in _NO_CONTENT_MARKERS):
+        return {"ok": False, "reason": "no_content_marker"}
+
+    word_count = len(re.findall(r"[a-zA-Zа-яА-ЯёЁ]{2,}", text or ""))
+    if word_count < MIN_MEANINGFUL_WORDS:
+        return {"ok": False, "reason": "too_few_words"}
+
+    return {"ok": True, "reason": ""}
 
 def get_md5(text: str) -> str:
     return hashlib.md5(text.strip().encode("utf-8")).hexdigest()
@@ -107,13 +153,13 @@ CLASSIFY_PROMPT_TEMPLATE = """
 Если рабочий В ОДНОМ сообщении говорит И про короткий период (статус), И про итог всего дня
 (факт) — раздели его речь на два отдельных фрагмента и верни classification = "mixed".
 
-Если по тексту невозможно понять, идёт речь о коротком периоде или о всём дне (нет ни
-слов-сигналов, ни ясного смысла периода) — верни classification = "undetermined". НЕ угадывай
-в этом случае.
+Если ни один явный признак ФАКТА не подходит — считай это СТАТУСОМ (это тип по умолчанию).
+НЕ возвращай никакое другое значение, кроме "status", "daily_fact" или "mixed" — здесь ты
+работаешь только с речью, которая уже точно распознана и содержит реальный смысл.
 
 Ответь только JSON:
 {{
-"classification": "status" или "daily_fact" или "mixed" или "undetermined",
+"classification": "status" или "daily_fact" или "mixed",
 "status_part": "часть текста про короткий период, если classification = status или mixed, иначе пустая строка",
 "fact_part": "часть текста про итог дня, если classification = daily_fact или mixed, иначе пустая строка"
 }}
@@ -123,19 +169,15 @@ CLASSIFY_PROMPT_TEMPLATE = """
 """
 
 def classify_report_type(text: str) -> dict:
-    """Dedicated classification step, run BEFORE the quality check (check_status) and
-    BEFORE any time-based assumption. Decides purely by meaning/trigger words whether a
-    report is about a short recent period (status) or the whole day (daily_fact) - the
-    submission time no longer forces the type. Can also detect a single message that mixes
-    both ("mixed", split into status_part/fact_part) or one where the period genuinely
-    can't be told ("undetermined" - never guessed, flagged for manual review instead)."""
-    default = {"classification": "undetermined", "status_part": "", "fact_part": ""}
-    lower_src = text.lower().strip()
-    if not lower_src or any(marker in lower_src for marker in _NO_CONTENT_MARKERS):
-        # No real speech to classify - let check_status's existing silence/hallucination
-        # handling take over exactly as before; "status" here is an arbitrary placeholder,
-        # normalize_ai_result's override produces the same result/message either way.
-        return {"classification": "status", "status_part": text, "fact_part": ""}
+    """Dedicated classification step, run AFTER assess_transcription_quality has already
+    confirmed there is real, usable speech to work with, and BEFORE the content (is_ok)
+    check. Decides purely by meaning/trigger words whether a report is about a short recent
+    period (status) or the whole day (daily_fact) - the submission time no longer forces the
+    type. Can also detect a single message that mixes both ("mixed", split into
+    status_part/fact_part). Never returns "can't tell" - per product decision, once speech is
+    confirmed recognizable it always resolves to status or daily_fact, defaulting to status
+    when the LLM is unavailable or genuinely unsure."""
+    default = {"classification": "status", "status_part": text, "fact_part": ""}
     if groq_client is None:
         return default
     h = get_md5(f"classify:{text}")
@@ -155,8 +197,8 @@ def classify_report_type(text: str) -> dict:
         raw = response.choices[0].message.content.strip()
         data = json.loads(raw)
         classification = str(data.get("classification", "")).strip().lower()
-        if classification not in ("status", "daily_fact", "mixed", "undetermined"):
-            classification = "undetermined"
+        if classification not in ("status", "daily_fact", "mixed"):
+            classification = "status"
         result = {
             "classification": classification,
             "status_part": str(data.get("status_part") or "").strip(),

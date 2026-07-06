@@ -263,6 +263,21 @@ def init_db():
         )
         """
     )
+    # Tracks every admin DM sent for a report stuck at report_type='unrecognized_speech'
+    # (transcription-quality gate failed) - lets the bot find and disable the "Пометить как
+    # Статус/Факт" buttons in EVERY admin's chat once any one admin has resolved it, so two
+    # admins can't both process the same report.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS speech_review_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id INTEGER NOT NULL,
+            admin_chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_speech_review_report ON speech_review_messages(report_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_date ON reports(report_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_worker_date ON reports(telegram_id, report_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_workers_pos ON workers(position)")
@@ -556,6 +571,64 @@ def update_report_text_and_ai(report_id: int, is_ok: bool, format_comment: str, 
         """,
         (int(is_ok), format_comment, required_action, raw_text, received_at, report_id)
     )
+    conn.commit()
+    conn.close()
+
+def resolve_unrecognized_report(report_id: int, report_type: str, slot_time: str | None, is_ok: bool, is_late: bool, format_comment: str, required_action: str):
+    """Converts a report_type='unrecognized_speech' row into a normal status/daily_fact row
+    once an admin has manually decided which one it is, after watching the original video."""
+    conn = get_db()
+    conn.execute(
+        """
+        UPDATE reports
+        SET report_type = ?, slot_time = ?, is_ok = ?, is_late = ?, format_comment = ?, required_action = ?
+        WHERE id = ?
+        """,
+        (report_type, slot_time, int(is_ok), int(is_late), format_comment, required_action, report_id)
+    )
+    conn.commit()
+    conn.close()
+
+def count_consecutive_unrecognized_reports(telegram_id: int) -> int:
+    """How many of this worker's MOST RECENT reports (by insertion order) are, one after
+    another, report_type='unrecognized_speech' - stops counting at the first report of any
+    other type. Used to detect a run of back-to-back failed recognitions (bad mic/recording
+    conditions) without needing a separate persisted streak counter."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT report_type FROM reports WHERE telegram_id = ? ORDER BY id DESC LIMIT 20",
+        (telegram_id,)
+    ).fetchall()
+    conn.close()
+    count = 0
+    for r in rows:
+        if r["report_type"] == "unrecognized_speech":
+            count += 1
+        else:
+            break
+    return count
+
+def save_speech_review_message(report_id: int, admin_chat_id: int, message_id: int):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO speech_review_messages (report_id, admin_chat_id, message_id) VALUES (?, ?, ?)",
+        (report_id, admin_chat_id, message_id)
+    )
+    conn.commit()
+    conn.close()
+
+def get_speech_review_messages(report_id: int) -> list:
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT admin_chat_id, message_id FROM speech_review_messages WHERE report_id = ?",
+        (report_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def set_report_media_group_message(media_id: int, group_message_id: int):
+    conn = get_db()
+    conn.execute("UPDATE report_media SET group_message_id = ? WHERE id = ?", (group_message_id, media_id))
     conn.commit()
     conn.close()
 

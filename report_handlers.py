@@ -57,7 +57,9 @@ from db import (
     now_local, is_quiet_mode_enabled, get_worker_target_group,
     get_group_name, get_pending_reason_requests, resolve_pending_reason_requests,
     get_missed_status_reason, check_and_update_remark_alert_threshold, get_recent_remarks,
-    is_message_already_processed
+    is_message_already_processed,
+    resolve_unrecognized_report, count_consecutive_unrecognized_reports,
+    save_speech_review_message, get_speech_review_messages, set_report_media_group_message
 )
 
 REMARK_REQUIRED_ACTION_TEXT = (
@@ -93,7 +95,8 @@ async def notify_admins_if_remark_threshold_crossed(context: ContextTypes.DEFAUL
             logger.error(f"Не удалось отправить админу {admin_id} накопительное предупреждение о сотруднике {telegram_id}: {e}")
 
 from ai import (
-    transcribe_audio, clean_report, check_status, classify_report_type
+    transcribe_audio, clean_report, check_status, classify_report_type,
+    assess_transcription_quality
 )
 
 logger = logging.getLogger(__name__)
@@ -211,7 +214,7 @@ async def render_report_message_from_row(report: dict, worker_name: str) -> tupl
     status_line = format_status_or_fact_line(report_type, slot_time, report_date)
     status_emoji = "✅" if is_ok else "⚠️"
     
-    type_label = {"status": "Статус", "daily_fact": "Факт", "undetermined": "Не определено"}.get(report_type, report_type)
+    type_label = {"status": "Статус", "daily_fact": "Факт", "unrecognized_speech": "Не удалось распознать речь"}.get(report_type, report_type)
     notify_lines = [
         f"👤 <b>{html.escape(worker_name)}</b>",
         f"📍 {html.escape(status_line)}",
@@ -268,9 +271,140 @@ async def check_status_async(text: str, report_type_override: str | None = None)
 async def classify_report_type_async(text: str) -> dict:
     return await asyncio.to_thread(classify_report_type, text)
 
-async def enqueue_media_report_item(user_id: int, context: ContextTypes.DEFAULT_TYPE, update: Update, text_content: str, now: datetime):
+async def assess_transcription_quality_async(text: str, duration_seconds: float | None) -> dict:
+    return await asyncio.to_thread(assess_transcription_quality, text, duration_seconds)
+
+UNRECOGNIZED_SPEECH_STREAK_THRESHOLD = 3
+
+async def notify_admins_unrecognized_speech(context: ContextTypes.DEFAULT_TYPE, report_id: int, worker_name: str, text_content: str, upd: Update):
+    """Sends the original video + a fixed review prompt to EVERY admin's private chat (not
+    the work group) with buttons to manually pick Статус/Факт - per product decision, ALL
+    admins get notified and the buttons self-lock on first click (see the
+    speechfix_status_/speechfix_fact_ callback), rather than picking one "on duty" admin."""
+    transcript_shown = html.escape(text_content.strip()) if text_content.strip() else "Пустой результат"
+    review_text = (
+        f"⚠️ Не удалось распознать речь в отчёте.\n"
+        f"Сотрудник: {html.escape(worker_name)}\n"
+        f"Результат транскрибации: \"{transcript_shown}\""
+    )
+    kbd = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Пометить как Статус", callback_data=f"speechfix_status_{report_id}"),
+        InlineKeyboardButton("📋 Пометить как Факт", callback_data=f"speechfix_fact_{report_id}"),
+    ]])
+    for admin_id in ADMIN_IDS:
+        try:
+            copied = await context.bot.copy_message(
+                chat_id=admin_id, from_chat_id=upd.effective_chat.id, message_id=upd.message.message_id
+            )
+            sent = await context.bot.send_message(
+                chat_id=admin_id, text=review_text, reply_markup=kbd,
+                reply_to_message_id=copied.message_id
+            )
+            await run_db(save_speech_review_message, report_id, admin_id, sent.message_id)
+        except Exception as e:
+            logger.error(f"Не удалось отправить админу {admin_id} видео с нераспознанной речью (отчёт {report_id}): {e}")
+
+async def notify_admins_unrecognized_speech_streak(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, worker_name: str):
+    streak = await run_db(count_consecutive_unrecognized_reports, telegram_id)
+    if streak == 0 or streak % UNRECOGNIZED_SPEECH_STREAK_THRESHOLD != 0:
+        return
+    alert_text = (
+        "⚠️ Обратите внимание.\n"
+        f"У сотрудника {html.escape(worker_name)} уже несколько подряд отчётов с нераспознанной речью.\n"
+        "Рекомендуется проверить качество записи видео или работу микрофона."
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=alert_text)
+        except Exception as e:
+            logger.error(f"Не удалось отправить админу {admin_id} предупреждение о повторных сбоях распознавания у {telegram_id}: {e}")
+
+async def resolve_unrecognized_speech_report(report_id: int, chosen_type: str, context: ContextTypes.DEFAULT_TYPE) -> tuple[bool, str | None]:
+    """Admin manually resolves a report_type='unrecognized_speech' row into Status or Fact.
+    Runs the exact same content check and slot attribution a normal report of that type would
+    get (using the ORIGINAL submission time, not the time of the admin's click), then forwards
+    the video to the work group for the first time - it was deliberately withheld from the
+    group until a human confirmed what it actually was. Returns (False, None) if the report
+    was already resolved by another admin - the caller uses this to lock out a second click."""
+
+    def _load():
+        conn = get_db()
+        r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        w = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (r["telegram_id"],)).fetchone() if r else None
+        media = conn.execute("SELECT * FROM report_media WHERE report_id = ? ORDER BY position", (report_id,)).fetchall()
+        conn.close()
+        return r, w, media
+
+    report, worker, media_rows = await run_db(_load)
+    if not report or report["report_type"] != "unrecognized_speech" or not worker:
+        return False, None
+
+    telegram_id = report["telegram_id"]
+    report_date = report["report_date"]
+    raw_text = report["raw_text"] or ""
+    w_name = f"{worker['last_name']} {worker['first_name']}"
+    sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
+
+    try:
+        h, m, s = map(int, report["received_at"].split(":"))
+        y, mo, d = map(int, report_date.split("-"))
+        submitted_at = datetime(y, mo, d, h, m, s)
+    except Exception:
+        submitted_at = now_local()
+
+    ai_res = await check_status_async(raw_text, report_type_override=chosen_type)
+
+    if chosen_type == "status":
+        submitted_slots = await run_db(get_submitted_status_slots, telegram_id, report_date)
+        slot_time, is_late = pick_target_status_slot(sched_list, submitted_at, submitted_slots, w_name)
+    else:
+        slot_time, is_late = None, False
+
+    await run_db(
+        resolve_unrecognized_report,
+        report_id=report_id,
+        report_type=chosen_type,
+        slot_time=slot_time,
+        is_ok=ai_res["is_ok"],
+        is_late=is_late,
+        format_comment=ai_res["format_comment"],
+        required_action=ai_res["required_action"],
+    )
+    async_sync_gsheets_background()
+
+    dest_chat = await run_db(get_worker_target_group, worker)
+    copied_msg_id = None
+    for m in media_rows:
+        try:
+            copied = await context.bot.copy_message(chat_id=dest_chat, from_chat_id=m["source_chat_id"], message_id=m["source_message_id"])
+            await run_db(set_report_media_group_message, m["id"], copied.message_id)
+            if copied_msg_id is None:
+                copied_msg_id = copied.message_id
+        except Exception as e:
+            logger.error(f"Ошибка пересылки видео вручную обработанного отчёта {report_id} в группу: {e}")
+
+    def _fetch_report_row():
+        conn = get_db()
+        r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        conn.close()
+        return r
+
+    report_row = await run_db(_fetch_report_row)
+    notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name)
+    try:
+        sent = await context.bot.send_message(
+            chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd,
+            reply_to_message_id=copied_msg_id, parse_mode="HTML"
+        )
+        await run_db(set_report_group_message, report_id, dest_chat, sent.message_id)
+    except Exception as e:
+        logger.error(f"Ошибка отправки карточки вручную обработанного отчёта {report_id} в группу: {e}")
+
+    return True, w_name
+
+async def enqueue_media_report_item(user_id: int, context: ContextTypes.DEFAULT_TYPE, update: Update, text_content: str, now: datetime, duration_seconds: float | None = None):
     buf = MEDIA_BATCH_BUFFERS.setdefault(user_id, {"items": [], "task": None})
-    buf["items"].append({"update": update, "text_content": text_content, "now": now})
+    buf["items"].append({"update": update, "text_content": text_content, "now": now, "duration": duration_seconds})
 
     old_task = buf.get("task")
     if old_task and not old_task.done():
@@ -379,21 +513,29 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
     # on where reports actually got sent.
     dest_chat = await run_db(get_worker_target_group, worker)
 
-    # LOGIC CHANGE: type (status vs факт) is now decided purely by the meaning of what the
-    # worker said (classify_report_type), never by submission time - see classify_report_
-    # type's docstring in ai.py. A single video can also come back "mixed" (split into two
-    # separate evaluated items feeding the same status_items/fact_items pipeline below,
-    # unchanged) or "undetermined" (never guessed - saved and flagged for manual review,
-    # kept out of status_items/fact_items entirely).
+    # Pipeline (strictly sequential per item): 1) speech-recognition quality gate -
+    # assess_transcription_quality decides ONLY whether there is usable real speech at all,
+    # completely independent of what type the report is. 2) type classification
+    # (classify_report_type) - runs ONLY on text that already passed the quality gate, and
+    # always resolves to status/daily_fact/mixed (never "can't tell"). This separation is the
+    # whole point of this pass: a silent/garbled/empty video is a SPEECH problem
+    # (unrecognized_items, routed to admins), never a "couldn't determine type" problem.
     evaluated_items = []
-    undetermined_items = []
+    unrecognized_items = []
     for idx, item in enumerate(items, start=1):
         text_content = item["text_content"]
         now = item["now"]
         upd = item["update"]
+        duration = item.get("duration")
         date_str = now.strftime("%Y-%m-%d")
 
         logger.info(f"[process_media_batch] Видео {idx}/{len(items)} пользователя {user_id}: текст='{text_content[:80]}'")
+
+        quality = await assess_transcription_quality_async(text_content, duration)
+        if not quality["ok"]:
+            logger.info(f"[Проверка качества транскрибации] Видео {idx}/{len(items)} пользователя {user_id}: не распознано ({quality['reason']})")
+            unrecognized_items.append({"item": item, "text_content": text_content, "now": now, "upd": upd, "date_str": date_str})
+            continue
 
         classification = await classify_report_type_async(text_content)
         kind = classification["classification"]
@@ -412,8 +554,6 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 "item": item, "ai_res": fact_ai, "report_type": "daily_fact",
                 "text_content": fact_text, "now": now, "upd": upd, "date_str": date_str
             })
-        elif kind == "undetermined":
-            undetermined_items.append({"item": item, "text_content": text_content, "now": now, "upd": upd, "date_str": date_str})
         else:
             ai_res_pre = await check_status_async(text_content, report_type_override=kind)
             evaluated_items.append({
@@ -421,10 +561,11 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 "text_content": text_content, "now": now, "upd": upd, "date_str": date_str
             })
 
-    # Undetermined items are never guessed into status/факт - save them for the record and
-    # flag them to the control department for a human to decide, instead of blocking the
-    # rest of the batch or silently dropping the report.
-    for u_item in undetermined_items:
+    # Reports that failed the speech-recognition quality gate never reach content analysis,
+    # status/fact checks, or automatic scoring - saved as their own type, forwarded to every
+    # admin's PRIVATE chat (not the work group) with buttons to manually resolve the type,
+    # and the employee gets one fixed, non-judgmental message (no "пересдайте отчёт").
+    for u_item in unrecognized_items:
         upd = u_item["upd"]
         now = u_item["now"]
         date_str = u_item["date_str"]
@@ -433,39 +574,25 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             save_report,
             telegram_id=user_id,
             report_date=date_str,
-            report_type="undetermined",
+            report_type="unrecognized_speech",
             slot_time=None,
             received_at=now.strftime("%H:%M:%S"),
             is_ok=False,
             is_late=0,
-            format_comment="не удалось определить тип отчёта (статус/факт)",
-            required_action="Требуется ручная проверка отделом контроля",
+            format_comment="не удалось распознать речь",
+            required_action="Требуется ручная проверка администратором",
             raw_text=text_content
         )
-        try:
-            copied_msg = await context.bot.copy_message(
-                chat_id=dest_chat, from_chat_id=upd.effective_chat.id, message_id=upd.message.message_id
-            )
-            await run_db(add_report_media, report_id, upd.effective_chat.id, upd.message.message_id, copied_msg.message_id, 1, now.strftime("%H:%M:%S"))
-            await context.bot.send_message(
-                chat_id=dest_chat,
-                text=(
-                    f"⚠️ <b>Не удалось определить тип отчёта</b> — {w_name}\n"
-                    f"Не понятно, это статус или факт дня. Требуется ручная проверка.\n\n"
-                    f"🗣 Оригинальный текст:\n\"{html.escape(text_content)}\""
-                ),
-                reply_to_message_id=copied_msg.message_id,
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка отправки неопределённого отчёта в чат {dest_chat}: {e}")
+        await run_db(add_report_media, report_id, upd.effective_chat.id, upd.message.message_id, None, 1, now.strftime("%H:%M:%S"))
+        await notify_admins_unrecognized_speech(context, report_id, w_name, text_content, upd)
         try:
             await upd.message.reply_text(
-                "⚠️ Не удалось точно понять, статус это или факт дня. "
-                "Отдел контроля проверит запись вручную."
+                "Не удалось разобрать текст в вашем видео.\n"
+                "Пожалуйста, в следующий раз чётче формулируйте, что именно вы делали."
             )
         except Exception as e:
-            logger.warning(f"Не удалось отправить личный фидбек по неопределённому отчёту пользователю {user_id}: {e}")
+            logger.warning(f"Не удалось отправить личный фидбек по нераспознанной речи пользователю {user_id}: {e}")
+        await notify_admins_unrecognized_speech_streak(context, user_id, w_name)
 
     # Separate status items and daily facts
     status_items = [x for x in evaluated_items if x["report_type"] == "status"]
@@ -1035,6 +1162,9 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             logger.error(f"Не удалось переслать причину несдачи статуса в группу: {e}")
                         return
 
+        is_media = bool(update.message.voice or update.message.video or update.message.video_note)
+        media_duration = None
+
         if update.message.text:
             text_content = update.message.text.strip()
         else:
@@ -1054,27 +1184,29 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
 
+                media_duration = getattr(file_obj, "duration", None)
                 await update.message.reply_text("📹 Видео получено, ожидайте оценки:")
                 tg_file = await context.bot.get_file(file_obj.file_id)
                 ext = "mp4" if update.message.video or update.message.video_note else "ogg"
-                
+
                 os.makedirs("tmp", exist_ok=True)
                 tmp_path = f"tmp/file_{user_id}_{int(datetime.now().timestamp())}.{ext}"
-                
+
                 await tg_file.download_to_drive(tmp_path)
                 logger.info(f"[handler] Начало транскрипции файла {tmp_path} для пользователя {user_id}")
                 text_content = await transcribe_audio_async(tmp_path)
                 logger.info(f"[handler] Транскрипция завершена: '{text_content[:80]}'")
 
-        if not text_content:
-            await update.message.reply_text("Ошибка: Не удалось распознать аудио или медиа отчета.")
+        # Media (voice/video/video_note) always proceeds from here, even on an empty or
+        # technically-failed transcription - assess_transcription_quality() (run per item
+        # inside process_media_batch) is the single, dedicated place that recognizes "no
+        # usable speech" and routes it to admin review, instead of a separate dead-end error
+        # message here that never saved or notified anyone about the report at all. Only a
+        # genuinely empty TEXT message (not media - Telegram text is never "unrecognized
+        # speech") is rejected this early.
+        if not is_media and not text_content:
+            await update.message.reply_text("Ошибка: не удалось прочитать текстовый отчёт.")
             return
-
-        if text_content.startswith("Ошибка распознавания аудио"):
-            await update.message.reply_text("❌ При распознавании аудио произошла ошибка. Пожалуйста, отправьте текстовый отчет или попробуйте перезаписать.")
-            return
-
-        is_media = bool(update.message.voice or update.message.video or update.message.video_note)
 
         if not worker:
             user_info = {
@@ -1241,7 +1373,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         now = now_local()
 
         if is_media:
-            await enqueue_media_report_item(user_id, context, update, text_content, now)
+            await enqueue_media_report_item(user_id, context, update, text_content, now, media_duration)
             return
 
         # Handle purely text status report (worker typewriting)
@@ -1347,10 +1479,10 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Ошибка отправки оценки в чат {dest_chat}: {e}")
 
-        # LOGIC CHANGE: type is decided purely by meaning (classify_report_type), never by
-        # submission time - same classification step as the video path above. "mixed" runs
-        # _process_one_text_report twice (once per part), "undetermined" is saved and
-        # flagged for manual review instead of being guessed into status or факт.
+        # Type is decided purely by meaning (classify_report_type), same classification step
+        # as the video path above. A typed text message is never a "speech recognition"
+        # problem (there's no ASR involved), so it always resolves to status/daily_fact,
+        # optionally split into two via "mixed" - never "can't tell".
         classification = await classify_report_type_async(text_content)
         kind = classification["classification"]
         logger.info(f"[Классификация статус/факт] Текстовый отчёт пользователя {user_id}: {kind}")
@@ -1358,38 +1490,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if kind == "mixed":
             await _process_one_text_report("status", classification["status_part"] or text_content)
             await _process_one_text_report("daily_fact", classification["fact_part"] or text_content)
-        elif kind == "undetermined":
-            report_id = await run_db(
-                save_report,
-                telegram_id=user_id,
-                report_date=date_str,
-                report_type="undetermined",
-                slot_time=None,
-                received_at=now.strftime("%H:%M:%S"),
-                is_ok=False,
-                is_late=0,
-                format_comment="не удалось определить тип отчёта (статус/факт)",
-                required_action="Требуется ручная проверка отделом контроля",
-                raw_text=text_content
-            )
-            async_sync_gsheets_background()
-            dest_chat = await run_db(get_worker_target_group, worker)
-            try:
-                await context.bot.send_message(
-                    chat_id=dest_chat,
-                    text=(
-                        f"⚠️ <b>Не удалось определить тип отчёта</b> — {w_name}\n"
-                        f"Не понятно, это статус или факт дня. Требуется ручная проверка.\n\n"
-                        f"🗣 Оригинальный текст:\n\"{html.escape(text_content)}\""
-                    ),
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logger.error(f"Ошибка отправки неопределённого отчёта в чат {dest_chat}: {e}")
-            await update.message.reply_text(
-                "⚠️ Не удалось точно понять, статус это или факт дня. "
-                "Отдел контроля проверит запись вручную."
-            )
         else:
             await _process_one_text_report(kind, text_content)
     finally:
@@ -1414,7 +1514,36 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         
     data = query.data
     logger.info(f"Получен callback_query: {data} от администратора {user_id}")
-    
+
+    # 0. Manually resolve a report stuck at report_type='unrecognized_speech' (speech
+    # recognition quality gate failed) into Status or Fact - self-locking across every admin
+    # that got a copy of this notification, so only the first click does anything.
+    if data.startswith("speechfix_status_") or data.startswith("speechfix_fact_"):
+        chosen_type = "status" if data.startswith("speechfix_status_") else "daily_fact"
+        report_id = int(data.split("_")[-1])
+        resolved, w_name = await resolve_unrecognized_speech_report(report_id, chosen_type, context)
+        if not resolved:
+            await query.answer("Этот отчёт уже был обработан другим администратором.", show_alert=True)
+            return
+
+        admin_name = update.effective_user.first_name or str(user_id)
+        type_label = "Статус" if chosen_type == "status" else "Факт"
+        resolved_note = (
+            f"⚠️ Не удалось распознать речь в отчёте.\n"
+            f"Сотрудник: {html.escape(w_name)}\n\n"
+            f"✅ Обработано администратором {html.escape(admin_name)} — тип: {type_label}"
+        )
+        review_msgs = await run_db(get_speech_review_messages, report_id)
+        for rm in review_msgs:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=rm["admin_chat_id"], message_id=rm["message_id"],
+                    text=resolved_note, reply_markup=None
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось обновить сообщение админу {rm['admin_chat_id']} после обработки отчёта {report_id}: {e}")
+        return
+
     # 1. Back to main menu
     if data.startswith("back_to_main_"):
         report_id = int(data.split("_")[-1])
