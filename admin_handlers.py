@@ -450,7 +450,11 @@ async def add_worker_firstname(update: Update, context: ContextTypes.DEFAULT_TYP
     return ASK_POSITION
 
 async def add_worker_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["position"] = clean_position(update.message.text.strip())
+    position_text = update.message.text.strip()
+    if not position_text:
+        await update.message.reply_text("Должность не может быть пустой. Введите должность сотрудника:", reply_markup=CANCEL_KEYBOARD)
+        return ASK_POSITION
+    context.user_data["position"] = clean_position(position_text)
     departments = await run_db(get_all_departments)
     buttons = [[d] for d in departments]
     buttons.append(["➕ Другой (ввести вручную)"])
@@ -687,6 +691,9 @@ async def edit_worker_value_received(update: Update, context: ContextTypes.DEFAU
 
     value = raw
     if field == "position":
+        if not raw:
+            await update.message.reply_text("Должность не может быть пустой. Введите новую должность:")
+            return ASK_EDIT_VALUE
         value = clean_position(raw)
     elif field == "group_id":
         if not raw.lstrip("-").isdigit():
