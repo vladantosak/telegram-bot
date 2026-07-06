@@ -23,7 +23,8 @@ from db import (
     is_admin, ADMIN_IDS, save_scheduled_times, get_scheduled_times,
     get_group_name_async, now_local, get_submitted_status_slots, clean_position,
     has_pre_reminder_sent, mark_pre_reminder_sent,
-    has_pending_reason_request, create_pending_reason_request
+    has_pending_reason_request, create_pending_reason_request,
+    is_missed_reason_request_enabled
 )
 
 PRE_REMINDER_WINDOW_MIN = (10, 15)  # send when a slot is 10-15 minutes away
@@ -284,6 +285,12 @@ async def pre_reminder_check_callback(context: ContextTypes.DEFAULT_TYPE):
         await run_db(mark_pre_reminder_sent, telegram_id, date_str, slot)
 
 async def missed_status_check_callback(context: ContextTypes.DEFAULT_TYPE):
+    # Feature disabled by default for now - toggled from the Settings menu
+    # ("📋 Запрос причины несдачи статуса"). While off, missed slots are simply not tracked
+    # here at all, so no worker gets asked for a reason or blocked from sending a new video.
+    if not await run_db(is_missed_reason_request_enabled):
+        return
+
     now = now_local()
     date_str = now.strftime("%Y-%m-%d")
     current_mins = now.hour * 60 + now.minute

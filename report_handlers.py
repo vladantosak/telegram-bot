@@ -57,7 +57,7 @@ from db import (
     now_local, is_quiet_mode_enabled, get_worker_target_group,
     get_group_name, get_pending_reason_requests, resolve_pending_reason_requests,
     get_missed_status_reason, check_and_update_remark_alert_threshold, get_recent_remarks,
-    is_message_already_processed,
+    is_message_already_processed, is_missed_reason_request_enabled,
     resolve_unrecognized_report, count_consecutive_unrecognized_reports,
     save_speech_review_message, get_speech_review_messages, set_report_media_group_message
 )
@@ -1121,7 +1121,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         worker = await run_db(get_worker, user_id)
 
-        if worker:
+        if worker and await run_db(is_missed_reason_request_enabled):
             pending_reasons = await run_db(get_pending_reason_requests, user_id)
             if pending_reasons:
                 is_media_msg = bool(update.message.voice or update.message.video or update.message.video_note)

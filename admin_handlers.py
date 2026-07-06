@@ -23,7 +23,8 @@ from db import (
     save_violators_threshold, now_local, set_quiet_mode, is_quiet_mode_enabled,
     save_scheduled_times, get_scheduled_times, sync_gsheets_task, async_sync_gsheets_background,
     save_report, get_all_departments, add_department, delete_department, count_workers_in_department,
-    get_departments_ordered, save_departments_order
+    get_departments_ordered, save_departments_order,
+    is_missed_reason_request_enabled, set_missed_reason_request_enabled
 )
 
 from report_handlers import menu_for_user
@@ -129,6 +130,7 @@ SETTINGS_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["📊 Настроить Google Таблицу", "🔗 Получить ссылку на таблицу"],
         ["🏢 Редактировать отделы", "📊 Порядок отделов в таблице"],
+        ["📋 Запрос причины несдачи статуса"],
         ["🗑 Очистить базу от удалённых сотрудников"],
         ["❌ Назад"]
     ],
@@ -179,6 +181,21 @@ async def settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if choice == "📊 Порядок отделов в таблице":
         return await department_order_start(update, context)
+
+    if choice == "📋 Запрос причины несдачи статуса":
+        curr = await run_db(is_missed_reason_request_enabled)
+        await run_db(set_missed_reason_request_enabled, not curr)
+        status_label = "ВКЛЮЧЁН" if not curr else "ВЫКЛЮЧЕН"
+        await update.message.reply_text(
+            f"📋 Запрос причины несдачи статуса {status_label}.\n"
+            + (
+                "Теперь при пропуске статуса сотрудник должен будет написать причину, прежде чем сможет отправить новое видео."
+                if not curr else
+                "Теперь пропуск статуса не требует объяснения и не блокирует отправку видео."
+            ),
+            reply_markup=kbd
+        )
+        return ASK_SETTINGS_ACTION
 
     if choice == "🗑 Очистить базу от удалённых сотрудников":
         deleted_reports, deleted_reminders, deleted_pending = await run_db(_cleanup_orphaned_records)

@@ -937,6 +937,29 @@ def set_quiet_mode(enabled: bool):
     conn.commit()
     conn.close()
 
+def is_missed_reason_request_enabled() -> bool:
+    """Whether a worker who misses a status slot is asked to explain why (and blocked from
+    sending a new video until they do) - disabled by default for now, per product decision,
+    toggled from the Settings menu."""
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT value FROM settings WHERE key = 'missed_reason_request_enabled'").fetchone()
+        conn.close()
+        if row:
+            return row["value"] == "1"
+    except Exception:
+        pass
+    return False
+
+def set_missed_reason_request_enabled(enabled: bool):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('missed_reason_request_enabled', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        ("1" if enabled else "0",)
+    )
+    conn.commit()
+    conn.close()
+
 def get_scheduled_times() -> list[str]:
     try:
         val = get_setting("scheduled_summary_times")
