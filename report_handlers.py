@@ -45,6 +45,20 @@ def rebuild_format_comment(video_items: list[dict]) -> str:
         parts.append(f"Видео {item['num']}: {status_label}{comment_part}")
     return "; ".join(parts)
 
+def extract_report_summaries(format_comment: str) -> list[str]:
+    """Turns a report's format_comment - either multi-video ("Видео 1: ОК - ...; Видео 2:
+    не ОК - ...") or single ("ОК - ...") - into a plain list of just the content summaries,
+    one per video, each with its own ОК/не ОК prefix stripped. Used for the compact group
+    message, which states the overall verdict once up front instead of repeating it per
+    video."""
+    items = parse_video_comments(format_comment)
+    summaries = []
+    for item in items:
+        comment = re.sub(r"^(не\s*ОК|ОК)\s*-\s*", "", item["comment"].strip(), flags=re.IGNORECASE).strip()
+        if comment:
+            summaries.append(comment)
+    return summaries
+
 from db import (
     get_worker, get_submitted_status_slots, get_existing_report_row,
     save_report, update_report_text_and_ai, set_report_group_message,
@@ -53,7 +67,7 @@ from db import (
     get_pending_unregistered_user, save_pending_unregistered_user,
     delete_pending_unregistered_user, bind_worker_id, async_sync_gsheets_background,
     get_db, run_db, is_admin, ADMIN_IDS, DEFAULT_GROUP_ID, SCHEDULES, SCHEDULE_A,
-    STATUS_LATE_TOLERANCE_MIN,
+    STATUS_LATE_TOLERANCE_MIN, clean_position,
     now_local, is_quiet_mode_enabled, get_worker_target_group,
     get_group_name, get_pending_reason_requests, resolve_pending_reason_requests,
     get_missed_status_reason, check_and_update_remark_alert_threshold, get_recent_remarks,
@@ -164,19 +178,23 @@ def make_report_keyboard(report_id: int, report_type: str | None = None) -> Inli
         except Exception:
             report_type = "status"
             
-    type_btn_text = "📋 Сделать Итогом дня" if report_type == "status" else "⏱ Сделать Статусом"
-    rows = [
-        [
-            InlineKeyboardButton("🔄 Изменить оценку (ОК / НЕ ОК)", callback_data=f"fix_toggle_{report_id}"),
-            InlineKeyboardButton("✏️ Изменить комментарий", callback_data=f"edit_comment_{report_id}")
-        ],
+    # Compact icon-only row, no text labels - callback_data and every handler behind these
+    # buttons are unchanged, only the visible caption shrank. Telegram can't hide inline
+    # buttons from specific chat members, so "неприметность" here is purely visual; the real
+    # access control is the is_admin() check at the top of handle_callback_query, which gates
+    # every one of these callback_data prefixes before anything runs.
+    # 🔄 = toggle ОК/НЕ ОК (fix_toggle_), 📝 = edit comment (edit_comment_),
+    # 🕒 = edit slot time, status only (edit_time_), 🔀 = toggle Статус/Факт (toggle_type_)
+    icon_row = [
+        InlineKeyboardButton("🔄", callback_data=f"fix_toggle_{report_id}"),
+        InlineKeyboardButton("📝", callback_data=f"edit_comment_{report_id}"),
     ]
     if report_type == "status":
         # Lets an admin correct a report misattributed to the wrong schedule slot (e.g. the
         # "nearest slot" pick landed on the wrong one) without having to delete and redo it.
-        rows.append([InlineKeyboardButton("🕐 Изменить время сдачи", callback_data=f"edit_time_{report_id}")])
-    rows.append([InlineKeyboardButton(type_btn_text, callback_data=f"toggle_type_{report_id}")])
-    return InlineKeyboardMarkup(rows)
+        icon_row.append(InlineKeyboardButton("🕒", callback_data=f"edit_time_{report_id}"))
+    icon_row.append(InlineKeyboardButton("🔀", callback_data=f"toggle_type_{report_id}"))
+    return InlineKeyboardMarkup([icon_row])
 
 def make_video_selection_keyboard(report_id: int, action_type: str, video_items: list[dict]) -> InlineKeyboardMarkup:
     prefix = "tg" if action_type == "toggle" else "ed"
@@ -199,53 +217,44 @@ def make_video_selection_keyboard(report_id: int, action_type: str, video_items:
     buttons.append([InlineKeyboardButton("❌ Назад", callback_data=f"back_to_main_{report_id}")])
     return InlineKeyboardMarkup(buttons)
 
-async def render_report_message_from_row(report: dict, worker_name: str) -> tuple[str, InlineKeyboardMarkup]:
+async def render_report_message_from_row(report: dict, worker_name: str, position: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    """Builds the SHORT group message: name (position) - type date за time / Формат отчета /
+    Требуемые действия - three lines, no per-video breakdown, no "official"/"original" report
+    text. The full detail (per-video comment, cleaned + raw text) still goes to Google Sheets
+    unchanged (sync_gsheets_task reads the same `reports` row directly) - it's just no longer
+    duplicated into the Telegram message."""
     report_id = report["id"]
     report_type = report["report_type"]
     slot_time = report["slot_time"]
     report_date = report["report_date"]
+    received_at = report["received_at"] or ""
     is_ok = bool(report["is_ok"])
     format_comment = report["format_comment"] or ""
-    required_action = report["required_action"] or ("Ничего не предпринимать, всё в порядке" if is_ok else "")
-    raw_text = report["raw_text"] or ""
-    
-    cleaned_text = await clean_report_async(raw_text)
 
-    status_line = format_status_or_fact_line(report_type, slot_time, report_date)
-    status_emoji = "✅" if is_ok else "⚠️"
-    
-    type_label = {"status": "Статус", "daily_fact": "Факт", "unrecognized_speech": "Не удалось распознать речь"}.get(report_type, report_type)
-    notify_lines = [
-        f"👤 <b>{html.escape(worker_name)}</b>",
-        f"📍 {html.escape(status_line)}",
-        f"Тип: {type_label}",
-        f"Оценка: {status_emoji} {'ОК' if is_ok else 'НЕ ОК'}",
-    ]
-    
-    is_status_with_videos = (report_type == "status" and ("Видео" in format_comment or ";" in format_comment))
-
-    if is_status_with_videos:
-        # Formatting change: a "📹 Видео N" line per video was replaced with a single count
-        # line - the actual per-video breakdown already lives in "Комментарий" below.
-        video_count = len([part for part in format_comment.split("; ") if part.strip()])
-        notify_lines.append("")
-        notify_lines.append(f"Количество видео: {video_count}")
-        notify_lines.append(f"Комментарий: {html.escape(format_comment)}")
+    formatted_date = format_show_date(report_date)
+    if report_type == "daily_fact":
+        time_str = received_at[:5] if received_at else "??:??"
+        type_line = f"факт {formatted_date} за {time_str}"
+    elif report_type == "status":
+        type_line = f"статус {formatted_date} за {slot_time or '??:??'}"
     else:
-        notify_lines.append(f"Комментарий: {html.escape(format_comment)}")
+        type_label = {"unrecognized_speech": "не удалось распознать речь"}.get(report_type, report_type)
+        type_line = f"{type_label} {formatted_date}"
 
-    notify_lines.append(f"⚡ Требуемое действие: {html.escape(required_action)}")
+    summaries = extract_report_summaries(format_comment)
+    verdict = "всё ОК" if is_ok else "не ОК"
+    format_line = f"{verdict} - {html.escape('; '.join(summaries))}" if summaries else verdict
 
-    notify_lines.append("")
-    notify_lines.append("📝 <b>Обработанный отчет:</b>")
-    notify_lines.append(f"\"{html.escape(cleaned_text)}\"")
-    notify_lines.append("")
-    notify_lines.append("🗣 <b>Оригинальный отчёт:</b>")
-    notify_lines.append(f"\"{html.escape(raw_text)}\"")
-    
-    notify_text = "\n".join(notify_lines)
+    action_line = "ничего не предпринимать" if is_ok else "сделано замечание, требуется проверка"
+
+    header = f"{html.escape(worker_name)} ({html.escape(position or '?')}) - {html.escape(type_line)}"
+    notify_text = (
+        f"{header}\n"
+        f"Формат отчета: {format_line}\n"
+        f"Требуемые действия: {action_line}"
+    )
     inline_kbd = make_report_keyboard(report_id, report_type)
-    
+
     return notify_text, inline_kbd
 
 def menu_for_user(user_id: int, chat_type: str = "private"):
@@ -390,7 +399,7 @@ async def resolve_unrecognized_speech_report(report_id: int, chosen_type: str, c
         return r
 
     report_row = await run_db(_fetch_report_row)
-    notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name)
+    notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name, clean_position(worker["position"]))
     try:
         sent = await context.bot.send_message(
             chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd,
@@ -606,7 +615,6 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         date_str = f_item["date_str"]
         ai_res = f_item["ai_res"]
 
-        cleaned_text = await clean_report_async(text_content)
         report_id = await run_db(
             save_report,
             telegram_id=user_id,
@@ -643,7 +651,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
 
         report_row = await run_db(_fetch_report_row)
 
-        notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name)
+        notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name, clean_position(worker["position"]))
 
         try:
             if copied_msg_id:
@@ -721,7 +729,6 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                 overall_format_comment = "; ".join(new_comments)
 
             overall_is_ok = bool(existing["is_ok"]) or any(x["ai_res"]["is_ok"] for x in status_items)
-            cleaned_text = await clean_report_async(combined_raw_text)
             report_id = existing["id"]
 
             error_count = overall_format_comment.lower().count("не ок")
@@ -758,7 +765,6 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
             overall_format_comment = "; ".join(new_comments)
 
             overall_is_ok = any(x["ai_res"]["is_ok"] for x in status_items)
-            cleaned_text = await clean_report_async(combined_raw_text)
 
             error_count = overall_format_comment.lower().count("не ок")
             overall_required_action = REMARK_REQUIRED_ACTION_TEXT if error_count > 0 else "Ничего не предпринимать, всё в порядке"
@@ -841,7 +847,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
 
         report_row = await run_db(_fetch_report_row2)
 
-        notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name)
+        notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name, clean_position(worker["position"]))
 
         # Send replying to the last forwarded video
         last_copied_msg_id = copied_msg_ids[-1] if copied_msg_ids else None
@@ -973,7 +979,8 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async_sync_gsheets_background()
         
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
-        text, kbd = await render_report_message_from_row(report, worker_name)
+        position = clean_position(worker["position"]) if worker else "?"
+        text, kbd = await render_report_message_from_row(report, worker_name, position)
         
         if original_chat_id and original_msg_id:
             try:
@@ -1080,7 +1087,8 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async_sync_gsheets_background()
 
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
-        text, kbd = await render_report_message_from_row(report, worker_name)
+        position = clean_position(worker["position"]) if worker else "?"
+        text, kbd = await render_report_message_from_row(report, worker_name, position)
 
         if original_chat_id and original_msg_id:
             try:
@@ -1398,7 +1406,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if existing_report:
                 is_addon = True
                 ai_res = await check_status_async(part_text, report_type_override=rt)
-                cleaned_text = await clean_report_async(part_text)
                 report_id = existing_report["id"]
                 action_text = REMARK_REQUIRED_ACTION_TEXT if (ai_res["report_type"] == "status" and not ai_res["is_ok"]) else ai_res["required_action"]
 
@@ -1413,7 +1420,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 ai_res = await check_status_async(part_text, report_type_override=rt)
-                cleaned_text = await clean_report_async(part_text)
                 action_text = REMARK_REQUIRED_ACTION_TEXT if (ai_res["report_type"] == "status" and not ai_res["is_ok"]) else ai_res["required_action"]
                 report_id = await run_db(
                     save_report,
@@ -1452,18 +1458,15 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
             dest_chat = await run_db(get_worker_target_group, worker)
-            title_text = f"Отчет обновлен: {w_name}" if is_addon else w_name
-            notify_text = (
-                f"{title_text}\n"
-                f"{format_status_or_fact_line(ai_res['report_type'], nearest_slot if ai_res['report_type'] == 'status' else None, date_str)}\n"
-                f"Тип: {'Статус' if ai_res['report_type'] == 'status' else 'Факт'}\n"
-                f"Оценка ИИ: {'ОК' if ai_res['is_ok'] else 'НЕ ОК'}\n"
-                f"Комментарий ИИ: {ai_res['format_comment']}\n\n"
-                f"📝 Обработанный отчет:\n\"{cleaned_text}\"\n\n"
-                f"🗣 Оригинальный отчёт:\n\"{part_text}\""
-            )
 
-            inline_kbd = make_report_keyboard(report_id, ai_res["report_type"])
+            def _fetch_report_row():
+                conn = get_db()
+                r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+                conn.close()
+                return r
+
+            report_row = await run_db(_fetch_report_row)
+            notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name, clean_position(worker["position"]))
 
             if is_addon and existing_report and existing_report["group_chat_id"] and existing_report["group_message_id"]:
                 try:
@@ -1473,7 +1476,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 sent_notify_msg = await context.bot.send_message(
-                    chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd, parse_mode="Markdown"
+                    chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd, parse_mode="HTML"
                 )
                 await run_db(set_report_group_message, report_id, dest_chat, sent_notify_msg.message_id)
             except Exception as e:
@@ -1509,7 +1512,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await query.answer("Это действие доступно только отделу контроля складовки.", show_alert=True)
+        await query.answer("⛔ Недостаточно прав. Действие доступно только отделу контроля.", show_alert=True)
         return
         
     data = query.data
@@ -1559,7 +1562,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         if report and worker:
             worker_name = f"{worker['last_name']} {worker['first_name']}"
-            text, kbd = await render_report_message_from_row(report, worker_name)
+            text, kbd = await render_report_message_from_row(report, worker_name, clean_position(worker["position"]))
             try:
                 await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
             except Exception as e:
@@ -1597,7 +1600,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         async_sync_gsheets_background()
         
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
-        text, kbd = await render_report_message_from_row(report, worker_name)
+        position = clean_position(worker["position"]) if worker else "?"
+        text, kbd = await render_report_message_from_row(report, worker_name, position)
         try:
             await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
         except Exception as e:
@@ -1674,7 +1678,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             async_sync_gsheets_background()
             
             worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
-            text, kbd = await render_report_message_from_row(report, worker_name)
+            position = clean_position(worker["position"]) if worker else "?"
+            text, kbd = await render_report_message_from_row(report, worker_name, position)
             try:
                 await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
             except Exception as e:
@@ -1708,7 +1713,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         async_sync_gsheets_background()
         
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
-        text, kbd = await render_report_message_from_row(report, worker_name)
+        position = clean_position(worker["position"]) if worker else "?"
+        text, kbd = await render_report_message_from_row(report, worker_name, position)
         try:
             await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
         except Exception as e:
@@ -1754,7 +1760,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         async_sync_gsheets_background()
         
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
-        text, kbd = await render_report_message_from_row(report, worker_name)
+        position = clean_position(worker["position"]) if worker else "?"
+        text, kbd = await render_report_message_from_row(report, worker_name, position)
         try:
             await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
         except Exception as e:
