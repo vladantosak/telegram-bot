@@ -168,33 +168,49 @@ def update_message_metadata(original_text: str, is_ok: bool | None = None, comme
 def update_message_text_fields(original_text: str, is_ok: bool, new_comment: str) -> str:
     return update_message_metadata(original_text, is_ok=is_ok, comment=new_comment, is_manual=True)
 
+def _resolve_report_type(report_id: int, report_type: str | None) -> str:
+    if report_type is not None:
+        return report_type
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT report_type FROM reports WHERE id = ?", (report_id,)).fetchone()
+        conn.close()
+        return row["report_type"] if row else "status"
+    except Exception:
+        return "status"
+
 def make_report_keyboard(report_id: int, report_type: str | None = None) -> InlineKeyboardMarkup:
-    if report_type is None:
-        try:
-            conn = get_db()
-            row = conn.execute("SELECT report_type FROM reports WHERE id = ?", (report_id,)).fetchone()
-            conn.close()
-            report_type = row["report_type"] if row else "status"
-        except Exception:
-            report_type = "status"
-            
-    # Compact icon-only row, no text labels - callback_data and every handler behind these
-    # buttons are unchanged, only the visible caption shrank. Telegram can't hide inline
-    # buttons from specific chat members, so "неприметность" here is purely visual; the real
-    # access control is the is_admin() check at the top of handle_callback_query, which gates
-    # every one of these callback_data prefixes before anything runs.
-    # 🔄 = toggle ОК/НЕ ОК (fix_toggle_), 📝 = edit comment (edit_comment_),
-    # 🕒 = edit slot time, status only (edit_time_), 🔀 = toggle Статус/Факт (toggle_type_)
-    icon_row = [
-        InlineKeyboardButton("🔄", callback_data=f"fix_toggle_{report_id}"),
-        InlineKeyboardButton("📝", callback_data=f"edit_comment_{report_id}"),
+    """Collapsed state (default): a single "⚙️ Действия" button. Telegram can't hide inline
+    buttons from specific chat members, so this button and the message itself are visible to
+    everyone in the group - the real access control is the is_admin() check at the top of
+    handle_callback_query, which gates actions_expand_ itself and every action behind it
+    before anything runs. report_type isn't needed for the collapsed button itself, but stays
+    in the signature so every existing caller (which already resolves/passes it) needs no
+    change."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Действия", callback_data=f"actions_expand_{report_id}")]])
+
+def make_report_actions_expanded_keyboard(report_id: int, report_type: str | None = None) -> InlineKeyboardMarkup:
+    """Expanded state, shown after an admin taps "⚙️ Действия" - the same 4 actions as
+    before, just reached one extra tap in. callback_data is unchanged from before this
+    collapse/expand redesign, so every existing handler (fix_toggle_/edit_comment_/
+    edit_time_/toggle_type_) keeps working exactly as it did."""
+    report_type = _resolve_report_type(report_id, report_type)
+    rows = [
+        [
+            InlineKeyboardButton("✏️ Изменить оценку", callback_data=f"fix_toggle_{report_id}"),
+            InlineKeyboardButton("📝 Изменить комментарий", callback_data=f"edit_comment_{report_id}"),
+        ],
     ]
+    second_row = []
     if report_type == "status":
         # Lets an admin correct a report misattributed to the wrong schedule slot (e.g. the
         # "nearest slot" pick landed on the wrong one) without having to delete and redo it.
-        icon_row.append(InlineKeyboardButton("🕒", callback_data=f"edit_time_{report_id}"))
-    icon_row.append(InlineKeyboardButton("🔀", callback_data=f"toggle_type_{report_id}"))
-    return InlineKeyboardMarkup([icon_row])
+        second_row.append(InlineKeyboardButton("🕒 Изменить время", callback_data=f"edit_time_{report_id}"))
+    type_btn_text = "📌 Сделать Итогом дня" if report_type == "status" else "📌 Сделать Статусом"
+    second_row.append(InlineKeyboardButton(type_btn_text, callback_data=f"toggle_type_{report_id}"))
+    rows.append(second_row)
+    rows.append([InlineKeyboardButton("◀️ Свернуть", callback_data=f"actions_collapse_{report_id}")])
+    return InlineKeyboardMarkup(rows)
 
 def make_video_selection_keyboard(report_id: int, action_type: str, video_items: list[dict]) -> InlineKeyboardMarkup:
     prefix = "tg" if action_type == "toggle" else "ed"
@@ -1545,6 +1561,26 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 )
             except Exception as e:
                 logger.warning(f"Не удалось обновить сообщение админу {rm['admin_chat_id']} после обработки отчёта {report_id}: {e}")
+        return
+
+    # 0b. Expand/collapse the "⚙️ Действия" button into the 4 action buttons and back.
+    # is_admin(user_id) was already checked above, at the top of this function, before this
+    # dispatch is even reached - so a non-admin tapping "⚙️ Действия" never gets here at all,
+    # matching "проверка прав И на разворачивание, И на каждое действие отдельно".
+    if data.startswith("actions_expand_"):
+        report_id = int(data.split("_")[-1])
+        try:
+            await query.edit_message_reply_markup(reply_markup=make_report_actions_expanded_keyboard(report_id))
+        except Exception as e:
+            logger.error(f"Ошибка при разворачивании меню действий отчёта {report_id}: {e}")
+        return
+
+    if data.startswith("actions_collapse_"):
+        report_id = int(data.split("_")[-1])
+        try:
+            await query.edit_message_reply_markup(reply_markup=make_report_keyboard(report_id))
+        except Exception as e:
+            logger.error(f"Ошибка при сворачивании меню действий отчёта {report_id}: {e}")
         return
 
     # 1. Back to main menu
