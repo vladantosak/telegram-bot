@@ -73,7 +73,8 @@ from db import (
     get_missed_status_reason, check_and_update_remark_alert_threshold, get_recent_remarks,
     is_message_already_processed, is_missed_reason_request_enabled,
     resolve_unrecognized_report, count_consecutive_unrecognized_reports,
-    save_speech_review_message, get_speech_review_messages, set_report_media_group_message
+    save_speech_review_message, get_speech_review_messages, set_report_media_group_message,
+    count_effective_remarks
 )
 
 REMARK_REQUIRED_ACTION_TEXT = (
@@ -180,34 +181,35 @@ def _resolve_report_type(report_id: int, report_type: str | None) -> str:
         return "status"
 
 def make_report_keyboard(report_id: int, report_type: str | None = None) -> InlineKeyboardMarkup:
-    """Collapsed state (default): a single "⚙️ Действия" button. Telegram can't hide inline
-    buttons from specific chat members, so this button and the message itself are visible to
-    everyone in the group - the real access control is the is_admin() check at the top of
-    handle_callback_query, which gates actions_expand_ itself and every action behind it
-    before anything runs. report_type isn't needed for the collapsed button itself, but stays
-    in the signature so every existing caller (which already resolves/passes it) needs no
-    change."""
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Действия", callback_data=f"actions_expand_{report_id}")]])
+    """Collapsed state (default): a single bare "⚙️" button, no label - kept as small and
+    unobtrusive as Telegram allows. Telegram can't hide inline buttons from specific chat
+    members, so this button and the message itself are visible to everyone in the group -
+    the real access control is the is_admin() check at the top of handle_callback_query,
+    which gates actions_expand_ itself and every action behind it before anything runs.
+    report_type isn't needed for the collapsed button itself, but stays in the signature so
+    every existing caller (which already resolves/passes it) needs no change."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⚙️", callback_data=f"actions_expand_{report_id}")]])
 
 def make_report_actions_expanded_keyboard(report_id: int, report_type: str | None = None) -> InlineKeyboardMarkup:
-    """Expanded state, shown after an admin taps "⚙️ Действия" - the same 4 actions as
-    before, just reached one extra tap in. callback_data is unchanged from before this
-    collapse/expand redesign, so every existing handler (fix_toggle_/edit_comment_/
-    edit_time_/toggle_type_) keeps working exactly as it did."""
+    """Expanded state, shown after an admin taps "⚙️": Оценка (fix_toggle_) / Тип
+    (toggle_type_) / Время (edit_time_, status only) / Действия (edit_action_, a manual
+    override for "Требуемые действия") - "📝 Изменить комментарий" is no longer on this quick
+    menu (Формат отчета no longer shows a freeform summary to edit - see render_report_
+    message_from_row), but edit_comment_/ed_overall_/ed_vid_ still exist unchanged in case
+    that's needed again."""
     report_type = _resolve_report_type(report_id, report_type)
     rows = [
         [
-            InlineKeyboardButton("✏️ Изменить оценку", callback_data=f"fix_toggle_{report_id}"),
-            InlineKeyboardButton("📝 Изменить комментарий", callback_data=f"edit_comment_{report_id}"),
+            InlineKeyboardButton("✏️ Оценка", callback_data=f"fix_toggle_{report_id}"),
+            InlineKeyboardButton("🔄 Тип", callback_data=f"toggle_type_{report_id}"),
         ],
     ]
     second_row = []
     if report_type == "status":
         # Lets an admin correct a report misattributed to the wrong schedule slot (e.g. the
         # "nearest slot" pick landed on the wrong one) without having to delete and redo it.
-        second_row.append(InlineKeyboardButton("🕒 Изменить время", callback_data=f"edit_time_{report_id}"))
-    type_btn_text = "📌 Сделать Итогом дня" if report_type == "status" else "📌 Сделать Статусом"
-    second_row.append(InlineKeyboardButton(type_btn_text, callback_data=f"toggle_type_{report_id}"))
+        second_row.append(InlineKeyboardButton("🕒 Время", callback_data=f"edit_time_{report_id}"))
+    second_row.append(InlineKeyboardButton("📋 Действия", callback_data=f"edit_action_{report_id}"))
     rows.append(second_row)
     rows.append([InlineKeyboardButton("◀️ Свернуть", callback_data=f"actions_collapse_{report_id}")])
     return InlineKeyboardMarkup(rows)
@@ -242,39 +244,83 @@ def make_video_selection_keyboard(report_id: int, action_type: str, video_items:
     buttons.append([InlineKeyboardButton("❌ Назад", callback_data=f"back_to_main_{report_id}")])
     return InlineKeyboardMarkup(buttons)
 
+def _derive_not_ok_reason(format_comment: str, content_ok: bool, is_late: bool) -> str:
+    """Maps whatever the content-quality check produced (format_comment's own free-text
+    issue, e.g. "не ОК - на видео молчал") plus the separate is_late flag onto ONE of the 4
+    fixed reason phrases the group message is allowed to show - never the LLM's raw text
+    verbatim. The content-based reasons are only ever considered when content_ok is False -
+    if an admin has manually flipped is_ok to True (fix_toggle_), format_comment may still
+    contain old wording like "не ОК - на видео молчал" verbatim, and that stale text must
+    NOT resurface as the reason once content has been marked fine; the only way this report
+    is still не ОК for THIS message at that point is lateness."""
+    if not content_ok:
+        lower = (format_comment or "").lower()
+        if "молчал" in lower:
+            return "молчал в видео"
+        if "неразборч" in lower:
+            return "говорил неразборчиво"
+        return "не указал объём работы"
+    return "прислал поздно"
+
 async def render_report_message_from_row(report: dict, worker_name: str, position: str = "") -> tuple[str, InlineKeyboardMarkup]:
-    """Builds the group message: name+position (bold) - статус/факт (underlined) date за
-    time / Формат отчета / Требуемые действия / Обработанный отчет - sent with
-    parse_mode="HTML", so every dynamic piece (name, position, summaries, cleaned report
-    text) MUST be html.escape()'d before going in, or a stray "<"/">"/"&" in someone's
-    spoken text would break the tags for the whole message. No per-video breakdown or raw
-    transcript here - full detail still goes to Google Sheets unchanged (sync_gsheets_task
-    reads the same `reports` row directly)."""
+    """Builds the group message: name+position (bold) - ✅/⚠️ статус/факт (underlined) date
+    за time / Формат отчета / Требуемые действия / Со слов сотрудника - sent with
+    parse_mode="HTML", so every dynamic piece (name, position, cleaned report text) MUST be
+    html.escape()'d before going in, or a stray "<"/">"/"&" in someone's spoken text would
+    break the tags for the whole message. No per-video breakdown or raw transcript here -
+    full detail still goes to Google Sheets unchanged (sync_gsheets_task reads the same
+    `reports` row directly).
+
+    "Формат отчета"/"Требуемые действия"/the ✅⚠️ icon are all computed HERE from is_ok +
+    is_late (+ the cumulative remark count), never read as stored free text - this is what
+    lets the existing fix_toggle_/toggle_type_ buttons "just work": flipping is_ok or
+    report_type and re-rendering via this same function automatically recomputes every
+    dependent field, no separate update logic needed. required_action is the one exception:
+    if an admin has set a manual override (the "📋 Действия" button), that verbatim text is
+    shown instead of the auto-computed wording, until they change it again."""
     report_id = report["id"]
     report_type = report["report_type"]
     slot_time = report["slot_time"]
     report_date = report["report_date"]
     received_at = report["received_at"] or ""
-    is_ok = bool(report["is_ok"])
+    content_ok = bool(report["is_ok"])
+    is_late = bool(report["is_late"])
     format_comment = report["format_comment"] or ""
     raw_text = report["raw_text"] or ""
+
+    # Per product decision: lateness alone makes a report не ОК for THIS message and its
+    # remark counter, even though the stored is_ok/Сводка computation is untouched (a
+    # late-but-content-fine report stays is_ok=1 in the database).
+    effective_not_ok = (not content_ok) or is_late
+    verdict_icon = "⚠️" if effective_not_ok else "✅"
 
     formatted_date = html.escape(format_show_date(report_date))
     if report_type == "daily_fact":
         time_str = html.escape(received_at[:5] if received_at else "??:??")
-        type_html = f"<u>факт</u> {formatted_date} за {time_str}"
+        type_html = f"{verdict_icon} <u>факт</u> {formatted_date} за {time_str}"
     elif report_type == "status":
         time_str = html.escape(slot_time or "??:??")
-        type_html = f"<u>статус</u> {formatted_date} за {time_str}"
+        type_html = f"{verdict_icon} <u>статус</u> {formatted_date} за {time_str}"
     else:
         type_label = {"unrecognized_speech": "не удалось распознать речь"}.get(report_type, report_type)
         type_html = f"{html.escape(type_label)} {formatted_date}"
 
-    summaries = extract_report_summaries(format_comment)
-    verdict = "всё ОК" if is_ok else "не ОК"
-    format_line = f"{verdict} - {html.escape('; '.join(summaries))}" if summaries else verdict
+    if effective_not_ok:
+        reason = _derive_not_ok_reason(format_comment, content_ok, is_late)
+        format_line = f"⚠️ не ОК - {html.escape(reason)}"
+    else:
+        format_line = "✅ всё ОК"
 
-    action_line = "ничего не предпринимать" if is_ok else "сделано замечание, требуется проверка"
+    if report["action_override"]:
+        action_line_html = html.escape(report["required_action"] or "")
+    elif not effective_not_ok:
+        action_line_html = "ничего не предпринимать"
+    else:
+        remark_count = await run_db(count_effective_remarks, report["telegram_id"])
+        if remark_count >= 3:
+            action_line_html = "сделано замечание, нарушение повторяется — делегировано отделу контроля"
+        else:
+            action_line_html = "сделано замечание сотруднику"
 
     cleaned_text = await clean_report_async(raw_text)
 
@@ -282,8 +328,8 @@ async def render_report_message_from_row(report: dict, worker_name: str, positio
     notify_text = (
         f"{header}\n"
         f"<b>Формат отчета:</b> {format_line}\n"
-        f"<b>Требуемые действия:</b> {html.escape(action_line)}\n\n"
-        f"<b>Обработанный отчет:</b> {html.escape(cleaned_text)}"
+        f"<b>Требуемые действия:</b> {action_line_html}\n\n"
+        f"<b>Со слов сотрудника:</b> {html.escape(cleaned_text)}"
     )
     inline_kbd = make_report_keyboard(report_id, report_type)
 
@@ -1146,6 +1192,74 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Не удалось отправить подтверждение изменения времени сдачи: {e}")
         return
 
+    if is_admin(user_id) and context.user_data.get("editing_action_report_id"):
+        report_id = context.user_data["editing_action_report_id"]
+        original_chat_id = context.user_data.get("editing_action_chat_id")
+        original_msg_id = context.user_data.get("editing_action_message_id")
+
+        context.user_data.pop("editing_action_report_id", None)
+        context.user_data.pop("editing_action_chat_id", None)
+        context.user_data.pop("editing_action_message_id", None)
+        prompt_message_id = context.user_data.pop("editing_action_prompt_message_id", None)
+
+        if prompt_message_id and original_chat_id:
+            try:
+                await context.bot.delete_message(chat_id=original_chat_id, message_id=prompt_message_id)
+            except Exception:
+                pass
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        new_action_text = update.message.text.strip() if update.message.text else ""
+        if not new_action_text or new_action_text.lower() in ("отмена", "❌ отмена"):
+            return
+
+        def _apply_action_override():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            if not r:
+                conn.close()
+                return None, None
+            conn.execute(
+                "UPDATE reports SET required_action = ?, action_override = 1 WHERE id = ?",
+                (new_action_text, report_id)
+            )
+            conn.commit()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            w = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (r["telegram_id"],)).fetchone()
+            conn.close()
+            return r, w
+
+        report, worker = await run_db(_apply_action_override)
+        if not report:
+            return
+
+        async_sync_gsheets_background()
+
+        worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+        position = clean_position(worker["position"]) if worker else "?"
+        text, kbd = await render_report_message_from_row(report, worker_name, position)
+
+        if original_chat_id and original_msg_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=original_chat_id,
+                    message_id=original_msg_id,
+                    text=text,
+                    reply_markup=kbd,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Ошибка при обновлении сообщения после изменения требуемых действий: {e}")
+
+        try:
+            await context.bot.send_message(chat_id=original_chat_id or user_id, text="✅ Требуемые действия обновлены.")
+        except Exception as e:
+            logger.warning(f"Не удалось отправить подтверждение изменения требуемых действий: {e}")
+        return
+
     if is_admin(user_id):
         return
 
@@ -1620,16 +1734,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         original_chat_id = (
             context.user_data.get("editing_comment_chat_id")
             or context.user_data.get("editing_slot_time_chat_id")
+            or context.user_data.get("editing_action_chat_id")
         )
         original_msg_id = (
             context.user_data.get("editing_comment_message_id")
             or context.user_data.get("editing_slot_time_message_id")
+            or context.user_data.get("editing_action_message_id")
         )
         for key in (
             "editing_comment_report_id", "editing_comment_video_num", "editing_comment_chat_id",
             "editing_comment_message_id", "editing_comment_original_text", "editing_comment_prompt_message_id",
             "editing_slot_time_report_id", "editing_slot_time_chat_id", "editing_slot_time_message_id",
             "editing_slot_time_prompt_message_id",
+            "editing_action_report_id", "editing_action_chat_id", "editing_action_message_id",
+            "editing_action_prompt_message_id",
         ):
             context.user_data.pop(key, None)
 
@@ -1754,6 +1872,37 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=make_cancel_edit_keyboard(report_id)
         )
         context.user_data["editing_slot_time_prompt_message_id"] = prompt_msg.message_id
+        return
+
+    # Manual override for "Требуемые действия" - lets an admin write their own text instead
+    # of the auto-computed "ничего не предпринимать"/"сделано замечание.../делегировано..."
+    if data.startswith("edit_action_"):
+        report_id = int(data.split("_")[-1])
+
+        def _fetch_report_for_action():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            conn.close()
+            return r
+
+        report = await run_db(_fetch_report_for_action)
+        if not report:
+            return
+
+        context.user_data["editing_action_report_id"] = report_id
+        context.user_data["editing_action_chat_id"] = query.message.chat.id
+        context.user_data["editing_action_message_id"] = query.message.message_id
+
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        prompt_msg = await query.message.reply_text(
+            "📋 Введите текст для «Требуемые действия»:",
+            reply_markup=make_cancel_edit_keyboard(report_id)
+        )
+        context.user_data["editing_action_prompt_message_id"] = prompt_msg.message_id
         return
 
     # 3. Main Toggle Button -> Choose overall or video

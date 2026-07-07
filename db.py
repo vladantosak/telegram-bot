@@ -180,6 +180,12 @@ def init_db():
         conn.execute("ALTER TABLE reports ADD COLUMN group_chat_id INTEGER")
     if "group_message_id" not in cols_reports:
         conn.execute("ALTER TABLE reports ADD COLUMN group_message_id INTEGER")
+    if "action_override" not in cols_reports:
+        # Set when an admin manually types a custom "Требуемые действия" text (the "📋
+        # Действия" button) - required_action then holds that exact text verbatim instead of
+        # the auto-computed "ничего не предпринимать"/"сделано замечание.../делегировано..."
+        # wording, until the admin edits it again.
+        conn.execute("ALTER TABLE reports ADD COLUMN action_override INTEGER NOT NULL DEFAULT 0")
 
     conn.execute(
         """
@@ -641,6 +647,33 @@ def count_remarks(telegram_id: int) -> int:
     ).fetchone()
     conn.close()
     return row["c"] if row else 0
+
+def count_effective_remarks(telegram_id: int) -> int:
+    """Cumulative, never-reset count of this worker's status/daily_fact reports that are
+    either content-not-ok OR late - the basis for the "Требуемые действия" escalation shown
+    in the group message ("сделано замечание" below 3, "делегировано отделу контроля" once
+    it reaches 3 - sticky, stays "делегировано" on every report after that too). Deliberately
+    separate from count_remarks (content-only, status-only) since a late-but-content-ok
+    report is a NEW category of "не ОК" for THIS display only, per product decision - it does
+    NOT change the stored is_ok value or feed the existing count_remarks/remark-alert-
+    threshold admin notification, both of which stay exactly as they were."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT COUNT(*) as c FROM reports WHERE telegram_id = ? AND report_type IN ('status', 'daily_fact') "
+        "AND (is_ok = 0 OR is_late = 1)",
+        (telegram_id,)
+    ).fetchone()
+    conn.close()
+    return row["c"] if row else 0
+
+def set_report_action_override(report_id: int, text: str):
+    conn = get_db()
+    conn.execute(
+        "UPDATE reports SET required_action = ?, action_override = 1 WHERE id = ?",
+        (text, report_id)
+    )
+    conn.commit()
+    conn.close()
 
 def get_recent_remarks(telegram_id: int, limit: int = 5) -> list:
     conn = get_db()
