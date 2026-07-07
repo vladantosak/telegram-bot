@@ -284,6 +284,32 @@ def init_db():
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_speech_review_report ON speech_review_messages(report_id)")
+    # Holds a report's already-transcribed text while the content-analysis LLM call
+    # (check_status) is unavailable (rate limit/timeout/etc.) - retried on a backoff schedule
+    # by a periodic job, never counted as a remark, never shown to the employee as a "не ОК"
+    # verdict. The original video (if any) is only referenced by source_chat_id/message_id,
+    # never re-downloaded or duplicated - it stays exactly where Telegram already has it
+    # until a successful retry forwards it to the work group.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_ai_reprocess (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            report_date TEXT NOT NULL,
+            report_type TEXT NOT NULL,
+            text_content TEXT NOT NULL,
+            submitted_at TEXT NOT NULL,
+            source_chat_id INTEGER,
+            source_message_id INTEGER,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_retry_at TEXT NOT NULL,
+            last_error TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_ai_reprocess_due ON pending_ai_reprocess(status, next_retry_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_date ON reports(report_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_worker_date ON reports(telegram_id, report_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_workers_pos ON workers(position)")
@@ -635,6 +661,59 @@ def get_speech_review_messages(report_id: int) -> list:
 def set_report_media_group_message(media_id: int, group_message_id: int):
     conn = get_db()
     conn.execute("UPDATE report_media SET group_message_id = ? WHERE id = ?", (group_message_id, media_id))
+    conn.commit()
+    conn.close()
+
+def save_pending_ai_reprocess(telegram_id: int, report_date: str, report_type: str, text_content: str,
+                               submitted_at: str, source_chat_id: int | None, source_message_id: int | None,
+                               next_retry_at: str, last_error: str, created_at: str) -> int:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO pending_ai_reprocess
+            (telegram_id, report_date, report_type, text_content, submitted_at,
+             source_chat_id, source_message_id, attempt_count, next_retry_at, last_error, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'pending', ?)
+        """,
+        (telegram_id, report_date, report_type, text_content, submitted_at,
+         source_chat_id, source_message_id, next_retry_at, last_error, created_at)
+    )
+    conn.commit()
+    inserted_id = cur.lastrowid
+    conn.close()
+    return inserted_id
+
+def get_due_ai_reprocess_items(now_str: str) -> list:
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM pending_ai_reprocess WHERE status = 'pending' AND next_retry_at <= ? ORDER BY id",
+        (now_str,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def reschedule_ai_reprocess(item_id: int, next_retry_at: str, last_error: str):
+    conn = get_db()
+    conn.execute(
+        "UPDATE pending_ai_reprocess SET attempt_count = attempt_count + 1, next_retry_at = ?, last_error = ? WHERE id = ?",
+        (next_retry_at, last_error, item_id)
+    )
+    conn.commit()
+    conn.close()
+
+def mark_ai_reprocess_escalated(item_id: int, last_error: str):
+    conn = get_db()
+    conn.execute(
+        "UPDATE pending_ai_reprocess SET attempt_count = attempt_count + 1, status = 'escalated', last_error = ? WHERE id = ?",
+        (last_error, item_id)
+    )
+    conn.commit()
+    conn.close()
+
+def delete_pending_ai_reprocess(item_id: int):
+    conn = get_db()
+    conn.execute("DELETE FROM pending_ai_reprocess WHERE id = ?", (item_id,))
     conn.commit()
     conn.close()
 

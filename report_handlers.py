@@ -3,7 +3,7 @@ import html
 import re
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes, ConversationHandler
 
@@ -74,7 +74,9 @@ from db import (
     is_message_already_processed, is_missed_reason_request_enabled,
     resolve_unrecognized_report, count_consecutive_unrecognized_reports,
     save_speech_review_message, get_speech_review_messages, set_report_media_group_message,
-    count_effective_remarks
+    count_effective_remarks,
+    save_pending_ai_reprocess, get_due_ai_reprocess_items, reschedule_ai_reprocess,
+    mark_ai_reprocess_escalated, delete_pending_ai_reprocess
 )
 
 REMARK_REQUIRED_ACTION_TEXT = (
@@ -111,7 +113,7 @@ async def notify_admins_if_remark_threshold_crossed(context: ContextTypes.DEFAUL
 
 from ai import (
     transcribe_audio, clean_report, check_status, classify_report_type,
-    assess_transcription_quality
+    assess_transcription_quality, AITechnicalError
 )
 
 logger = logging.getLogger(__name__)
@@ -357,6 +359,180 @@ async def check_status_async(text: str, report_type_override: str | None = None)
 
 async def classify_report_type_async(text: str) -> dict:
     return await asyncio.to_thread(classify_report_type, text)
+
+# Backoff schedule for retrying check_status after an AITechnicalError (rate limit/timeout/
+# infra failure). Used only when the API didn't hand back a specific "try again in Ns" hint
+# (AITechnicalError.retry_after_seconds) - when it did, that exact wait is used instead.
+AI_RETRY_BACKOFF_SCHEDULE = [30, 60, 300]
+AI_RETRY_MAX_ATTEMPTS = len(AI_RETRY_BACKOFF_SCHEDULE)
+
+async def schedule_ai_retry(context: ContextTypes.DEFAULT_TYPE, *, telegram_id: int, report_date: str,
+                             report_type: str, text_content: str, submitted_at_str: str,
+                             source_chat_id: int | None, source_message_id: int | None,
+                             error: AITechnicalError, employee_chat_id: int):
+    """Called the FIRST time content-analysis fails technically for a report. Never treats
+    this as "не ОК" and never shows the employee anything about the actual error - persists
+    everything needed to redo just the analysis step later (process_due_ai_reprocess_items,
+    run periodically from bot.py) and tells the employee their video is still being handled,
+    just slower than usual."""
+    delay = error.retry_after_seconds if error.retry_after_seconds else AI_RETRY_BACKOFF_SCHEDULE[0]
+    next_retry_at = (now_local() + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
+    await run_db(
+        save_pending_ai_reprocess,
+        telegram_id=telegram_id, report_date=report_date, report_type=report_type,
+        text_content=text_content, submitted_at=submitted_at_str,
+        source_chat_id=source_chat_id, source_message_id=source_message_id,
+        next_retry_at=next_retry_at, last_error=error.message,
+        created_at=now_local().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    logger.warning(f"[ai_retry] Технический сбой ИИ для пользователя {telegram_id}, отчёт отложен на {delay:.0f} сек: {error.message}")
+    try:
+        await context.bot.send_message(
+            chat_id=employee_chat_id,
+            text="⏳ Видео получено, обрабатываем ваш отчёт. Это может занять немного больше времени, чем обычно."
+        )
+    except Exception as e:
+        logger.warning(f"[ai_retry] Не удалось отправить сообщение об отложенной обработке пользователю {employee_chat_id}: {e}")
+
+async def notify_admin_ai_technical_failure(context: ContextTypes.DEFAULT_TYPE, item: dict, error_message: str):
+    """The one place a raw API error message is shown to anyone - admins need the real
+    detail to check the provider's billing/rate-limit dashboard, unlike the employee."""
+    worker = await run_db(get_worker, item["telegram_id"])
+    w_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {item['telegram_id']}"
+    alert_text = (
+        "⚠️ Техническая ошибка при обработке отчёта.\n"
+        f"Сотрудник: {html.escape(w_name)}\n"
+        f"Отчёт получен в {html.escape(item['submitted_at'])} ({html.escape(item['report_date'])}), "
+        f"но не обработан после {item['attempt_count'] + 1} попыток из-за ошибки API.\n"
+        f"Детали: {html.escape(error_message)}\n"
+        "Требуется проверить лимиты/доступность LLM-провайдера."
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=alert_text, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Не удалось отправить админу {admin_id} уведомление о технической ошибке ИИ: {e}")
+
+async def _retry_one_ai_reprocess_item(item: dict, context: ContextTypes.DEFAULT_TYPE):
+    item_id = item["id"]
+    telegram_id = item["telegram_id"]
+    report_type = item["report_type"]
+    text_content = item["text_content"]
+
+    try:
+        ai_res = await check_status_async(text_content, report_type_override=report_type)
+    except AITechnicalError as e:
+        attempts_so_far = item["attempt_count"] + 1
+        if attempts_so_far >= AI_RETRY_MAX_ATTEMPTS:
+            await run_db(mark_ai_reprocess_escalated, item_id, e.message)
+            await notify_admin_ai_technical_failure(context, item, e.message)
+            logger.error(f"[ai_retry] Отчёт пользователя {telegram_id} эскалирован админам после {attempts_so_far} попыток: {e.message}")
+            return
+        delay = e.retry_after_seconds if e.retry_after_seconds else AI_RETRY_BACKOFF_SCHEDULE[min(attempts_so_far, len(AI_RETRY_BACKOFF_SCHEDULE) - 1)]
+        next_retry_at = (now_local() + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
+        await run_db(reschedule_ai_reprocess, item_id, next_retry_at, e.message)
+        return
+
+    # Success - AI is back. Complete this report exactly as if it had just arrived now,
+    # using the ORIGINAL submission time for slot attribution/lateness, not the retry time.
+    worker = await run_db(get_worker, telegram_id)
+    if not worker:
+        await run_db(delete_pending_ai_reprocess, item_id)
+        return
+    w_name = f"{worker['last_name']} {worker['first_name']}"
+    sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
+
+    try:
+        h, m, s = map(int, item["submitted_at"].split(":"))
+        y, mo, d = map(int, item["report_date"].split("-"))
+        submitted_at = datetime(y, mo, d, h, m, s)
+    except Exception:
+        submitted_at = now_local()
+
+    if report_type == "status":
+        submitted_slots = await run_db(get_submitted_status_slots, telegram_id, item["report_date"])
+        slot_time, is_late = pick_target_status_slot(sched_list, submitted_at, submitted_slots, w_name)
+    else:
+        slot_time, is_late = None, False
+
+    existing = await run_db(get_existing_report_row, telegram_id, item["report_date"], report_type, slot_time)
+    action_text = REMARK_REQUIRED_ACTION_TEXT if (report_type == "status" and not ai_res["is_ok"]) else ai_res["required_action"]
+    if existing:
+        await run_db(
+            update_report_text_and_ai, report_id=existing["id"], is_ok=ai_res["is_ok"],
+            format_comment=ai_res["format_comment"], required_action=action_text,
+            raw_text=text_content, received_at=item["submitted_at"]
+        )
+        report_id = existing["id"]
+    else:
+        report_id = await run_db(
+            save_report, telegram_id=telegram_id, report_date=item["report_date"], report_type=report_type,
+            slot_time=slot_time if report_type == "status" else None, received_at=item["submitted_at"],
+            is_ok=ai_res["is_ok"], is_late=is_late if report_type == "status" else 0,
+            format_comment=ai_res["format_comment"], required_action=action_text, raw_text=text_content
+        )
+    async_sync_gsheets_background()
+
+    if report_type == "status" and not ai_res["is_ok"]:
+        await notify_admins_if_remark_threshold_crossed(context, telegram_id, w_name)
+
+    dest_chat = await run_db(get_worker_target_group, worker)
+    copied_msg_id = None
+    if item["source_chat_id"] and item["source_message_id"]:
+        try:
+            copied = await context.bot.copy_message(
+                chat_id=dest_chat, from_chat_id=item["source_chat_id"], message_id=item["source_message_id"]
+            )
+            copied_msg_id = copied.message_id
+            await run_db(add_report_media, report_id, item["source_chat_id"], item["source_message_id"], copied_msg_id, 1, item["submitted_at"])
+        except Exception as e:
+            logger.error(f"[ai_retry] Ошибка пересылки видео отложенного отчёта {report_id} в группу: {e}")
+
+    def _fetch_report_row():
+        conn = get_db()
+        r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        conn.close()
+        return r
+
+    report_row = await run_db(_fetch_report_row)
+    notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name, clean_position(worker["position"]))
+    try:
+        sent = await context.bot.send_message(
+            chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd,
+            reply_to_message_id=copied_msg_id, parse_mode="HTML"
+        )
+        await run_db(set_report_group_message, report_id, dest_chat, sent.message_id)
+    except Exception as e:
+        logger.error(f"[ai_retry] Ошибка отправки карточки отложенного отчёта {report_id} в группу: {e}")
+
+    label = "Статус" if report_type == "status" else "Факт"
+    try:
+        if ai_res["is_ok"]:
+            personal_text = f"✅ {label} за {slot_time} принят без замечаний." if report_type == "status" else "✅ Факт получен и принят без замечаний."
+        else:
+            personal_text = (
+                f"❌ {label} НЕ ОК. {_short_issue_text([ai_res])}\n"
+                "Сотрудник контроля свяжется с вами и скажет замечания.\n"
+                "Напоминаем, что при частом допущении ошибок в сдаче отчетов, "
+                "проблема будет делегироваться руководству."
+            )
+        await context.bot.send_message(chat_id=telegram_id, text=personal_text)
+    except Exception as e:
+        logger.warning(f"[ai_retry] Не удалось отправить личный фидбек по отложенному отчёту пользователю {telegram_id}: {e}")
+
+    await run_db(delete_pending_ai_reprocess, item_id)
+
+async def process_due_ai_reprocess_items(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic job (registered in bot.py) - picks up every report whose retry is due and
+    re-attempts content analysis for it. Runs one at a time, sequentially, since these are
+    rare (only fire when the LLM API itself is having trouble)."""
+    now_str = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    items = await run_db(get_due_ai_reprocess_items, now_str)
+    for item in items:
+        try:
+            await _retry_one_ai_reprocess_item(item, context)
+        except Exception:
+            logger.exception(f"[ai_retry] Необработанная ошибка при повторной обработке отчёта id={item['id']}")
 
 async def assess_transcription_quality_async(text: str, duration_seconds: float | None) -> dict:
     return await asyncio.to_thread(assess_transcription_quality, text, duration_seconds)
@@ -631,22 +807,49 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         if kind == "mixed":
             status_text = classification["status_part"] or text_content
             fact_text = classification["fact_part"] or text_content
-            status_ai = await check_status_async(status_text, report_type_override="status")
-            fact_ai = await check_status_async(fact_text, report_type_override="daily_fact")
-            evaluated_items.append({
-                "item": item, "ai_res": status_ai, "report_type": "status",
-                "text_content": status_text, "now": now, "upd": upd, "date_str": date_str
-            })
-            evaluated_items.append({
-                "item": item, "ai_res": fact_ai, "report_type": "daily_fact",
-                "text_content": fact_text, "now": now, "upd": upd, "date_str": date_str
-            })
+            # The two halves of a "mixed" video are independent content-analysis calls - if
+            # one hits a technical error, the other can still succeed normally; only the
+            # failing half gets queued for retry.
+            try:
+                status_ai = await check_status_async(status_text, report_type_override="status")
+                evaluated_items.append({
+                    "item": item, "ai_res": status_ai, "report_type": "status",
+                    "text_content": status_text, "now": now, "upd": upd, "date_str": date_str
+                })
+            except AITechnicalError as e:
+                await schedule_ai_retry(
+                    context, telegram_id=user_id, report_date=date_str, report_type="status",
+                    text_content=status_text, submitted_at_str=now.strftime("%H:%M:%S"),
+                    source_chat_id=upd.effective_chat.id, source_message_id=upd.message.message_id,
+                    error=e, employee_chat_id=user_id,
+                )
+            try:
+                fact_ai = await check_status_async(fact_text, report_type_override="daily_fact")
+                evaluated_items.append({
+                    "item": item, "ai_res": fact_ai, "report_type": "daily_fact",
+                    "text_content": fact_text, "now": now, "upd": upd, "date_str": date_str
+                })
+            except AITechnicalError as e:
+                await schedule_ai_retry(
+                    context, telegram_id=user_id, report_date=date_str, report_type="daily_fact",
+                    text_content=fact_text, submitted_at_str=now.strftime("%H:%M:%S"),
+                    source_chat_id=upd.effective_chat.id, source_message_id=upd.message.message_id,
+                    error=e, employee_chat_id=user_id,
+                )
         else:
-            ai_res_pre = await check_status_async(text_content, report_type_override=kind)
-            evaluated_items.append({
-                "item": item, "ai_res": ai_res_pre, "report_type": kind,
-                "text_content": text_content, "now": now, "upd": upd, "date_str": date_str
-            })
+            try:
+                ai_res_pre = await check_status_async(text_content, report_type_override=kind)
+                evaluated_items.append({
+                    "item": item, "ai_res": ai_res_pre, "report_type": kind,
+                    "text_content": text_content, "now": now, "upd": upd, "date_str": date_str
+                })
+            except AITechnicalError as e:
+                await schedule_ai_retry(
+                    context, telegram_id=user_id, report_date=date_str, report_type=kind,
+                    text_content=text_content, submitted_at_str=now.strftime("%H:%M:%S"),
+                    source_chat_id=upd.effective_chat.id, source_message_id=upd.message.message_id,
+                    error=e, employee_chat_id=user_id,
+                )
 
     # Reports that failed the speech-recognition quality gate never reach content analysis,
     # status/fact checks, or automatic scoring - saved as their own type, forwarded to every
@@ -1359,7 +1562,34 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 await tg_file.download_to_drive(tmp_path)
                 logger.info(f"[handler] Начало транскрипции файла {tmp_path} для пользователя {user_id}")
-                text_content = await transcribe_audio_async(tmp_path)
+                try:
+                    text_content = await transcribe_audio_async(tmp_path)
+                except AITechnicalError as e:
+                    # An ASR-level infra failure (rate limit/timeout) is NOT "the worker
+                    # spoke unclearly" - that would wrongly route to the unrecognized_speech
+                    # flow, which tells the employee to "формулируйте чётче" for a problem
+                    # that has nothing to do with their speech. No automatic retry here (the
+                    # downloaded file would need to be kept around for it) - just tell the
+                    # employee plainly and let an admin know to check the API.
+                    logger.error(f"[handler] Техническая ошибка распознавания аудио для пользователя {user_id}: {e.message}")
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=admin_id,
+                                text=(
+                                    "⚠️ Техническая ошибка при распознавании речи (ASR).\n"
+                                    f"Сотрудник TG ID: {user_id}\n"
+                                    f"Детали: {html.escape(e.message)}\n"
+                                    "Сотруднику предложено отправить видео повторно. Требуется проверить лимиты/доступность LLM-провайдера."
+                                )
+                            )
+                        except Exception as notify_err:
+                            logger.error(f"Не удалось отправить админу {admin_id} уведомление об ошибке ASR: {notify_err}")
+                    await update.message.reply_text(
+                        "⏳ Не получилось обработать видео прямо сейчас из-за технической накладки. "
+                        "Пожалуйста, отправьте его ещё раз через несколько минут."
+                    )
+                    return
                 logger.info(f"[handler] Транскрипция завершена: '{text_content[:80]}'")
 
         # Media (voice/video/video_note) always proceeds from here, even on an empty or
@@ -1559,10 +1789,22 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             existing_report = await run_db(get_existing_report_row, user_id, date_str, rt, nearest_slot)
 
+            try:
+                ai_res = await check_status_async(part_text, report_type_override=rt)
+            except AITechnicalError as e:
+                # Infra failure, not a verdict on the report - queued for the periodic retry
+                # job instead of being saved as "не ОК" (see process_due_ai_reprocess_items).
+                await schedule_ai_retry(
+                    context, telegram_id=user_id, report_date=date_str, report_type=rt,
+                    text_content=part_text, submitted_at_str=now.strftime("%H:%M:%S"),
+                    source_chat_id=None, source_message_id=None,
+                    error=e, employee_chat_id=user_id,
+                )
+                return
+
             is_addon = False
             if existing_report:
                 is_addon = True
-                ai_res = await check_status_async(part_text, report_type_override=rt)
                 report_id = existing_report["id"]
                 action_text = REMARK_REQUIRED_ACTION_TEXT if (ai_res["report_type"] == "status" and not ai_res["is_ok"]) else ai_res["required_action"]
 
@@ -1576,7 +1818,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     received_at=now.strftime("%H:%M:%S")
                 )
             else:
-                ai_res = await check_status_async(part_text, report_type_override=rt)
                 action_text = REMARK_REQUIRED_ACTION_TEXT if (ai_res["report_type"] == "status" and not ai_res["is_ok"]) else ai_res["required_action"]
                 report_id = await run_db(
                     save_report,
@@ -1681,7 +1922,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if data.startswith("speechfix_status_") or data.startswith("speechfix_fact_"):
         chosen_type = "status" if data.startswith("speechfix_status_") else "daily_fact"
         report_id = int(data.split("_")[-1])
-        resolved, w_name = await resolve_unrecognized_speech_report(report_id, chosen_type, context)
+        try:
+            resolved, w_name = await resolve_unrecognized_speech_report(report_id, chosen_type, context)
+        except AITechnicalError:
+            # Infra problem (rate limit/timeout), not a conflict with another admin - the
+            # report stays report_type='unrecognized_speech', untouched, so this button still
+            # works once the admin tries again.
+            await query.answer("⏳ Технический сбой при обращении к ИИ. Попробуйте ещё раз через минуту.", show_alert=True)
+            return
         if not resolved:
             await query.answer("Этот отчёт уже был обработан другим администратором.", show_alert=True)
             return

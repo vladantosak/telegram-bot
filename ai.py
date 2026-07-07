@@ -7,6 +7,44 @@ from groq import Groq
 
 logger = logging.getLogger(__name__)
 
+class AITechnicalError(Exception):
+    """Raised when a call to the LLM API fails for infrastructure reasons (rate limit,
+    timeout, connection error, 5xx, or even a malformed/unparseable response) - NEVER a
+    verdict on the employee's report. Callers must retry, not treat this as "не ОК".
+    retry_after_seconds is the exact wait time the API told us to use (parsed out of a
+    rate-limit message like "Please try again in 20m19.104s"), or None if no such hint was
+    given (a timeout/connection error, or a limit message without a parseable duration)."""
+    def __init__(self, message: str, retry_after_seconds: float | None = None):
+        super().__init__(message)
+        self.message = message
+        self.retry_after_seconds = retry_after_seconds
+
+_RETRY_AFTER_RE = re.compile(r"try again in\s+(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?", re.IGNORECASE)
+
+def _parse_retry_after_seconds(text: str) -> float | None:
+    m = _RETRY_AFTER_RE.search(text or "")
+    if not m or not any(m.groups()):
+        return None
+    hours, minutes, seconds = m.groups()
+    total = (int(hours) * 3600 if hours else 0) + (int(minutes) * 60 if minutes else 0) + (float(seconds) if seconds else 0)
+    return total if total > 0 else None
+
+def _is_technical_ai_error(exc: Exception) -> bool:
+    """True for rate limits, timeouts, connection failures, and 5xx server errors - matched
+    by status_code/exception-type name rather than importing groq's exact exception classes,
+    so this keeps working across groq SDK versions without needing to track its internals."""
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and (status_code == 429 or status_code >= 500):
+        return True
+    return type(exc).__name__ in ("RateLimitError", "APITimeoutError", "APIConnectionError", "InternalServerError", "ServiceUnavailableError")
+
+def _raise_as_technical_error(exc: Exception):
+    """Every exception from an LLM call site is treated as a technical/infra problem, not a
+    verdict on the report - a malformed response the API sent back is just as much "not the
+    employee's fault" as a timeout. Re-raises as AITechnicalError with any parseable
+    retry-after hint attached, so the caller can schedule a retry instead of faking a result."""
+    raise AITechnicalError(str(exc), retry_after_seconds=_parse_retry_after_seconds(str(exc))) from exc
+
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 groq_client = Groq(api_key=GROQ_API_KEY, timeout=120.0) if GROQ_API_KEY else None
 
@@ -74,8 +112,11 @@ def get_md5(text: str) -> str:
     return hashlib.md5(text.strip().encode("utf-8")).hexdigest()
 
 def transcribe_audio(file_path: str) -> str:
+    """Raises AITechnicalError on any failure (missing key, rate limit, timeout, connection
+    drop) - transcription failing is never "the worker didn't speak clearly", it's an infra
+    problem, and must not be silently returned as if it were the transcript text."""
     if groq_client is None:
-        return "Не задан GROQ_API_KEY, аудио не распознано."
+        raise AITechnicalError("GROQ_API_KEY не задан")
     try:
         with open(file_path, "rb") as f:
             transcription = groq_client.audio.transcriptions.create(
@@ -87,7 +128,7 @@ def transcribe_audio(file_path: str) -> str:
         return transcription.strip()
     except Exception as e:
         logger.error(f"Ошибка распознавания аудио: {e}")
-        return f"Ошибка распознавания аудио: {e}"
+        _raise_as_technical_error(e)
 
 CHECK_PROMPT_TEMPLATE = """
 Ты — опытный прораб строительного объекта.
@@ -389,8 +430,11 @@ def check_status(text: str, report_type: str | None = "status") -> dict:
         json_type_field = '"report_type": "status" или "daily_fact",\n\n'
         cache_key_prefix = "auto"
 
+    # A missing API key is exactly as much an infrastructure problem as a rate limit or a
+    # timeout - never the employee's fault, so it goes through the same AITechnicalError path
+    # instead of quietly faking a "не ОК" content verdict.
     if groq_client is None:
-        return normalize_ai_result({"is_ok": False, "issue": "GROQ_API_KEY не задан"}, text, report_type if is_forced else None)
+        raise AITechnicalError("GROQ_API_KEY не задан")
     h = get_md5(f"{cache_key_prefix}:{text}")
     if h in _ai_status_cache:
         return _ai_status_cache[h]
@@ -409,5 +453,13 @@ def check_status(text: str, report_type: str | None = "status") -> dict:
         res = normalize_ai_result(json.loads(raw), text, report_type if is_forced else None)
         _ai_status_cache[h] = res
         return res
+    except AITechnicalError:
+        raise
     except Exception as e:
-        return normalize_ai_result({"is_ok": False, "issue": f"Ошибка ИИ: {e}"}, text, report_type if is_forced else None)
+        # Every failure here - rate limit, timeout, connection drop, or the API returning
+        # something normalize_ai_result/json.loads chokes on - is an infrastructure problem,
+        # never a verdict on the report. Previously this silently became a fake "не ОК" with
+        # the raw exception text (including API error JSON/links) shown straight to the
+        # employee - see AITechnicalError's docstring for why that's wrong on every count.
+        logger.error(f"Ошибка ИИ при проверке отчёта ({'технический сбой' if _is_technical_ai_error(e) else 'необработанное исключение'}): {e}")
+        _raise_as_technical_error(e)
