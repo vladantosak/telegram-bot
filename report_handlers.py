@@ -243,11 +243,13 @@ def make_video_selection_keyboard(report_id: int, action_type: str, video_items:
     return InlineKeyboardMarkup(buttons)
 
 async def render_report_message_from_row(report: dict, worker_name: str, position: str = "") -> tuple[str, InlineKeyboardMarkup]:
-    """Builds the SHORT group message: name (position) - type date за time / Формат отчета /
-    Требуемые действия - three lines, no per-video breakdown, no "official"/"original" report
-    text. The full detail (per-video comment, cleaned + raw text) still goes to Google Sheets
-    unchanged (sync_gsheets_task reads the same `reports` row directly) - it's just no longer
-    duplicated into the Telegram message."""
+    """Builds the group message: name+position (bold) - статус/факт (underlined) date за
+    time / Формат отчета / Требуемые действия / Обработанный отчет - sent with
+    parse_mode="HTML", so every dynamic piece (name, position, summaries, cleaned report
+    text) MUST be html.escape()'d before going in, or a stray "<"/">"/"&" in someone's
+    spoken text would break the tags for the whole message. No per-video breakdown or raw
+    transcript here - full detail still goes to Google Sheets unchanged (sync_gsheets_task
+    reads the same `reports` row directly)."""
     report_id = report["id"]
     report_type = report["report_type"]
     slot_time = report["slot_time"]
@@ -255,16 +257,18 @@ async def render_report_message_from_row(report: dict, worker_name: str, positio
     received_at = report["received_at"] or ""
     is_ok = bool(report["is_ok"])
     format_comment = report["format_comment"] or ""
+    raw_text = report["raw_text"] or ""
 
-    formatted_date = format_show_date(report_date)
+    formatted_date = html.escape(format_show_date(report_date))
     if report_type == "daily_fact":
-        time_str = received_at[:5] if received_at else "??:??"
-        type_line = f"факт {formatted_date} за {time_str}"
+        time_str = html.escape(received_at[:5] if received_at else "??:??")
+        type_html = f"<u>факт</u> {formatted_date} за {time_str}"
     elif report_type == "status":
-        type_line = f"статус {formatted_date} за {slot_time or '??:??'}"
+        time_str = html.escape(slot_time or "??:??")
+        type_html = f"<u>статус</u> {formatted_date} за {time_str}"
     else:
         type_label = {"unrecognized_speech": "не удалось распознать речь"}.get(report_type, report_type)
-        type_line = f"{type_label} {formatted_date}"
+        type_html = f"{html.escape(type_label)} {formatted_date}"
 
     summaries = extract_report_summaries(format_comment)
     verdict = "всё ОК" if is_ok else "не ОК"
@@ -272,11 +276,14 @@ async def render_report_message_from_row(report: dict, worker_name: str, positio
 
     action_line = "ничего не предпринимать" if is_ok else "сделано замечание, требуется проверка"
 
-    header = f"{html.escape(worker_name)} ({html.escape(position or '?')}) - {html.escape(type_line)}"
+    cleaned_text = await clean_report_async(raw_text)
+
+    header = f"<b>{html.escape(worker_name)} ({html.escape(position or '?')})</b> - {type_html}"
     notify_text = (
         f"{header}\n"
-        f"Формат отчета: {format_line}\n"
-        f"Требуемые действия: {action_line}"
+        f"<b>Формат отчета:</b> {format_line}\n"
+        f"<b>Требуемые действия:</b> {html.escape(action_line)}\n\n"
+        f"<b>Обработанный отчет:</b> {html.escape(cleaned_text)}"
     )
     inline_kbd = make_report_keyboard(report_id, report_type)
 
