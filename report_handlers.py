@@ -74,7 +74,7 @@ from db import (
     is_message_already_processed, is_missed_reason_request_enabled,
     resolve_unrecognized_report, count_consecutive_unrecognized_reports,
     save_speech_review_message, get_speech_review_messages, set_report_media_group_message,
-    count_effective_remarks
+    count_effective_remarks, is_ai_error_simulation_enabled
 )
 
 REMARK_REQUIRED_ACTION_TEXT = (
@@ -347,12 +347,18 @@ def menu_for_user(user_id: int, chat_type: str = "private"):
     return ReplyKeyboardMarkup([["🔑 Начать регистрацию"]], resize_keyboard=True)
 
 async def transcribe_audio_async(file_path: str) -> str:
+    # QA toggle (/simulate_ai_error) - lets an admin force the whole "technical failure ->
+    # manual review" pipeline on demand instead of waiting for a real rate limit.
+    if await run_db(is_ai_error_simulation_enabled):
+        raise AITechnicalError("Симулированная ошибка API (тестовый режим включён администратором через /simulate_ai_error)")
     return await asyncio.to_thread(transcribe_audio, file_path)
 
 async def clean_report_async(text: str) -> str:
     return await asyncio.to_thread(clean_report, text)
 
 async def check_status_async(text: str, report_type_override: str | None = None) -> dict:
+    if await run_db(is_ai_error_simulation_enabled):
+        raise AITechnicalError("Симулированная ошибка API (тестовый режим включён администратором через /simulate_ai_error)")
     return await asyncio.to_thread(check_status, text, report_type_override)
 
 async def classify_report_type_async(text: str) -> dict:

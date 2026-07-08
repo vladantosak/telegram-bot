@@ -970,6 +970,31 @@ def set_quiet_mode(enabled: bool):
     conn.commit()
     conn.close()
 
+def is_ai_error_simulation_enabled() -> bool:
+    """Temporary QA toggle (/simulate_ai_error) - while on, check_status_async/transcribe_
+    audio_async (report_handlers.py) raise AITechnicalError immediately instead of calling
+    the real LLM, so the whole "technical failure -> manual admin review" pipeline can be
+    tested on demand without waiting for a real rate limit. Affects EVERY worker's videos
+    while enabled - meant to be turned off again right after testing."""
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT value FROM settings WHERE key = 'ai_error_simulation_enabled'").fetchone()
+        conn.close()
+        if row:
+            return row["value"] == "1"
+    except Exception:
+        pass
+    return False
+
+def set_ai_error_simulation(enabled: bool):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('ai_error_simulation_enabled', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        ("1" if enabled else "0",)
+    )
+    conn.commit()
+    conn.close()
+
 def is_missed_reason_request_enabled() -> bool:
     """Whether a worker who misses a status slot is asked to explain why (and blocked from
     sending a new video until they do) - disabled by default for now, per product decision,

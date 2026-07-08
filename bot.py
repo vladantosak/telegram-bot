@@ -233,6 +233,26 @@ async def cmd_quiet_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_label = "ВКЛЮЧЕН" if not curr else "ВЫКЛЮЧЕН"
     await update.message.reply_text(f"🔇 Тихий режим {status_label}.")
 
+async def cmd_simulate_ai_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """QA-only toggle: while on, EVERY worker's video/text report is forced through the
+    "техническая ошибка API" path (manual review, ✅ Статус/📋 Факт buttons to the admin, no
+    retries) instead of being analyzed for real - lets the whole pipeline be tested end to
+    end without waiting for a real Groq rate limit. Remember to turn it back off after
+    testing - it affects real submissions from real workers while enabled."""
+    if not is_admin(update.effective_user.id): return
+    from db import set_ai_error_simulation, is_ai_error_simulation_enabled
+    curr = await run_db(is_ai_error_simulation_enabled)
+    await run_db(set_ai_error_simulation, not curr)
+    if not curr:
+        await update.message.reply_text(
+            "🧪 Симуляция ошибки API ВКЛЮЧЕНА.\n"
+            "⚠️ Теперь ЛЮБОЕ видео/отчёт от ЛЮБОГО сотрудника будет уходить на ручную проверку "
+            "администратору вместо автоматического анализа. Не забудьте выключить командой "
+            "/simulate_ai_error ещё раз после теста."
+        )
+    else:
+        await update.message.reply_text("🧪 Симуляция ошибки API ВЫКЛЮЧЕНА. Анализ отчётов снова работает как обычно.")
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     await update.message.reply_text("ℹ️ Полная аналитика по отчетам выгружается в Google Таблицу на лист 'Аналитика'.")
@@ -433,6 +453,7 @@ def main():
     application.add_handler(CommandHandler("set_object_group", set_object_group_command))
     application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CommandHandler("quiet_mode", cmd_quiet_mode))
+    application.add_handler(CommandHandler("simulate_ai_error", cmd_simulate_ai_error))
 
     # Export reports and sync ConversationHandler
     export_handler = ConversationHandler(
