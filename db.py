@@ -114,6 +114,18 @@ def backup_database_to_file(target_path: str):
         dest.close()
         source.close()
 
+def restore_database_from_file(source_path: str):
+    """Reverse of backup_database_to_file - copies a previously-taken snapshot back over the
+    live database, using the same SQLite online-backup API (safe under concurrent access).
+    Used to roll back a workers-database sync that failed partway through applying."""
+    source = sqlite3.connect(source_path, timeout=30.0)
+    dest = sqlite3.connect(DB_PATH)
+    try:
+        source.backup(dest)
+    finally:
+        dest.close()
+        source.close()
+
 async def run_db(func, *args, **kwargs):
     import asyncio
     return await asyncio.to_thread(func, *args, **kwargs)
@@ -1258,6 +1270,52 @@ EXCEL_HEADER_ALIASES = {
     "объект": "object_id",
 }
 
+def _normalize_worker_row(row_dict: dict) -> dict | None:
+    """Shared row-normalization rules between read_excel (existing bulk-import feature) and
+    parse_workers_excel_bytes (the diff-based sync feature) - one place to fix a parsing rule
+    so both stay in sync instead of silently drifting apart. Returns None if the row has no
+    usable Telegram ID (caller should skip it)."""
+    if "telegram_id" not in row_dict or row_dict["telegram_id"] is None:
+        return None
+    try:
+        row_dict["telegram_id"] = int(row_dict["telegram_id"])
+    except (ValueError, TypeError):
+        return None
+
+    row_dict["last_name"] = str(row_dict.get("last_name", "") or "").strip()
+    row_dict["first_name"] = str(row_dict.get("first_name", "") or "").strip()
+    row_dict["position"] = clean_position(str(row_dict.get("position", "Не указано") or "Не указано"))
+
+    try:
+        row_dict["group_id"] = int(row_dict.get("group_id", DEFAULT_GROUP_ID) or DEFAULT_GROUP_ID)
+    except (ValueError, TypeError):
+        row_dict["group_id"] = DEFAULT_GROUP_ID
+
+    row_dict["schedule"] = str(row_dict.get("schedule", "A") or "A").strip().upper()
+    if row_dict["schedule"] not in SCHEDULES:
+        row_dict["schedule"] = "A"
+
+    ndf = row_dict.get("needs_daily_fact")
+    row_dict["needs_daily_fact"] = ndf in (True, 1, "1", "Да", "да", "yes", "YES", "True", "true")
+
+    row_dict["object_id"] = str(row_dict.get("object_id", "Основной") or "Основной").strip()
+
+    is_act = row_dict.get("is_active")
+    if isinstance(is_act, str):
+        not_working_labels = {"отпуск", "больничный", "нет", "no", "false", "0", "не работает"}
+        row_dict["is_active"] = is_act.strip().lower() not in not_working_labels
+    elif is_act in (False, 0):
+        row_dict["is_active"] = False
+    else:
+        row_dict["is_active"] = True
+
+    try:
+        row_dict["sort_order"] = int(row_dict.get("sort_order", 0) or 0)
+    except (ValueError, TypeError):
+        row_dict["sort_order"] = 0
+
+    return row_dict
+
 def read_excel(file_path: str) -> list[dict]:
     import openpyxl
     wb = openpyxl.load_workbook(file_path, data_only=True)
@@ -1284,51 +1342,158 @@ def read_excel(file_path: str) -> list[dict]:
         for i, h in enumerate(headers):
             if i < len(row) and h:
                 row_dict[h] = row[i]
-        
-        if "telegram_id" in row_dict and row_dict["telegram_id"] is not None:
-            try:
-                row_dict["telegram_id"] = int(row_dict["telegram_id"])
-            except ValueError:
-                continue
-            
-            row_dict["last_name"] = str(row_dict.get("last_name", "") or "").strip()
-            row_dict["first_name"] = str(row_dict.get("first_name", "") or "").strip()
-            row_dict["position"] = clean_position(str(row_dict.get("position", "Не указано") or "Не указано"))
-            
-            try:
-                row_dict["group_id"] = int(row_dict.get("group_id", DEFAULT_GROUP_ID) or DEFAULT_GROUP_ID)
-            except ValueError:
-                row_dict["group_id"] = DEFAULT_GROUP_ID
-                
-            row_dict["schedule"] = str(row_dict.get("schedule", "A") or "A").strip().upper()
-            if row_dict["schedule"] not in SCHEDULES:
-                row_dict["schedule"] = "A"
-                
-            ndf = row_dict.get("needs_daily_fact")
-            if ndf in (True, 1, "1", "Да", "да", "yes", "YES", "True", "true"):
-                row_dict["needs_daily_fact"] = True
-            else:
-                row_dict["needs_daily_fact"] = False
-                
-            row_dict["object_id"] = str(row_dict.get("object_id", "Основной") or "Основной").strip()
-            
-            is_act = row_dict.get("is_active")
-            if isinstance(is_act, str):
-                not_working_labels = {"отпуск", "больничный", "нет", "no", "false", "0", "не работает"}
-                row_dict["is_active"] = is_act.strip().lower() not in not_working_labels
-            elif is_act in (False, 0):
-                row_dict["is_active"] = False
-            else:
-                row_dict["is_active"] = True
-                
-            try:
-                row_dict["sort_order"] = int(row_dict.get("sort_order", 0) or 0)
-            except ValueError:
-                row_dict["sort_order"] = 0
-                
-            workers.append(row_dict)
+
+        normalized = _normalize_worker_row(row_dict)
+        if normalized:
+            workers.append(normalized)
 
     return workers
+
+REQUIRED_WORKERS_COLUMNS = [
+    ("telegram_id", "Telegram ID"),
+    ("last_name", "Фамилия"),
+    ("first_name", "Имя"),
+    ("position", "Должность"),
+    ("group_id", "ID чата (уведомления)"),
+    ("schedule", "График (А или Б)"),
+    ("object_id", "Объект"),
+]
+
+def parse_workers_excel_bytes(file_bytes: bytes) -> tuple[list[dict], list[str]]:
+    """Like read_excel, but reads from in-memory bytes (no temp file - avoids the filename-
+    collision race read_excel's caller has when two admins import at once) and validates the
+    file BEFORE returning any rows: every required column present (matched by header NAME,
+    not position - an admin can reorder columns freely) and no duplicate Telegram ID within
+    the file itself. Returns (rows, errors) - a non-empty errors list means the file was
+    rejected outright and rows is always []; nothing about the database is touched here."""
+    import io
+    try:
+        wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+    except Exception as e:
+        return [], [f"Не удалось открыть файл как Excel (.xlsx): {e}"]
+
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return [], ["Файл пустой."]
+
+    raw_headers = [str(cell).strip() if cell is not None else "" for cell in rows[0]]
+    headers = [EXCEL_HEADER_ALIASES.get(h.lower(), h) for h in raw_headers]
+
+    missing_columns = [label for key, label in REQUIRED_WORKERS_COLUMNS if key not in headers]
+    if missing_columns:
+        return [], ["Отсутствует колонка «" + "», «".join(missing_columns) + "»"]
+
+    data_rows = rows[1:]
+    if data_rows and data_rows[0]:
+        first_cell = data_rows[0][0]
+        if isinstance(first_cell, str) and not first_cell.strip().lstrip("-").isdigit():
+            data_rows = data_rows[1:]
+
+    seen_ids = set()
+    dup_ids = []
+    workers = []
+    for row in data_rows:
+        if not any(row):
+            continue
+        row_dict = {}
+        for i, h in enumerate(headers):
+            if i < len(row) and h:
+                row_dict[h] = row[i]
+
+        raw_id = row_dict.get("telegram_id")
+        if raw_id is None:
+            continue
+        try:
+            tg_id = int(raw_id)
+        except (ValueError, TypeError):
+            continue
+
+        if tg_id in seen_ids and tg_id not in dup_ids:
+            dup_ids.append(tg_id)
+        seen_ids.add(tg_id)
+
+        normalized = _normalize_worker_row(row_dict)
+        if normalized:
+            workers.append(normalized)
+
+    if dup_ids:
+        return [], ["Обнаружен дублирующийся Telegram ID внутри файла: " + ", ".join(str(i) for i in dup_ids)]
+
+    return workers, []
+
+_WORKERS_DIFF_FIELDS = [
+    ("last_name", "Фамилия"),
+    ("first_name", "Имя"),
+    ("position", "Должность"),
+    ("group_id", "ID чата"),
+    ("schedule", "График"),
+    ("needs_daily_fact", "Итоговый отчёт за день"),
+    ("is_active", "Статус"),
+    ("sort_order", "Номер в списке"),
+    ("object_id", "Объект"),
+]
+
+def _format_worker_field_value(key: str, value) -> str:
+    if key == "needs_daily_fact":
+        return "Да" if value else "Нет"
+    if key == "is_active":
+        return "Работает" if value else "Отпуск"
+    return str(value)
+
+def _diff_worker_fields(old_row, new_row) -> list[tuple[str, str, str]]:
+    diffs = []
+    for key, label in _WORKERS_DIFF_FIELDS:
+        old_val = old_row[key]
+        new_val = new_row[key]
+        if key in ("needs_daily_fact", "is_active"):
+            old_val, new_val = bool(old_val), bool(new_val)
+        if old_val != new_val:
+            diffs.append((label, _format_worker_field_value(key, old_val), _format_worker_field_value(key, new_val)))
+    return diffs
+
+def compute_workers_diff(new_rows: list[dict]) -> dict:
+    """Compares freshly-parsed Excel rows against the current `workers` table (the source of
+    truth - Google Sheets is a one-way mirror of it, so comparisons are never made against
+    Sheets) by Telegram ID. "missing" workers (in the DB but not the uploaded file) are only
+    ever reported here, never auto-deleted - deletion happens only via a separate, explicit
+    admin confirmation (see apply_workers_sync)."""
+    current = {w["telegram_id"]: dict(w) for w in get_all_workers()}
+    new_by_id = {w["telegram_id"]: w for w in new_rows}
+
+    new_workers = []
+    changed_workers = []
+    for tg_id, new_row in new_by_id.items():
+        if tg_id not in current:
+            new_workers.append(new_row)
+        else:
+            diffs = _diff_worker_fields(current[tg_id], new_row)
+            if diffs:
+                changed_workers.append({"telegram_id": tg_id, "old": current[tg_id], "new": new_row, "diffs": diffs})
+
+    missing_workers = [w for tg_id, w in current.items() if tg_id not in new_by_id]
+
+    return {"new": new_workers, "changed": changed_workers, "missing": missing_workers}
+
+def apply_workers_sync(new_workers: list[dict], changed_workers: list[dict], missing_ids_to_delete: list[int]) -> dict:
+    """Applies a previously-computed workers diff - upserts new+changed rows via the same
+    upsert_worker the existing bulk-import feature already uses, and fully removes any
+    worker in missing_ids_to_delete via the existing delete_worker (the same thorough
+    cleanup of their reports/media/reminders as the manual "🗑 Удалить сотрудника" admin
+    action - not a separate, narrower deletion path). The caller is responsible for taking a
+    backup first and restoring it if this raises."""
+    for w in new_workers + [item["new"] for item in changed_workers]:
+        upsert_worker(
+            telegram_id=w["telegram_id"], last_name=w["last_name"], first_name=w["first_name"],
+            position=w["position"], group_id=w["group_id"], schedule=w["schedule"],
+            needs_daily_fact=w["needs_daily_fact"], sort_order=w["sort_order"],
+            is_active=1 if w["is_active"] else 0, object_id=w["object_id"]
+        )
+    deleted_count = 0
+    for tg_id in missing_ids_to_delete:
+        if delete_worker(tg_id):
+            deleted_count += 1
+    return {"added": len(new_workers), "changed": len(changed_workers), "deleted": deleted_count}
 
 # Known Сводка cell background colors the bot itself paints (see sync_gsheets_task) - used
 # to tell "this color is one the bot could have set" apart from a manually chosen highlight.

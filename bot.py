@@ -42,7 +42,7 @@ from admin_handlers import (
     edit_worker_select, edit_worker_field_chosen, edit_worker_value_received,
     edit_worker_schedule_received, edit_worker_daily_fact_received, edit_worker_status_received,
     edit_worker_not_working_days, edit_worker_not_working_reason,
-    import_workers_start, import_workers_action, import_workers_file,
+    import_workers_start, import_workers_action, handle_workers_file_upload,
     register_start, register_lastname_received, register_firstname_received,
     register_confirm_received, register_contact_received,
     settings_start, settings_action, cancel,
@@ -513,12 +513,17 @@ def main():
     )
     application.add_handler(view_dept_handler)
 
-    # Import workers
+    # Import workers - the menu below only explains the feature now; the actual file intake
+    # is the standalone handle_workers_file_upload handler registered further down (group 1),
+    # which fires whenever an admin sends a .xlsx in a private chat, with or without going
+    # through this menu first. ASK_IMPORT_FILE is intentionally no longer used as a state
+    # here (kept as an import/state-number placeholder elsewhere to avoid renumbering other
+    # states) - having only ONE place that ever reads an uploaded workers file avoids two
+    # handlers racing to process the same document.
     import_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📥 Импорт сотрудников$"), import_workers_start)],
         states={
             ASK_IMPORT_ACTION: [MessageHandler(safe_text_filter, import_workers_action)],
-            ASK_IMPORT_FILE: [MessageHandler(filters.Document.ALL, import_workers_file)],
         },
         fallbacks=[MessageHandler(admin_cancel_filter, cancel)],
     )
@@ -581,6 +586,15 @@ def main():
         filters.VOICE | filters.VIDEO | filters.VIDEO_NOTE | filters.TEXT & ~filters.COMMAND,
         handle_report
     ))
+
+    # Workers-database sync: an admin can send an updated workers.xlsx directly, any time,
+    # without navigating a menu first (handle_workers_file_upload itself silently ignores
+    # anything that isn't admin+private+.xlsx). Registered in group=1 so it only runs AFTER
+    # every group-0 handler has had a chance - a document that's actually meant for another
+    # in-progress conversation (e.g. uploading Google Sheets credentials, ASK_GSHEETS_CREDS)
+    # is consumed there first; this one only ever reacts to a bare .xlsx with no active
+    # conversation claiming it, or once that conversation itself declined a non-.xlsx file.
+    application.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_workers_file_upload), group=1)
 
     # Callback Query Handler for report buttons
     application.add_handler(CallbackQueryHandler(handle_callback_query))

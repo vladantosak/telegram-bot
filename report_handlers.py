@@ -1821,6 +1821,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     data = query.data
     logger.info(f"Получен callback_query: {data} от администратора {user_id}")
 
+    # Workers-database sync confirmation buttons (see admin_handlers.handle_workers_file_
+    # upload) - deferred import to avoid a circular import (admin_handlers already imports
+    # from report_handlers at module load time).
+    if data.startswith("wsync_"):
+        from admin_handlers import handle_workers_sync_callback
+        await handle_workers_sync_callback(query, context, data)
+        return
+
     # 0. Manually resolve a report stuck at report_type='unrecognized_speech' (speech
     # recognition quality gate failed) into Status or Fact - self-locking across every admin
     # that got a copy of this notification, so only the first click does anything.

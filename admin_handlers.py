@@ -24,7 +24,9 @@ from db import (
     save_scheduled_times, get_scheduled_times, sync_gsheets_task, async_sync_gsheets_background,
     save_report, get_all_departments, add_department, delete_department, count_workers_in_department,
     get_departments_ordered, save_departments_order,
-    is_missed_reason_request_enabled, set_missed_reason_request_enabled
+    is_missed_reason_request_enabled, set_missed_reason_request_enabled,
+    parse_workers_excel_bytes, compute_workers_diff, apply_workers_sync,
+    backup_database_to_file, restore_database_from_file
 )
 
 from report_handlers import menu_for_user
@@ -842,56 +844,159 @@ async def import_workers_action(update: Update, context: ContextTypes.DEFAULT_TY
 
     if choice == "📥 Загрузить обновления из файла":
         await update.message.reply_text(
-            "📎 Отправьте файл Excel (.xlsx) со списком сотрудников.\n\n"
-            "Если вы ещё не скачивали текущий список — сначала нажмите «❌ Отмена» и выберите "
-            "«📤 Скачать текущий список сотрудников», чтобы не потерять данные.",
-            reply_markup=CANCEL_KEYBOARD
+            "📎 Просто отправьте файл Excel (.xlsx) со списком сотрудников сюда, в личные сообщения боту — "
+            "он сам распознает файл, сравнит с текущей базой и покажет, что именно изменится, ДО того как "
+            "что-либо применится.\n\n"
+            "Если вы ещё не скачивали текущий список — сначала выберите «📤 Скачать текущий список сотрудников», "
+            "чтобы не потерять данные.",
+            reply_markup=MAIN_MENU
         )
-        return ASK_IMPORT_FILE
+        return ConversationHandler.END
     return ConversationHandler.END
 
-async def import_workers_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if not doc or not doc.file_name.lower().endswith(".xlsx"):
-        await update.message.reply_text("❌ Это не файл Excel. Пожалуйста, отправьте файл с расширением .xlsx.")
-        return ASK_IMPORT_FILE
+def _format_worker_line(w: dict) -> str:
+    return f"- {w['last_name']} {w['first_name']} ({w['position']}, объект {w['object_id']})"
 
-    await update.message.reply_text("⏳ Читаю файл и обновляю базу данных...")
+def _build_workers_sync_summary(diff: dict) -> str:
+    lines = ["📋 Обнаружены изменения в базе сотрудников:\n"]
+    if diff["new"]:
+        lines.append(f"🆕 Новые сотрудники ({len(diff['new'])}):")
+        for w in diff["new"]:
+            lines.append(_format_worker_line(w))
+        lines.append("")
+    if diff["changed"]:
+        lines.append(f"✏️ Изменённые поля ({len(diff['changed'])}):")
+        for item in diff["changed"]:
+            w = item["new"]
+            name = f"{w['last_name']} {w['first_name']}"
+            for label, old_val, new_val in item["diffs"]:
+                lines.append(f"- {name}: {label} '{old_val}' → '{new_val}'")
+        lines.append("")
+    if diff["missing"]:
+        lines.append(f"⚠️ Отсутствуют в новом файле, но есть в текущей базе ({len(diff['missing'])}):")
+        for w in diff["missing"]:
+            lines.append(f"- {w['last_name']} {w['first_name']} (Telegram ID: {w['telegram_id']})")
+        lines.append("")
+    lines.append("Применить эти изменения?")
+    return "\n".join(lines)
+
+async def handle_workers_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Global entry point for the workers-database sync feature - an admin can just send an
+    updated workers.xlsx directly in a private chat with the bot at any time, without
+    navigating a menu first (the "📥 Импорт сотрудников" menu now only explains this and
+    points here). Silently ignores anything that isn't an admin+private+.xlsx combination,
+    per the "не мешать другому функционалу бота" requirement - a non-admin's document, a
+    group chat document, or a file that isn't .xlsx, is simply none of this feature's
+    concern and is left for whatever else might handle it."""
+    if update.effective_chat.type != "private":
+        return
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    doc = update.message.document
+    if not doc or not doc.file_name or not doc.file_name.lower().endswith(".xlsx"):
+        return
+
+    await update.message.reply_text("⏳ Читаю файл и сравниваю с текущей базой...")
     try:
         tg_file = await context.bot.get_file(doc.file_id)
-        local_path = "workers_temp_import.xlsx"
-        await tg_file.download_to_drive(local_path)
-        workers = await run_db(read_excel, local_path)
-        if not workers:
-            await update.message.reply_text(
-                "⚠️ В файле не найдено ни одной записи с заполненным Telegram ID.\n"
-                "Проверьте, что данные начинаются с 3-й строки (после заголовков и подсказки).",
-                reply_markup=MAIN_MENU
-            )
-            if os.path.exists(local_path): os.remove(local_path)
-            return ConversationHandler.END
-
-        def _import_all(rows):
-            for w in rows:
-                upsert_worker(
-                    telegram_id=w["telegram_id"], last_name=w["last_name"], first_name=w["first_name"],
-                    position=w["position"], group_id=w["group_id"], schedule=w["schedule"],
-                    needs_daily_fact=w["needs_daily_fact"], object_id=w.get("object_id", "Основной"),
-                    is_active=1 if w.get("is_active", True) else 0, sort_order=w.get("sort_order", 0)
-                )
-        await run_db(_import_all, workers)
-        if os.path.exists(local_path): os.remove(local_path)
-        async_sync_gsheets_background()
-        await update.message.reply_text(
-            f"✅ <b>Импорт завершён!</b>\nОбработано строк: {len(workers)}.\n"
-            f"Все изменения уже применены и синхронизируются с Google Таблицей.",
-            reply_markup=MAIN_MENU,
-            parse_mode="HTML"
-        )
-        return ConversationHandler.END
+        file_bytes = bytes(await tg_file.download_as_bytearray())
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка во время импорта: {e}", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
+        await update.message.reply_text(f"❌ Не удалось скачать файл: {e}")
+        return
+
+    workers, errors = await run_db(parse_workers_excel_bytes, file_bytes)
+    if errors:
+        await update.message.reply_text("❌ Файл не принят.\n" + "\n".join(errors) + "\n\nБаза не изменена.")
+        return
+    if not workers:
+        await update.message.reply_text(
+            "⚠️ В файле не найдено ни одной записи с заполненным Telegram ID.\n"
+            "Проверьте, что данные начинаются с 3-й строки (после заголовков и подсказки). База не изменена."
+        )
+        return
+
+    diff = await run_db(compute_workers_diff, workers)
+    if not diff["new"] and not diff["changed"] and not diff["missing"]:
+        await update.message.reply_text("✅ Изменений не обнаружено — файл полностью совпадает с текущей базой.")
+        return
+
+    # Kept per-admin in context.user_data (same convention as other short-lived "pending
+    # admin action" state elsewhere in this project) rather than a new DB table - this is a
+    # single admin's own confirm-or-cancel decision, not data other users/admins need to see.
+    context.user_data["pending_workers_sync"] = diff
+
+    summary = _build_workers_sync_summary(diff)
+    kbd = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Применить все изменения", callback_data="wsync_apply_all")],
+        [InlineKeyboardButton("✏️ Применить только новых и изменённых", callback_data="wsync_apply_no_delete")],
+        [InlineKeyboardButton("❌ Отменить", callback_data="wsync_cancel")],
+    ])
+    await update.message.reply_text(summary, reply_markup=kbd)
+
+async def handle_workers_sync_callback(query, context: ContextTypes.DEFAULT_TYPE, data: str):
+    """Handles the 3 buttons on the summary message built by handle_workers_file_upload.
+    Admin rights are already checked by the caller (handle_callback_query's global is_admin
+    gate) before this is ever reached."""
+    pending = context.user_data.get("pending_workers_sync")
+    if not pending:
+        await query.answer("Сессия синхронизации устарела или уже обработана. Отправьте файл заново.", show_alert=True)
+        return
+
+    if data == "wsync_cancel":
+        context.user_data.pop("pending_workers_sync", None)
+        await query.edit_message_text("❌ Синхронизация отменена. База не изменена.")
+        return
+
+    include_deletions = (data == "wsync_apply_all")
+    missing_ids = [w["telegram_id"] for w in pending["missing"]] if include_deletions else []
+    context.user_data.pop("pending_workers_sync", None)
+
+    ts = now_local().strftime("%Y%m%d_%H%M%S")
+    backup_path = f"pre_workers_sync_backup_{ts}.db"
+    try:
+        await run_db(backup_database_to_file, backup_path)
+    except Exception as e:
+        logger.error(f"[workers_sync] Не удалось создать резервную копию перед применением изменений: {e}")
+        await query.edit_message_text("❌ Не удалось сделать резервную копию перед применением изменений — изменения НЕ применены.")
+        return
+
+    try:
+        result = await run_db(apply_workers_sync, pending["new"], pending["changed"], missing_ids)
+    except Exception as e:
+        logger.error(f"[workers_sync] Ошибка при применении изменений, откат к резервной копии {backup_path}: {e}")
+        try:
+            await run_db(restore_database_from_file, backup_path)
+            await query.edit_message_text(
+                "❌ Ошибка при обновлении базы. Изменения отменены, база возвращена к предыдущему состоянию.\n"
+                "Детали: техническая ошибка при записи в базу данных."
+            )
+        except Exception as restore_err:
+            logger.error(f"[workers_sync] КРИТИЧНО: не удалось откатить базу после сбоя применения: {restore_err}")
+            await query.edit_message_text(
+                "❌ Критическая ошибка при обновлении базы, и автоматический откат тоже не удался.\n"
+                f"Резервная копия сохранена на сервере в файле {backup_path} — обратитесь к разработчику."
+            )
+        return
+
+    async_sync_gsheets_background()
+
+    try:
+        with open(backup_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=query.from_user.id, document=f, filename=backup_path,
+                caption="🗄 Резервная копия базы сотрудников перед этой синхронизацией (на случай, если понадобится откатиться вручную)."
+            )
+    except Exception as e:
+        logger.error(f"[workers_sync] Не удалось отправить резервную копию админу: {e}")
+    finally:
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+
+    await query.edit_message_text(
+        f"✅ База сотрудников обновлена.\n"
+        f"Добавлено: {result['added']}, изменено: {result['changed']}, удалено: {result['deleted']}."
+    )
 
 async def _notify_admins_registration_issue(context, update, reason, entered_last_name, matches=None, phone=None):
     user = update.effective_user
