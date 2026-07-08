@@ -3,6 +3,7 @@ import html
 import re
 import asyncio
 import logging
+import uuid
 from datetime import datetime
 from telegram import ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes, ConversationHandler
@@ -74,7 +75,8 @@ from db import (
     is_message_already_processed, is_missed_reason_request_enabled,
     resolve_unrecognized_report, count_consecutive_unrecognized_reports,
     save_speech_review_message, get_speech_review_messages, set_report_media_group_message,
-    count_effective_remarks, is_ai_error_simulation_enabled
+    count_effective_remarks, is_ai_error_simulation_enabled,
+    count_unresolved_batch_siblings, get_resolved_batch_reports_by_type, merge_resolved_batch_reports
 )
 
 REMARK_REQUIRED_ACTION_TEXT = (
@@ -403,15 +405,13 @@ async def notify_admins_ai_check_failed(context: ContextTypes.DEFAULT_TYPE, repo
         except Exception as e:
             logger.error(f"Не удалось отправить админу {admin_id} уведомление о технической ошибке ИИ (отчёт {report_id}): {e}")
 
-async def handle_ai_check_failure(context: ContextTypes.DEFAULT_TYPE, user_id: int, worker_name: str,
-                                   date_str: str, now: datetime, text_content: str, upd: Update,
-                                   error: AITechnicalError):
-    """Called the moment content-analysis (check_status) fails technically, for either a
-    video/voice item or a typed text report - no retries, straight to the SAME manual-review
-    mechanism as "не удалось распознать речь" (report_type='unrecognized_speech', the
-    speechfix_status_/speechfix_fact_ buttons, resolve_unrecognized_speech_report on click).
-    Never treated as не ОК, never counted toward the remark counter (no report row exists
-    with a real verdict until an admin resolves it), never shown any error text at all."""
+async def _save_ai_check_failure_report(user_id: int, date_str: str, now: datetime, text_content: str,
+                                         upd: Update, batch_id: str | None = None) -> tuple[int, bool]:
+    """Saves the report_type='unrecognized_speech' row for a content-analysis technical
+    failure (and its media, if any) - split out of handle_ai_check_failure so a multi-video
+    submission session can save EVERY manual-review row first and only notify admins once all
+    of them exist (see process_media_batch), instead of notifying one at a time as each item
+    is evaluated. Returns (report_id, is_media)."""
     is_media = bool(upd.message.voice or upd.message.video or upd.message.video_note)
     submitted_at_str = now.strftime("%H:%M:%S")
     report_id = await run_db(
@@ -425,11 +425,24 @@ async def handle_ai_check_failure(context: ContextTypes.DEFAULT_TYPE, user_id: i
         is_late=0,
         format_comment="техническая ошибка при анализе отчёта (LLM API)",
         required_action="Требуется ручная проверка администратором",
-        raw_text=text_content
+        raw_text=text_content,
+        batch_id=batch_id
     )
     if is_media:
         await run_db(add_report_media, report_id, upd.effective_chat.id, upd.message.message_id, None, 1, submitted_at_str)
-    await notify_admins_ai_check_failed(context, report_id, worker_name, submitted_at_str, date_str, upd, error.message)
+    return report_id, is_media
+
+async def handle_ai_check_failure(context: ContextTypes.DEFAULT_TYPE, user_id: int, worker_name: str,
+                                   date_str: str, now: datetime, text_content: str, upd: Update,
+                                   error: AITechnicalError, batch_id: str | None = None):
+    """Called the moment content-analysis (check_status) fails technically, for either a
+    video/voice item or a typed text report - no retries, straight to the SAME manual-review
+    mechanism as "не удалось распознать речь" (report_type='unrecognized_speech', the
+    speechfix_status_/speechfix_fact_ buttons, resolve_unrecognized_speech_report on click).
+    Never treated as не ОК, never counted toward the remark counter (no report row exists
+    with a real verdict until an admin resolves it), never shown any error text at all."""
+    report_id, is_media = await _save_ai_check_failure_report(user_id, date_str, now, text_content, upd, batch_id)
+    await notify_admins_ai_check_failed(context, report_id, worker_name, now.strftime("%H:%M:%S"), date_str, upd, error.message)
     try:
         confirm_text = "✅ Видео получено, ожидайте оценки." if is_media else "✅ Отчёт получен, ожидайте оценки."
         await upd.message.reply_text(confirm_text)
@@ -440,6 +453,29 @@ async def assess_transcription_quality_async(text: str, duration_seconds: float 
     return await asyncio.to_thread(assess_transcription_quality, text, duration_seconds)
 
 UNRECOGNIZED_SPEECH_STREAK_THRESHOLD = 3
+
+async def _save_unrecognized_speech_report(user_id: int, date_str: str, now: datetime, text_content: str,
+                                            upd: Update, batch_id: str | None = None) -> int:
+    """Saves the report_type='unrecognized_speech' row (and its media) for a video that
+    failed the speech-recognition quality gate - split out so a multi-video submission
+    session can save every manual-review row first and notify admins only once all of them
+    exist (see process_media_batch)."""
+    report_id = await run_db(
+        save_report,
+        telegram_id=user_id,
+        report_date=date_str,
+        report_type="unrecognized_speech",
+        slot_time=None,
+        received_at=now.strftime("%H:%M:%S"),
+        is_ok=False,
+        is_late=0,
+        format_comment="не удалось распознать речь",
+        required_action="Требуется ручная проверка администратором",
+        raw_text=text_content,
+        batch_id=batch_id
+    )
+    await run_db(add_report_media, report_id, upd.effective_chat.id, upd.message.message_id, None, 1, now.strftime("%H:%M:%S"))
+    return report_id
 
 async def notify_admins_unrecognized_speech(context: ContextTypes.DEFAULT_TYPE, report_id: int, worker_name: str, text_content: str, upd: Update):
     """Sends the original video + a fixed review prompt to EVERY admin's private chat (not
@@ -484,13 +520,73 @@ async def notify_admins_unrecognized_speech_streak(context: ContextTypes.DEFAULT
         except Exception as e:
             logger.error(f"Не удалось отправить админу {admin_id} предупреждение о повторных сбоях распознавания у {telegram_id}: {e}")
 
-async def resolve_unrecognized_speech_report(report_id: int, chosen_type: str, context: ContextTypes.DEFAULT_TYPE) -> tuple[bool, str | None]:
+async def _post_resolved_batch_type_group_message(batch_id: str, telegram_id: int, report_type: str,
+                                                    worker: dict, dest_chat: int, w_name: str,
+                                                    context: ContextTypes.DEFAULT_TYPE):
+    """Once every video from one manually-reviewed submission session has been labeled,
+    combines every already-resolved sibling of ONE type (status or daily_fact) into a single
+    report row via merge_resolved_batch_reports (a no-op if there's only one), forwards all
+    of its videos to the group in order, and posts one group card - mirrors exactly how
+    process_media_batch already combines multiple same-type videos from an auto-classified
+    session, so a manually-resolved session ends up looking identical. Does nothing if this
+    session had no video of this type."""
+    rows = await run_db(get_resolved_batch_reports_by_type, batch_id, telegram_id, report_type)
+    if not rows:
+        return
+
+    error_count = sum(1 for r in rows if not r["is_ok"])
+    required_action = REMARK_REQUIRED_ACTION_TEXT if error_count > 0 else "Ничего не предпринимать, всё в порядке"
+    ids = [r["id"] for r in rows]
+    primary_id = await run_db(merge_resolved_batch_reports, ids, required_action)
+
+    media_rows = await run_db(get_report_media, primary_id)
+    copied_msg_id = None
+    for m in media_rows:
+        try:
+            copied = await context.bot.copy_message(chat_id=dest_chat, from_chat_id=m["source_chat_id"], message_id=m["source_message_id"])
+            await run_db(set_report_media_group_message, m["id"], copied.message_id)
+            if copied_msg_id is None:
+                copied_msg_id = copied.message_id
+        except Exception as e:
+            logger.error(f"Ошибка пересылки видео объединённого вручную обработанного отчёта {primary_id} в группу: {e}")
+
+    def _fetch():
+        conn = get_db()
+        r = conn.execute("SELECT * FROM reports WHERE id = ?", (primary_id,)).fetchone()
+        conn.close()
+        return r
+
+    report_row = await run_db(_fetch)
+    notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name, clean_position(worker["position"]))
+    try:
+        sent = await context.bot.send_message(
+            chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd,
+            reply_to_message_id=copied_msg_id, parse_mode="HTML"
+        )
+        await run_db(set_report_group_message, primary_id, dest_chat, sent.message_id)
+    except Exception as e:
+        logger.error(f"Ошибка отправки карточки объединённого вручную обработанного отчёта {primary_id} в группу: {e}")
+
+async def resolve_unrecognized_speech_report(report_id: int, chosen_type: str, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, str | None, int]:
     """Admin manually resolves a report_type='unrecognized_speech' row into Status or Fact.
     Runs the exact same content check and slot attribution a normal report of that type would
-    get (using the ORIGINAL submission time, not the time of the admin's click), then forwards
-    the video to the work group for the first time - it was deliberately withheld from the
-    group until a human confirmed what it actually was. Returns (False, None) if the report
-    was already resolved by another admin - the caller uses this to lock out a second click."""
+    get (using the ORIGINAL submission time, not the time of the admin's click). The employee
+    gets their personal verdict message immediately, per video, exactly as before - but the
+    video is only forwarded to the WORK GROUP once every OTHER video from the SAME submission
+    session (batch_id) has also been resolved, so a session an admin labels one video at a
+    time - in any order, possibly hours apart - still ends up posted as ONE combined message
+    per type actually used (matching how an automatically-classified session's videos get
+    grouped), instead of separate messages trickling into the group as each button is
+    clicked. A lone report with no batch_id (e.g. a pre-migration row) posts immediately,
+    exactly as this function always worked before session tracking existed.
+
+    Returns (status, worker_name, remaining):
+    - "conflict": already resolved by another admin (or a stale second click) - worker_name is None.
+    - "waiting": resolved, but other videos from the same session are still unresolved -
+      nothing was posted to the group yet; `remaining` counts how many are still pending.
+    - "posted": resolved AND every sibling in its session is now resolved (or there was no
+      session to wait for) - the combined group message(s) were just sent.
+    """
 
     def _load():
         conn = get_db()
@@ -502,11 +598,12 @@ async def resolve_unrecognized_speech_report(report_id: int, chosen_type: str, c
 
     report, worker, media_rows = await run_db(_load)
     if not report or report["report_type"] != "unrecognized_speech" or not worker:
-        return False, None
+        return "conflict", None, 0
 
     telegram_id = report["telegram_id"]
     report_date = report["report_date"]
     raw_text = report["raw_text"] or ""
+    batch_id = report["batch_id"]
     w_name = f"{worker['last_name']} {worker['first_name']}"
     sched_list = SCHEDULES.get(worker["schedule"], SCHEDULE_A)
 
@@ -554,37 +651,11 @@ async def resolve_unrecognized_speech_report(report_id: int, chosen_type: str, c
     )
     async_sync_gsheets_background()
 
-    dest_chat = await run_db(get_worker_target_group, worker)
-    copied_msg_id = None
-    for m in media_rows:
-        try:
-            copied = await context.bot.copy_message(chat_id=dest_chat, from_chat_id=m["source_chat_id"], message_id=m["source_message_id"])
-            await run_db(set_report_media_group_message, m["id"], copied.message_id)
-            if copied_msg_id is None:
-                copied_msg_id = copied.message_id
-        except Exception as e:
-            logger.error(f"Ошибка пересылки видео вручную обработанного отчёта {report_id} в группу: {e}")
-
-    def _fetch_report_row():
-        conn = get_db()
-        r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        conn.close()
-        return r
-
-    report_row = await run_db(_fetch_report_row)
-    notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name, clean_position(worker["position"]))
-    try:
-        sent = await context.bot.send_message(
-            chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd,
-            reply_to_message_id=copied_msg_id, parse_mode="HTML"
-        )
-        await run_db(set_report_group_message, report_id, dest_chat, sent.message_id)
-    except Exception as e:
-        logger.error(f"Ошибка отправки карточки вручную обработанного отчёта {report_id} в группу: {e}")
-
     # The employee gets the exact same personal message a normal auto-processed report
-    # would produce - nothing here reveals that an admin resolved this manually rather than
-    # the AI doing it automatically, per product decision.
+    # would produce, immediately, one per video, regardless of whether its session's group
+    # post is still waiting on siblings - it's this video's own confirmation that IT was
+    # judged, not a group-session concept. Nothing here reveals that an admin resolved this
+    # manually rather than the AI doing it automatically, per product decision.
     label = "Статус" if chosen_type == "status" else "Факт"
     try:
         if ai_res["is_ok"]:
@@ -605,7 +676,49 @@ async def resolve_unrecognized_speech_report(report_id: int, chosen_type: str, c
     except Exception as e:
         logger.warning(f"Не удалось отправить личный фидбек по вручную обработанному отчёту пользователю {telegram_id}: {e}")
 
-    return True, w_name
+    if batch_id:
+        remaining = await run_db(count_unresolved_batch_siblings, batch_id, telegram_id)
+        if remaining > 0:
+            return "waiting", w_name, remaining
+
+    dest_chat = await run_db(get_worker_target_group, worker)
+
+    if batch_id:
+        # This was the last unresolved sibling in its session - combine and post ONE message
+        # per type actually used in the session (status and/or daily_fact).
+        for rt in ("status", "daily_fact"):
+            await _post_resolved_batch_type_group_message(batch_id, telegram_id, rt, worker, dest_chat, w_name, context)
+    else:
+        # No session to wait for (a lone report, or a pre-migration row with no batch_id) -
+        # post immediately, exactly as this function always worked before session tracking.
+        copied_msg_id = None
+        for m in media_rows:
+            try:
+                copied = await context.bot.copy_message(chat_id=dest_chat, from_chat_id=m["source_chat_id"], message_id=m["source_message_id"])
+                await run_db(set_report_media_group_message, m["id"], copied.message_id)
+                if copied_msg_id is None:
+                    copied_msg_id = copied.message_id
+            except Exception as e:
+                logger.error(f"Ошибка пересылки видео вручную обработанного отчёта {report_id} в группу: {e}")
+
+        def _fetch_report_row():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            conn.close()
+            return r
+
+        report_row = await run_db(_fetch_report_row)
+        notify_text, inline_kbd = await render_report_message_from_row(report_row, w_name, clean_position(worker["position"]))
+        try:
+            sent = await context.bot.send_message(
+                chat_id=dest_chat, text=notify_text, reply_markup=inline_kbd,
+                reply_to_message_id=copied_msg_id, parse_mode="HTML"
+            )
+            await run_db(set_report_group_message, report_id, dest_chat, sent.message_id)
+        except Exception as e:
+            logger.error(f"Ошибка отправки карточки вручную обработанного отчёта {report_id} в группу: {e}")
+
+    return "posted", w_name, 0
 
 async def enqueue_media_report_item(user_id: int, context: ContextTypes.DEFAULT_TYPE, update: Update, text_content: str, now: datetime, duration_seconds: float | None = None):
     buf = MEDIA_BATCH_BUFFERS.setdefault(user_id, {"items": [], "task": None})
@@ -631,8 +744,12 @@ async def _flush_media_batch(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     user_lock = get_user_lock(user_id)
     await user_lock.acquire()
     try:
-        logger.info(f"[media_batch] Начало обработки {len(buf['items'])} видео от пользователя {user_id}")
-        await process_media_batch(user_id, buf["items"], context)
+        # One id per debounce-window burst - shared by every report this batch's videos end
+        # up creating, so a technical-failure report knows which OTHER reports came from the
+        # same submission session (see batch_id on the `reports` table).
+        batch_id = uuid.uuid4().hex[:12]
+        logger.info(f"[media_batch] Начало обработки {len(buf['items'])} видео от пользователя {user_id} (batch_id={batch_id})")
+        await process_media_batch(user_id, buf["items"], context, batch_id)
         logger.info(f"[media_batch] Обработка завершена для пользователя {user_id}")
     except Exception as exc:
         logger.exception(f"Ошибка обработки пачки видео-отчетов пользователя {user_id}")
@@ -705,7 +822,7 @@ def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots:
     )
     return best_slot, is_late
 
-async def process_media_batch(user_id: int, items: list[dict], context: ContextTypes.DEFAULT_TYPE):
+async def process_media_batch(user_id: int, items: list[dict], context: ContextTypes.DEFAULT_TYPE, batch_id: str | None = None):
     worker = await run_db(get_worker, user_id)
     if not worker:
         return
@@ -724,9 +841,14 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
     # (classify_report_type) - runs ONLY on text that already passed the quality gate, and
     # always resolves to status/daily_fact/mixed (never "can't tell"). This separation is the
     # whole point of this pass: a silent/garbled/empty video is a SPEECH problem
-    # (unrecognized_items, routed to admins), never a "couldn't determine type" problem.
+    # (manual_review_items, routed to admins), never a "couldn't determine type" problem.
     evaluated_items = []
-    unrecognized_items = []
+    # Unified list for BOTH reasons a video ends up needing a human: failed the speech-quality
+    # gate ("unrecognized") or hit an AITechnicalError during content analysis ("ai_error") -
+    # both are saved as report_type='unrecognized_speech' and resolved via the same
+    # speechfix_status_/speechfix_fact_ buttons, so batch-sibling tracking treats them
+    # identically regardless of which one triggered it.
+    manual_review_items = []
     for idx, item in enumerate(items, start=1):
         text_content = item["text_content"]
         now = item["now"]
@@ -739,7 +861,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
         quality = await assess_transcription_quality_async(text_content, duration)
         if not quality["ok"]:
             logger.info(f"[Проверка качества транскрибации] Видео {idx}/{len(items)} пользователя {user_id}: не распознано ({quality['reason']})")
-            unrecognized_items.append({"item": item, "text_content": text_content, "now": now, "upd": upd, "date_str": date_str})
+            manual_review_items.append({"kind": "unrecognized", "text_content": text_content, "now": now, "upd": upd, "date_str": date_str, "error": None})
             continue
 
         classification = await classify_report_type_async(text_content)
@@ -765,7 +887,7 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                     "text_content": fact_text, "now": now, "upd": upd, "date_str": date_str
                 })
             except AITechnicalError as e:
-                await handle_ai_check_failure(context, user_id, w_name, date_str, now, text_content, upd, e)
+                manual_review_items.append({"kind": "ai_error", "text_content": text_content, "now": now, "upd": upd, "date_str": date_str, "error": e})
         else:
             try:
                 ai_res_pre = await check_status_async(text_content, report_type_override=kind)
@@ -774,39 +896,48 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
                     "text_content": text_content, "now": now, "upd": upd, "date_str": date_str
                 })
             except AITechnicalError as e:
-                await handle_ai_check_failure(context, user_id, w_name, date_str, now, text_content, upd, e)
+                manual_review_items.append({"kind": "ai_error", "text_content": text_content, "now": now, "upd": upd, "date_str": date_str, "error": e})
 
-    # Reports that failed the speech-recognition quality gate never reach content analysis,
-    # status/fact checks, or automatic scoring - saved as their own type, forwarded to every
-    # admin's PRIVATE chat (not the work group) with buttons to manually resolve the type,
-    # and the employee gets one fixed, non-judgmental message (no "пересдайте отчёт").
-    for u_item in unrecognized_items:
-        upd = u_item["upd"]
-        now = u_item["now"]
-        date_str = u_item["date_str"]
-        text_content = u_item["text_content"]
-        report_id = await run_db(
-            save_report,
-            telegram_id=user_id,
-            report_date=date_str,
-            report_type="unrecognized_speech",
-            slot_time=None,
-            received_at=now.strftime("%H:%M:%S"),
-            is_ok=False,
-            is_late=0,
-            format_comment="не удалось распознать речь",
-            required_action="Требуется ручная проверка администратором",
-            raw_text=text_content
-        )
-        await run_db(add_report_media, report_id, upd.effective_chat.id, upd.message.message_id, None, 1, now.strftime("%H:%M:%S"))
-        await notify_admins_unrecognized_speech(context, report_id, w_name, text_content, upd)
-        try:
-            await upd.message.reply_text(
-                "Не удалось разобрать текст в вашем видео.\n"
-                "Пожалуйста, в следующий раз чётче формулируйте, что именно вы делали."
-            )
-        except Exception as e:
-            logger.warning(f"Не удалось отправить личный фидбек по нераспознанной речи пользователю {user_id}: {e}")
+    # Reports that failed the speech-recognition quality gate or hit a technical AI error
+    # never reach automatic scoring - saved as their own type, forwarded to every admin's
+    # PRIVATE chat (not the work group) with buttons to manually resolve the type. Saved in
+    # TWO passes: first every row in this batch is written to the DB (so
+    # count_unresolved_batch_siblings sees the true final count of this session from the very
+    # first notification onward - notifying before every sibling row exists could let a fast
+    # admin resolve undercount how many are still pending), THEN admins/employees are
+    # notified once all of them exist.
+    for m_item in manual_review_items:
+        if m_item["kind"] == "unrecognized":
+            report_id = await _save_unrecognized_speech_report(user_id, m_item["date_str"], m_item["now"], m_item["text_content"], m_item["upd"], batch_id)
+        else:
+            report_id, _ = await _save_ai_check_failure_report(user_id, m_item["date_str"], m_item["now"], m_item["text_content"], m_item["upd"], batch_id)
+        m_item["report_id"] = report_id
+
+    for m_item in manual_review_items:
+        upd = m_item["upd"]
+        now = m_item["now"]
+        date_str = m_item["date_str"]
+        text_content = m_item["text_content"]
+        report_id = m_item["report_id"]
+        if m_item["kind"] == "unrecognized":
+            await notify_admins_unrecognized_speech(context, report_id, w_name, text_content, upd)
+            try:
+                await upd.message.reply_text(
+                    "Не удалось разобрать текст в вашем видео.\n"
+                    "Пожалуйста, в следующий раз чётче формулируйте, что именно вы делали."
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось отправить личный фидбек по нераспознанной речи пользователю {user_id}: {e}")
+            await notify_admins_unrecognized_speech_streak(context, user_id, w_name)
+        else:
+            error = m_item["error"]
+            is_media = bool(upd.message.voice or upd.message.video or upd.message.video_note)
+            await notify_admins_ai_check_failed(context, report_id, w_name, now.strftime("%H:%M:%S"), date_str, upd, error.message)
+            try:
+                confirm_text = "✅ Видео получено, ожидайте оценки." if is_media else "✅ Отчёт получен, ожидайте оценки."
+                await upd.message.reply_text(confirm_text)
+            except Exception as e:
+                logger.warning(f"Не удалось отправить сотруднику {user_id} подтверждение получения при технической ошибке ИИ: {e}")
         await notify_admins_unrecognized_speech_streak(context, user_id, w_name)
 
     # Separate status items and daily facts
@@ -1836,20 +1967,34 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         chosen_type = "status" if data.startswith("speechfix_status_") else "daily_fact"
         report_id = int(data.split("_")[-1])
         # resolve_unrecognized_speech_report always completes (it falls back to a manual
-        # "оценено администратором" verdict if the AI is still unavailable), so the only way
-        # this returns falsy is a genuine conflict with another admin - see below.
-        resolved, w_name = await resolve_unrecognized_speech_report(report_id, chosen_type, context)
-        if not resolved:
+        # "оценено администратором" verdict if the AI is still unavailable), so "conflict" is
+        # the only status meaning another admin already handled this exact report.
+        status, w_name, remaining = await resolve_unrecognized_speech_report(report_id, chosen_type, context)
+        if status == "conflict":
             await query.answer("Этот отчёт уже был обработан другим администратором.", show_alert=True)
             return
 
         admin_name = update.effective_user.first_name or str(user_id)
         type_label = "Статус" if chosen_type == "status" else "Факт"
-        resolved_note = (
-            f"⚠️ Не удалось распознать речь в отчёте.\n"
-            f"Сотрудник: {html.escape(w_name)}\n\n"
-            f"✅ Обработано администратором {html.escape(admin_name)} — тип: {type_label}"
-        )
+        if status == "waiting":
+            # Other videos from this same submission session are still unlabeled - the group
+            # post is deliberately held back until every one of them is resolved, so the
+            # admin needs to see clearly that their click registered but nothing was posted
+            # yet (otherwise it can look like the button silently did nothing).
+            plural_suffix = "о" if remaining == 1 else ""
+            resolved_note = (
+                f"⚠️ Не удалось распознать речь в отчёте.\n"
+                f"Сотрудник: {html.escape(w_name)}\n\n"
+                f"✅ Обработано администратором {html.escape(admin_name)} — тип: {type_label}\n"
+                f"⏳ Ожидание остальных видео из этой отправки (ещё не размечен{plural_suffix} {remaining}) — "
+                "сообщение в группу будет отправлено, когда все видео этой отправки будут размечены."
+            )
+        else:
+            resolved_note = (
+                f"⚠️ Не удалось распознать речь в отчёте.\n"
+                f"Сотрудник: {html.escape(w_name)}\n\n"
+                f"✅ Обработано администратором {html.escape(admin_name)} — тип: {type_label}"
+            )
         review_msgs = await run_db(get_speech_review_messages, report_id)
         for rm in review_msgs:
             try:

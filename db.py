@@ -198,6 +198,14 @@ def init_db():
         # the auto-computed "ничего не предпринимать"/"сделано замечание.../делегировано..."
         # wording, until the admin edits it again.
         conn.execute("ALTER TABLE reports ADD COLUMN action_override INTEGER NOT NULL DEFAULT 0")
+    if "batch_id" not in cols_reports:
+        # Shared by every report/unrecognized_speech row that came from ONE submission
+        # session (one process_media_batch call, one debounce-window burst of videos) - lets
+        # a manually-resolved report (after a technical AI failure) know how many siblings
+        # from the same session still need an admin's decision before the group message for
+        # that type can be posted. Null for reports predating this feature or made through
+        # paths that don't need session tracking (e.g. a single text report).
+        conn.execute("ALTER TABLE reports ADD COLUMN batch_id TEXT")
 
     conn.execute(
         """
@@ -564,15 +572,15 @@ def delete_worker(telegram_id: int) -> bool:
         conn.close()
     return deleted
 
-def save_report(telegram_id: int, report_date: str, report_type: str, slot_time: str | None, received_at: str, is_ok: bool, is_late: bool, format_comment: str, required_action: str, raw_text: str = "") -> int:
+def save_report(telegram_id: int, report_date: str, report_type: str, slot_time: str | None, received_at: str, is_ok: bool, is_late: bool, format_comment: str, required_action: str, raw_text: str = "", batch_id: str | None = None) -> int:
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO reports (telegram_id, report_date, report_type, slot_time, received_at, is_ok, is_late, format_comment, required_action, raw_text)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO reports (telegram_id, report_date, report_type, slot_time, received_at, is_ok, is_late, format_comment, required_action, raw_text, batch_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (telegram_id, report_date, report_type, slot_time, received_at, int(is_ok), int(is_late), format_comment, required_action, raw_text),
+        (telegram_id, report_date, report_type, slot_time, received_at, int(is_ok), int(is_late), format_comment, required_action, raw_text, batch_id),
     )
     conn.commit()
     inserted_id = cur.lastrowid
@@ -606,6 +614,85 @@ def resolve_unrecognized_report(report_id: int, report_type: str, slot_time: str
     )
     conn.commit()
     conn.close()
+
+def count_unresolved_batch_siblings(batch_id: str, telegram_id: int) -> int:
+    """How many reports sharing this batch_id (the same submission session) are still stuck
+    at report_type='unrecognized_speech' for this worker - used to decide whether a just-
+    resolved report was the LAST one pending, and the session's group message(s) can finally
+    be posted."""
+    if not batch_id:
+        return 0
+    conn = get_db()
+    row = conn.execute(
+        "SELECT COUNT(*) as c FROM reports WHERE batch_id = ? AND telegram_id = ? AND report_type = 'unrecognized_speech'",
+        (batch_id, telegram_id)
+    ).fetchone()
+    conn.close()
+    return row["c"] if row else 0
+
+def get_resolved_batch_reports_by_type(batch_id: str, telegram_id: int, report_type: str) -> list:
+    """Reports from the same submission session that have ALREADY been resolved (by an
+    admin, one at a time) to the given type - the set that gets combined into one group
+    message once every sibling in the session has been labeled."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM reports WHERE batch_id = ? AND telegram_id = ? AND report_type = ? ORDER BY id",
+        (batch_id, telegram_id, report_type)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def merge_resolved_batch_reports(report_ids: list[int], required_action: str | None = None) -> int:
+    """Combines multiple already-saved `reports` rows that were just resolved to the SAME
+    type (status or daily_fact) into ONE row - mirrors how process_media_batch already
+    combines multiple same-type videos from one auto-classified session into a single row
+    with a "Видео N: ..." joined format_comment/raw_text, so a manually-resolved session ends
+    up represented identically (one row, one editable report card) instead of N disconnected
+    ones. The first id becomes the primary (keeps its own row, its already-computed slot_time/
+    is_late/received_at); the rest have their report_media reassigned to it and are then
+    deleted. required_action, if given, is stored on the merged row too (the caller computes
+    it from the combined verdict - db.py has no access to the project's fixed action-text
+    constants). Returns the primary report_id - a no-op returning report_ids[0] if there's
+    only one id (nothing to merge)."""
+    if len(report_ids) <= 1:
+        return report_ids[0] if report_ids else None
+
+    conn = get_db()
+    rows = [conn.execute("SELECT * FROM reports WHERE id = ?", (rid,)).fetchone() for rid in report_ids]
+    rows = [dict(r) for r in rows if r]
+    if not rows:
+        conn.close()
+        return report_ids[0]
+
+    primary = rows[0]
+    raw_text_parts = [f"[Видео {i}]: {r['raw_text']}" for i, r in enumerate(rows, start=1)]
+    combined_raw_text = "\n".join(raw_text_parts)
+    # Each row's own format_comment already carries its "ОК - ..."/"не ОК - ..." prefix
+    # (baked in by ai.py's check_status, same as every non-batch report) - just number them,
+    # don't add a second prefix on top or parse_video_comments would see a doubled-up label.
+    comment_parts = [f"Видео {i}: {r['format_comment'] or ('ОК' if r['is_ok'] else 'не ОК')}" for i, r in enumerate(rows, start=1)]
+    combined_format_comment = "; ".join(comment_parts)
+    # Matches process_media_batch's own multi-video status/fact aggregation convention
+    # exactly (ANY video OK => overall row marked is_ok) - required_action, computed by the
+    # caller from the real error count, is what actually drives "needs correction" downstream.
+    combined_is_ok = any(bool(r["is_ok"]) for r in rows)
+
+    if required_action is not None:
+        conn.execute(
+            "UPDATE reports SET raw_text = ?, format_comment = ?, is_ok = ?, required_action = ? WHERE id = ?",
+            (combined_raw_text, combined_format_comment, int(combined_is_ok), required_action, primary["id"])
+        )
+    else:
+        conn.execute(
+            "UPDATE reports SET raw_text = ?, format_comment = ?, is_ok = ? WHERE id = ?",
+            (combined_raw_text, combined_format_comment, int(combined_is_ok), primary["id"])
+        )
+    for other in rows[1:]:
+        conn.execute("UPDATE report_media SET report_id = ? WHERE report_id = ?", (primary["id"], other["id"]))
+        conn.execute("DELETE FROM reports WHERE id = ?", (other["id"],))
+    conn.commit()
+    conn.close()
+    return primary["id"]
 
 def count_consecutive_unrecognized_reports(telegram_id: int) -> int:
     """How many of this worker's MOST RECENT reports (by insertion order) are, one after
