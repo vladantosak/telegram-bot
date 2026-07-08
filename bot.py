@@ -413,17 +413,6 @@ async def post_init(application: Application):
             )
             logger.info("Nightly database backup scheduled at 03:00.")
 
-        if not job_queue.get_jobs_by_name("ai_retry_check"):
-            from report_handlers import process_due_ai_reprocess_items
-            job_queue.run_repeating(
-                process_due_ai_reprocess_items,
-                interval=20,  # frequent - retries are due at specific times (30s/1min/5min or
-                              # an exact "try again in Ns" hint from the API), not on the clock
-                first=20,
-                name="ai_retry_check"
-            )
-            logger.info("AI technical-error retry check scheduled every 20 seconds.")
-
 def main():
     init_db()
     TOKEN = os.environ.get("TELEGRAM_TOKEN")
