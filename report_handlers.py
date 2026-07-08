@@ -576,6 +576,29 @@ async def resolve_unrecognized_speech_report(report_id: int, chosen_type: str, c
     except Exception as e:
         logger.error(f"Ошибка отправки карточки вручную обработанного отчёта {report_id} в группу: {e}")
 
+    # The employee gets the exact same personal message a normal auto-processed report
+    # would produce - nothing here reveals that an admin resolved this manually rather than
+    # the AI doing it automatically, per product decision.
+    label = "Статус" if chosen_type == "status" else "Факт"
+    try:
+        if ai_res["is_ok"]:
+            if chosen_type == "status":
+                personal_text = f"✅ Статус за {slot_time} принят без замечаний."
+                if is_late:
+                    personal_text += " Статус получен позже установленного времени."
+            else:
+                personal_text = "✅ Факт получен и принят без замечаний."
+        else:
+            personal_text = (
+                f"❌ {label} НЕ ОК. {_short_issue_text([ai_res])}\n"
+                "Сотрудник контроля свяжется с вами и скажет замечания.\n"
+                "Напоминаем, что при частом допущении ошибок в сдаче отчетов, "
+                "проблема будет делегироваться руководству."
+            )
+        await context.bot.send_message(chat_id=telegram_id, text=personal_text)
+    except Exception as e:
+        logger.warning(f"Не удалось отправить личный фидбек по вручную обработанному отчёту пользователю {telegram_id}: {e}")
+
     return True, w_name
 
 async def enqueue_media_report_item(user_id: int, context: ContextTypes.DEFAULT_TYPE, update: Update, text_content: str, now: datetime, duration_seconds: float | None = None):
