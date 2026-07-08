@@ -511,7 +511,24 @@ async def resolve_unrecognized_speech_report(report_id: int, chosen_type: str, c
     except Exception:
         submitted_at = now_local()
 
-    ai_res = await check_status_async(raw_text, report_type_override=chosen_type)
+    try:
+        ai_res = await check_status_async(raw_text, report_type_override=chosen_type)
+    except AITechnicalError as e:
+        # The whole point of this manual button is to let an admin resolve a report WHILE
+        # the AI is unavailable - if it still requires a working check_status call to
+        # complete, an admin clicking during exactly that outage just gets the same failure
+        # again, with nothing visibly changing in the chat (the click looked "broken"). An
+        # admin choosing Статус/Факт here has already looked at the video and judged it
+        # acceptable, so treat that judgment as the verdict instead of blocking on the AI.
+        logger.warning(f"[resolve_unrecognized_speech_report] ИИ всё ещё недоступен при разрешении отчёта {report_id} администратором, принято по решению администратора: {e.message}")
+        ai_res = {
+            "report_type": chosen_type,
+            "is_ok": True,
+            "format_comment": "оценено вручную администратором (ИИ недоступен)",
+            "required_action": "ничего не предпринимать",
+            "employee_message": "",
+            "issue": "",
+        }
 
     if chosen_type == "status":
         submitted_slots = await run_db(get_submitted_status_slots, telegram_id, report_date)
@@ -1781,14 +1798,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if data.startswith("speechfix_status_") or data.startswith("speechfix_fact_"):
         chosen_type = "status" if data.startswith("speechfix_status_") else "daily_fact"
         report_id = int(data.split("_")[-1])
-        try:
-            resolved, w_name = await resolve_unrecognized_speech_report(report_id, chosen_type, context)
-        except AITechnicalError:
-            # Infra problem (rate limit/timeout), not a conflict with another admin - the
-            # report stays report_type='unrecognized_speech', untouched, so this button still
-            # works once the admin tries again.
-            await query.answer("⏳ Технический сбой при обращении к ИИ. Попробуйте ещё раз через минуту.", show_alert=True)
-            return
+        # resolve_unrecognized_speech_report always completes (it falls back to a manual
+        # "оценено администратором" verdict if the AI is still unavailable), so the only way
+        # this returns falsy is a genuine conflict with another admin - see below.
+        resolved, w_name = await resolve_unrecognized_speech_report(report_id, chosen_type, context)
         if not resolved:
             await query.answer("Этот отчёт уже был обработан другим администратором.", show_alert=True)
             return
