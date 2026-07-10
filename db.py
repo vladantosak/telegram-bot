@@ -1321,8 +1321,19 @@ def export_workers_to_excel() -> bytes:
     for i, width in enumerate([14, 16, 14, 22, 18, 12, 16, 20, 10, 26], 1):
         ws.column_dimensions[get_column_letter(i)].width = width
 
+    # get_all_workers() already orders by object_id first (then sort_order/last_name/
+    # first_name), so same-object rows are already contiguous - no re-sorting needed here,
+    # just detect the boundary between one object's rows and the next.
     workers = get_all_workers()
-    for w in workers:
+    separator_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+    prev_object_id = None
+    for i, w in enumerate(workers):
+        if i > 0 and w["object_id"] != prev_object_id:
+            ws.append([None] * len(headers))
+            sep_row = ws.max_row
+            for col in range(1, len(headers) + 1):
+                ws.cell(row=sep_row, column=col).fill = separator_fill
+
         ws.append([
             w["telegram_id"],
             w["last_name"],
@@ -1335,6 +1346,7 @@ def export_workers_to_excel() -> bytes:
             w["sort_order"],
             w["object_id"],
         ])
+        prev_object_id = w["object_id"]
 
     out = io.BytesIO()
     wb.save(out)
