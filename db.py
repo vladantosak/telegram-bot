@@ -1343,9 +1343,17 @@ def export_workers_to_excel() -> bytes:
             w["schedule"],
             "Да" if w["needs_daily_fact"] else "Нет",
             "Работает" if w["is_active"] else "Отпуск",
-            w["sort_order"],
+            None,  # "Номер в списке" (column I) - set below as a formula, not a static value
             w["object_id"],
         ])
+        # Auto-numbers within each "Объект" (column J) group, restarting at 1 whenever it
+        # changes from the row above - works for the very first data row too, since row 2 is
+        # the hint row ("объект" text), which never equals a real object_id, so the
+        # comparison naturally falls through to 1. This column is purely for the admin's
+        # convenience while reading the file - not intended to be edited by hand, and
+        # ignored on the way back in (see _WORKERS_DIFF_FIELDS / apply_workers_sync).
+        row_num = ws.max_row
+        ws.cell(row=row_num, column=9).value = f"=IF(J{row_num - 1}=J{row_num},I{row_num - 1}+1,1)"
         prev_object_id = w["object_id"]
 
     out = io.BytesIO()
@@ -1529,8 +1537,10 @@ _WORKERS_DIFF_FIELDS = [
     ("schedule", "График"),
     ("needs_daily_fact", "Итоговый отчёт за день"),
     ("is_active", "Статус"),
-    ("sort_order", "Номер в списке"),
     ("object_id", "Объект"),
+    # sort_order ("Номер в списке") is deliberately excluded - the exported file now writes
+    # it as an auto-computed Excel formula (=IF(J{r-1}=J{r},I{r-1}+1,1)), not a real editable
+    # value, so it must never make a worker show up as "changed" on its own.
 ]
 
 def _format_worker_field_value(key: str, value) -> str:
@@ -1581,11 +1591,24 @@ def apply_workers_sync(new_workers: list[dict], changed_workers: list[dict], mis
     cleanup of their reports/media/reminders as the manual "🗑 Удалить сотрудника" admin
     action - not a separate, narrower deletion path). The caller is responsible for taking a
     backup first and restoring it if this raises."""
-    for w in new_workers + [item["new"] for item in changed_workers]:
+    for w in new_workers:
         upsert_worker(
             telegram_id=w["telegram_id"], last_name=w["last_name"], first_name=w["first_name"],
             position=w["position"], group_id=w["group_id"], schedule=w["schedule"],
             needs_daily_fact=w["needs_daily_fact"], sort_order=w["sort_order"],
+            is_active=1 if w["is_active"] else 0, object_id=w["object_id"]
+        )
+    for item in changed_workers:
+        w = item["new"]
+        # "Номер в списке" is now an auto-computed display formula in the exported file, not
+        # a real editable field (see _WORKERS_DIFF_FIELDS) - keep the worker's actual stored
+        # rank untouched instead of overwriting it with whatever came back in the file
+        # (which could even be a stale/uncalculated value if the admin never opened the file
+        # in Excel/LibreOffice, since openpyxl never evaluates formulas itself).
+        upsert_worker(
+            telegram_id=w["telegram_id"], last_name=w["last_name"], first_name=w["first_name"],
+            position=w["position"], group_id=w["group_id"], schedule=w["schedule"],
+            needs_daily_fact=w["needs_daily_fact"], sort_order=item["old"]["sort_order"],
             is_active=1 if w["is_active"] else 0, object_id=w["object_id"]
         )
     deleted_count = 0
