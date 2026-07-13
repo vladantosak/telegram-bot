@@ -290,9 +290,9 @@ def init_db():
         """
     )
     # Tracks every admin DM sent for a report stuck at report_type='unrecognized_speech'
-    # (transcription-quality gate failed) - lets the bot find and disable the "Пометить как
-    # Статус/Факт" buttons in EVERY admin's chat once any one admin has resolved it, so two
-    # admins can't both process the same report.
+    # (transcription-quality gate failed, or an AI technical failure) - lets the bot find and
+    # disable the manual-review buttons in EVERY admin's chat once any one admin has resolved
+    # it, so two admins can't both process the same report.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS speech_review_messages (
@@ -2410,6 +2410,47 @@ def sync_gsheets_task() -> tuple[bool, str | None]:
 _gsheets_sync_lock = None
 _gsheets_sync_state_lock = None
 _gsheets_sync_pending = False
+_gsheets_last_failure_alert_ts = 0.0
+GSHEETS_FAILURE_ALERT_COOLDOWN_SECONDS = 900  # 15 min - one alert is enough to notice an outage without flooding admins on every retry while it's down
+
+def _alert_admins_gsheets_sync_failed(error_text: str):
+    """Best-effort admin alert for a background Sheets sync failure. async_sync_gsheets_
+    background is triggered after nearly every report/worker write and used to silently
+    discard a failed sync's (success, error) result - logged server-side only, with no way
+    for anyone to notice Sheets had drifted out of sync with the real data until someone
+    happened to check the spreadsheet by hand. This runs in a plain background thread with
+    no bot Application/event loop available (unlike every other admin notification in this
+    project, which goes through context.bot), so it posts directly via Telegram's HTTP API
+    instead - a deliberate, minimal, one-off exception made only because no context object
+    exists at this call site."""
+    global _gsheets_last_failure_alert_ts
+    import time
+    now_ts = time.time()
+    if now_ts - _gsheets_last_failure_alert_ts < GSHEETS_FAILURE_ALERT_COOLDOWN_SECONDS:
+        return
+    _gsheets_last_failure_alert_ts = now_ts
+
+    token = os.environ.get("TELEGRAM_TOKEN")
+    if not token or not ADMIN_IDS:
+        return
+    text = (
+        "⚠️ Синхронизация с Google Sheets не удалась (автоматическая фоновая попытка).\n"
+        "Таблица может отставать от реальных данных бота.\n"
+        f"Причина: {(error_text or '')[:300]}"
+    )
+    try:
+        import requests
+    except ImportError:
+        return
+    for admin_id in ADMIN_IDS:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": admin_id, "text": text},
+                timeout=10
+            )
+        except Exception:
+            pass
 
 def async_sync_gsheets_background():
     # BUG FIX: this used to spawn a brand-new thread on every call with no coordination.
@@ -2437,7 +2478,9 @@ def async_sync_gsheets_background():
         global _gsheets_sync_pending
         with _gsheets_sync_lock:
             while True:
-                sync_gsheets_task()
+                success, err = sync_gsheets_task()
+                if not success:
+                    _alert_admins_gsheets_sync_failed(err)
                 with _gsheets_sync_state_lock:
                     if _gsheets_sync_pending:
                         _gsheets_sync_pending = False

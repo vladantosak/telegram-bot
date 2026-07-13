@@ -221,6 +221,46 @@ def make_report_actions_expanded_keyboard(report_id: int, report_type: str | Non
     rows.append([InlineKeyboardButton("◀️ Свернуть", callback_data=f"actions_collapse_{report_id}")])
     return InlineKeyboardMarkup(rows)
 
+# Fixed vocabulary for a manually-assigned "не ОК" reason during manual review (AI technical
+# failure or unrecognized speech) - the SAME 3 content-quality reasons _derive_not_ok_reason
+# already recognizes by keyword in format_comment ("молчал"/"неразборч", else the default), so
+# a manually-resolved не-ОК report renders identically to an automatically-scored one with no
+# changes needed there. "прислал поздно" is deliberately NOT one of these - it's an is_late
+# attribute with its own dedicated "⏰ Опоздание" toggle (see make_report_actions_expanded_
+# keyboard), never a content-quality verdict an admin picks here.
+MANUAL_REVIEW_REASONS = [
+    ("silent", "🔇 Молчал в видео", "на видео молчал"),
+    ("unclear", "🗣 Говорил неразборчиво", "неразборчивый текст"),
+    ("novolume", "📦 Не указал объём работы", "не указал объём работы"),
+]
+MANUAL_REVIEW_REASON_TEXT = {code: text for code, _, text in MANUAL_REVIEW_REASONS}
+
+def make_manual_review_keyboard(report_id: int) -> InlineKeyboardMarkup:
+    """Initial keyboard for a report awaiting manual review (AI technical failure OR
+    unrecognized speech): the admin picks TYPE and VERDICT in a single tap - "ОК" resolves
+    immediately, "НЕ ОК" swaps this same message's keyboard (edit_message_reply_markup - only
+    THIS admin's own copy of the message, every other admin's copy is untouched) to a reason
+    sub-menu via make_manual_review_reason_keyboard, nothing is written to the database until
+    a final verdict (ОК, or a specific не-ОК reason) is actually chosen."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Статус ОК", callback_data=f"mr_status_ok_{report_id}"),
+            InlineKeyboardButton("⚠️ Статус НЕ ОК", callback_data=f"mr_status_bad_{report_id}"),
+        ],
+        [
+            InlineKeyboardButton("✅ Факт ОК", callback_data=f"mr_fact_ok_{report_id}"),
+            InlineKeyboardButton("⚠️ Факт НЕ ОК", callback_data=f"mr_fact_bad_{report_id}"),
+        ],
+    ])
+
+def make_manual_review_reason_keyboard(report_id: int, rtype: str) -> InlineKeyboardMarkup:
+    """rtype is "status" or "fact" (kept as a distinct short token in callback_data, alongside
+    report_type's real "daily_fact" spelling elsewhere) - shown after "⚠️ ... НЕ ОК" is
+    tapped, replacing this admin's own copy of the initial 4-button keyboard."""
+    rows = [[InlineKeyboardButton(label, callback_data=f"mr_{rtype}_{code}_{report_id}")] for code, label, _ in MANUAL_REVIEW_REASONS]
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"mr_back_{report_id}")])
+    return InlineKeyboardMarkup(rows)
+
 def make_cancel_edit_keyboard(report_id: int) -> InlineKeyboardMarkup:
     """Real inline "❌ Отмена" button shown on a text-input prompt (edit comment/slot time),
     replacing the old "(или введите «Отмена»)" text hint. A message can't carry both a
@@ -374,12 +414,12 @@ async def classify_report_type_async(text: str) -> dict:
 async def notify_admins_ai_check_failed(context: ContextTypes.DEFAULT_TYPE, report_id: int, worker_name: str,
                                          submitted_at_str: str, report_date_str: str, upd: Update | None,
                                          error_message: str):
-    """Same review mechanism as notify_admins_unrecognized_speech (speechfix_status_/
-    speechfix_fact_ buttons, self-locking across every admin via speech_review_messages) but
-    for a report whose CONTENT-ANALYSIS call failed technically (rate limit/timeout/etc.) -
-    not one whose speech genuinely couldn't be understood. The Telegram message only ever
-    gets a short, fixed phrase about the failure - the real error text (needed to check the
-    provider's billing/rate-limit dashboard) is logged server-side only, never sent here."""
+    """Same review mechanism as notify_admins_unrecognized_speech (mr_ buttons, self-locking
+    across every admin via speech_review_messages) but for a report whose CONTENT-ANALYSIS
+    call failed technically (rate limit/timeout/etc.) - not one whose speech genuinely
+    couldn't be understood. The Telegram message only ever gets a short, fixed phrase about
+    the failure - the real error text (needed to check the provider's billing/rate-limit
+    dashboard) is logged server-side only, never sent here."""
     logger.error(f"[ai_check_failed] Техническая ошибка ИИ при анализе отчёта {report_id} сотрудника {worker_name}: {error_message}")
     is_media = bool(upd and (upd.message.voice or upd.message.video or upd.message.video_note))
     alert_text = (
@@ -391,10 +431,7 @@ async def notify_admins_ai_check_failed(context: ContextTypes.DEFAULT_TYPE, repo
     )
     if not is_media and upd is not None:
         alert_text += f"\n\n🗣 Текст отчёта:\n\"{html.escape(upd.message.text or '')}\""
-    kbd = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Пометить как Статус", callback_data=f"speechfix_status_{report_id}"),
-        InlineKeyboardButton("📋 Пометить как Факт", callback_data=f"speechfix_fact_{report_id}"),
-    ]])
+    kbd = make_manual_review_keyboard(report_id)
     for admin_id in ADMIN_IDS:
         try:
             if is_media:
@@ -443,7 +480,7 @@ async def handle_ai_check_failure(context: ContextTypes.DEFAULT_TYPE, user_id: i
     """Called the moment content-analysis (check_status) fails technically, for either a
     video/voice item or a typed text report - no retries, straight to the SAME manual-review
     mechanism as "не удалось распознать речь" (report_type='unrecognized_speech', the
-    speechfix_status_/speechfix_fact_ buttons, resolve_unrecognized_speech_report on click).
+    mr_ buttons, resolve_unrecognized_speech_report on click).
     Never treated as не ОК, never counted toward the remark counter (no report row exists
     with a real verdict until an admin resolves it), never shown any error text at all."""
     report_id, is_media = await _save_ai_check_failure_report(user_id, date_str, now, text_content, upd, batch_id)
@@ -484,19 +521,16 @@ async def _save_unrecognized_speech_report(user_id: int, date_str: str, now: dat
 
 async def notify_admins_unrecognized_speech(context: ContextTypes.DEFAULT_TYPE, report_id: int, worker_name: str, text_content: str, upd: Update):
     """Sends the original video + a fixed review prompt to EVERY admin's private chat (not
-    the work group) with buttons to manually pick Статус/Факт - per product decision, ALL
-    admins get notified and the buttons self-lock on first click (see the
-    speechfix_status_/speechfix_fact_ callback), rather than picking one "on duty" admin."""
+    the work group) with buttons to manually pick type AND verdict in one tap - per product
+    decision, ALL admins get notified and the buttons self-lock on first click (see the mr_
+    callback dispatch in handle_callback_query), rather than picking one "on duty" admin."""
     transcript_shown = html.escape(text_content.strip()) if text_content.strip() else "Пустой результат"
     review_text = (
         f"⚠️ Не удалось распознать речь в отчёте.\n"
         f"Сотрудник: {html.escape(worker_name)}\n"
         f"Результат транскрибации: \"{transcript_shown}\""
     )
-    kbd = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Пометить как Статус", callback_data=f"speechfix_status_{report_id}"),
-        InlineKeyboardButton("📋 Пометить как Факт", callback_data=f"speechfix_fact_{report_id}"),
-    ]])
+    kbd = make_manual_review_keyboard(report_id)
     for admin_id in ADMIN_IDS:
         try:
             copied = await context.bot.copy_message(
@@ -572,18 +606,24 @@ async def _post_resolved_batch_type_group_message(batch_id: str, telegram_id: in
     except Exception as e:
         logger.error(f"Ошибка отправки карточки объединённого вручную обработанного отчёта {primary_id} в группу: {e}")
 
-async def resolve_unrecognized_speech_report(report_id: int, chosen_type: str, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, str | None, int]:
-    """Admin manually resolves a report_type='unrecognized_speech' row into Status or Fact.
-    Runs the exact same content check and slot attribution a normal report of that type would
-    get (using the ORIGINAL submission time, not the time of the admin's click). The employee
-    gets their personal verdict message immediately, per video, exactly as before - but the
-    video is only forwarded to the WORK GROUP once every OTHER video from the SAME submission
-    session (batch_id) has also been resolved, so a session an admin labels one video at a
-    time - in any order, possibly hours apart - still ends up posted as ONE combined message
-    per type actually used (matching how an automatically-classified session's videos get
-    grouped), instead of separate messages trickling into the group as each button is
-    clicked. A lone report with no batch_id (e.g. a pre-migration row) posts immediately,
-    exactly as this function always worked before session tracking existed.
+async def resolve_unrecognized_speech_report(report_id: int, chosen_type: str, is_ok: bool,
+                                              reason_code: str | None,
+                                              context: ContextTypes.DEFAULT_TYPE) -> tuple[str, str | None, int]:
+    """Admin manually resolves a report_type='unrecognized_speech' row into Status or Fact,
+    with the FULL verdict (is_ok, and - if НЕ ОК - which of MANUAL_REVIEW_REASONS) given
+    directly by the admin's button tap, never re-derived by asking the AI again: the whole
+    point of this button existing is that the AI is either down or the speech genuinely
+    couldn't be transcribed, so there is nothing left for it to weigh in on here - the admin
+    has already watched the video and made the call. Runs the same slot attribution a normal
+    status report would get (using the ORIGINAL submission time, not the time of the admin's
+    click). The employee gets their personal verdict message immediately, per video, exactly
+    as before - but the video is only forwarded to the WORK GROUP once every OTHER video from
+    the SAME submission session (batch_id) has also been resolved, so a session an admin
+    labels one video at a time - in any order, possibly hours apart - still ends up posted as
+    ONE combined message per type actually used (matching how an automatically-classified
+    session's videos get grouped), instead of separate messages trickling into the group as
+    each button is clicked. A lone report with no batch_id (e.g. a pre-migration row) posts
+    immediately, exactly as this function always worked before session tracking existed.
 
     Returns (status, worker_name, remaining):
     - "conflict": already resolved by another admin (or a stale second click) - worker_name is None.
@@ -619,23 +659,29 @@ async def resolve_unrecognized_speech_report(report_id: int, chosen_type: str, c
     except Exception:
         submitted_at = now_local()
 
-    try:
-        ai_res = await check_status_async(raw_text, report_type_override=chosen_type)
-    except AITechnicalError as e:
-        # The whole point of this manual button is to let an admin resolve a report WHILE
-        # the AI is unavailable - if it still requires a working check_status call to
-        # complete, an admin clicking during exactly that outage just gets the same failure
-        # again, with nothing visibly changing in the chat (the click looked "broken"). An
-        # admin choosing Статус/Факт here has already looked at the video and judged it
-        # acceptable, so treat that judgment as the verdict instead of blocking on the AI.
-        logger.warning(f"[resolve_unrecognized_speech_report] ИИ всё ещё недоступен при разрешении отчёта {report_id} администратором, принято по решению администратора: {e.message}")
+    # format_comment/required_action/issue follow the EXACT same "ОК - .../не ОК - ..."
+    # convention ai.py's normalize_ai_result already produces for an automatic verdict, so
+    # every downstream consumer (_derive_not_ok_reason's "молчал"/"неразборч" keyword match,
+    # parse_video_comments, count_effective_remarks, Google Sheets) treats a manually-given
+    # verdict identically to an automatic one with no separate-casing needed anywhere else.
+    if is_ok:
         ai_res = {
             "report_type": chosen_type,
             "is_ok": True,
-            "format_comment": "оценено вручную администратором (ИИ недоступен)",
+            "format_comment": "ОК - оценено вручную администратором",
             "required_action": "ничего не предпринимать",
             "employee_message": "",
             "issue": "",
+        }
+    else:
+        reason_text = MANUAL_REVIEW_REASON_TEXT.get(reason_code, "не указал объём работы")
+        ai_res = {
+            "report_type": chosen_type,
+            "is_ok": False,
+            "format_comment": f"не ОК - {reason_text}",
+            "required_action": f"сделал замечание сотруднику: {reason_text}",
+            "employee_message": f"В отчете есть замечание: {reason_text}. В следующем отчете исправьте это.",
+            "issue": reason_text,
         }
 
     if chosen_type == "status":
@@ -757,19 +803,49 @@ async def _flush_media_batch(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         await process_media_batch(user_id, buf["items"], context, batch_id)
         logger.info(f"[media_batch] Обработка завершена для пользователя {user_id}")
     except Exception as exc:
+        # Last-resort catch-all for a genuinely unexpected bug in the pipeline (every
+        # EXPECTED failure mode - AITechnicalError from ASR/content-analysis, a bad
+        # transcription - is already caught deeper inside process_media_batch and routed to
+        # manual review without ever reaching here). The employee must never see the raw
+        # exception text (it could be anything - a stack-trace-adjacent message, a raw
+        # provider error), so only a fixed, generic phrase goes to them; the real detail is
+        # logged server-side and also sent to admins so an unexpected crash doesn't go
+        # unnoticed the way a silent background-sync failure would.
         logger.exception(f"Ошибка обработки пачки видео-отчетов пользователя {user_id}")
         try:
             await context.bot.send_message(
                 chat_id=user_id,
-                text=f"❌ Ошибка при обработке видео: {exc}\n\nПопробуйте отправить ещё раз."
+                text="❌ Не удалось обработать видео из-за технической ошибки.\n\nПопробуйте отправить ещё раз."
             )
         except Exception:
             pass
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        "⚠️ Необработанная ошибка при обработке пачки видео-отчётов.\n"
+                        f"Сотрудник (telegram_id): {user_id}\n"
+                        "Подробности — в серверных логах."
+                    )
+                )
+            except Exception:
+                pass
     finally:
         try:
             user_lock.release()
         except Exception:
             pass
+
+def is_late_by_tolerance(signed_diff_minutes: int) -> bool:
+    """Single shared definition of "прислал поздно": strictly later than
+    STATUS_LATE_TOLERANCE_MIN minutes past the slot's clock time (early is never late, no
+    matter how early - exactly-at-tolerance still counts as on time, matching the historical
+    behavior this replaces). Used by BOTH pick_target_status_slot (initial attribution) and
+    the edit_time_ admin correction flow, which used to reimplement this same comparison
+    independently - kept as one function so the two can never quietly drift apart if the
+    tolerance or the comparison itself ever changes."""
+    return signed_diff_minutes > STATUS_LATE_TOLERANCE_MIN
 
 def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots: set, worker_name: str = "?"):
     """Attributes a status video to the schedule slot closest to it in clock time — always
@@ -813,7 +889,7 @@ def pick_target_status_slot(schedule: list[str], now: datetime, submitted_slots:
     # submission (signed_diff negative) is never late, no matter how early. The previous
     # version also flagged anything sent too far EARLY as "late", which is exactly backwards
     # (e.g. a video sent at 08:10 for a 10:00 slot was being marked "прислал поздно").
-    is_late = signed_diff > STATUS_LATE_TOLERANCE_MIN
+    is_late = is_late_by_tolerance(signed_diff)
 
     logger.info(
         "[Определение времени] Получено видео. "
@@ -850,9 +926,9 @@ async def process_media_batch(user_id: int, items: list[dict], context: ContextT
     evaluated_items = []
     # Unified list for BOTH reasons a video ends up needing a human: failed the speech-quality
     # gate ("unrecognized") or hit an AITechnicalError during content analysis ("ai_error") -
-    # both are saved as report_type='unrecognized_speech' and resolved via the same
-    # speechfix_status_/speechfix_fact_ buttons, so batch-sibling tracking treats them
-    # identically regardless of which one triggered it.
+    # both are saved as report_type='unrecognized_speech' and resolved via the same mr_
+    # buttons, so batch-sibling tracking treats them identically regardless of which one
+    # triggered it.
     manual_review_items = []
     for idx, item in enumerate(items, start=1):
         text_content = item["text_content"]
@@ -1398,7 +1474,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 rh, rm = int(r["received_at"][0:2]), int(r["received_at"][3:5])
                 h, m = map(int, new_time.split(":"))
                 diff = (rh * 60 + rm) - (h * 60 + m)
-                new_is_late = diff > STATUS_LATE_TOLERANCE_MIN
+                new_is_late = is_late_by_tolerance(diff)
             except Exception:
                 pass
 
@@ -1965,22 +2041,55 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await handle_workers_sync_callback(query, context, data)
         return
 
-    # 0. Manually resolve a report stuck at report_type='unrecognized_speech' (speech
-    # recognition quality gate failed) into Status or Fact - self-locking across every admin
-    # that got a copy of this notification, so only the first click does anything.
-    if data.startswith("speechfix_status_") or data.startswith("speechfix_fact_"):
-        chosen_type = "status" if data.startswith("speechfix_status_") else "daily_fact"
+    # 0a. Manual review menu navigation - "◀️ Назад" from the reason sub-menu back to the
+    # initial 4-button menu. Pure UI state, encoded entirely in which keyboard THIS admin's
+    # own copy of the message currently shows - nothing is read from or written to the
+    # database here, so there's no shared state to race on between admins or clicks.
+    if data.startswith("mr_back_"):
         report_id = int(data.split("_")[-1])
-        # resolve_unrecognized_speech_report always completes (it falls back to a manual
-        # "оценено администратором" verdict if the AI is still unavailable), so "conflict" is
-        # the only status meaning another admin already handled this exact report.
-        status, w_name, remaining = await resolve_unrecognized_speech_report(report_id, chosen_type, context)
+        try:
+            await query.edit_message_reply_markup(reply_markup=make_manual_review_keyboard(report_id))
+        except Exception as e:
+            logger.error(f"Ошибка при возврате к меню ручной оценки отчёта {report_id}: {e}")
+        return
+
+    # 0b. "⚠️ Статус/Факт НЕ ОК" - not a verdict yet, just swaps this admin's own copy of the
+    # keyboard to the reason sub-menu. Checked before the general "mr_" dispatch below since
+    # both share the "mr_status_"/"mr_fact_" prefix.
+    if data.startswith("mr_status_bad_") or data.startswith("mr_fact_bad_"):
+        rtype = "status" if data.startswith("mr_status_bad_") else "fact"
+        report_id = int(data.split("_")[-1])
+        try:
+            await query.edit_message_reply_markup(reply_markup=make_manual_review_reason_keyboard(report_id, rtype))
+        except Exception as e:
+            logger.error(f"Ошибка при показе меню причин ручной оценки отчёта {report_id}: {e}")
+        return
+
+    # 0c. Final verdict for a report stuck at report_type='unrecognized_speech' (speech
+    # recognition quality gate failed, or an AI technical failure) - type AND verdict
+    # (ОК, or a specific не-ОК reason) are both given directly by this one tap, no further AI
+    # call. Self-locking across every admin that got a copy of this notification, so only the
+    # first admin to reach a final verdict does anything - a second click (by the same admin
+    # re-tapping, or a different admin who was mid-navigation on their own copy) is a no-op
+    # "conflict".
+    if data.startswith("mr_status_") or data.startswith("mr_fact_"):
+        parts = data.split("_")
+        chosen_type = "status" if parts[1] == "status" else "daily_fact"
+        verdict_token = parts[2]
+        report_id = int(parts[-1])
+        is_ok = verdict_token == "ok"
+        reason_code = None if is_ok else verdict_token
+
+        status, w_name, remaining = await resolve_unrecognized_speech_report(
+            report_id, chosen_type, is_ok, reason_code, context
+        )
         if status == "conflict":
             await query.answer("Этот отчёт уже был обработан другим администратором.", show_alert=True)
             return
 
         admin_name = update.effective_user.first_name or str(user_id)
         type_label = "Статус" if chosen_type == "status" else "Факт"
+        verdict_label = "ОК" if is_ok else f"НЕ ОК ({MANUAL_REVIEW_REASON_TEXT.get(reason_code, 'не указал объём работы')})"
         if status == "waiting":
             # Other videos from this same submission session are still unlabeled - the group
             # post is deliberately held back until every one of them is resolved, so the
@@ -1988,17 +2097,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             # yet (otherwise it can look like the button silently did nothing).
             plural_suffix = "о" if remaining == 1 else ""
             resolved_note = (
-                f"⚠️ Не удалось распознать речь в отчёте.\n"
+                f"⚠️ Не удалось автоматически обработать отчёт.\n"
                 f"Сотрудник: {html.escape(w_name)}\n\n"
-                f"✅ Обработано администратором {html.escape(admin_name)} — тип: {type_label}\n"
+                f"✅ Обработано администратором {html.escape(admin_name)} — {type_label}, {verdict_label}\n"
                 f"⏳ Ожидание остальных видео из этой отправки (ещё не размечен{plural_suffix} {remaining}) — "
                 "сообщение в группу будет отправлено, когда все видео этой отправки будут размечены."
             )
         else:
             resolved_note = (
-                f"⚠️ Не удалось распознать речь в отчёте.\n"
+                f"⚠️ Не удалось автоматически обработать отчёт.\n"
                 f"Сотрудник: {html.escape(w_name)}\n\n"
-                f"✅ Обработано администратором {html.escape(admin_name)} — тип: {type_label}"
+                f"✅ Обработано администратором {html.escape(admin_name)} — {type_label}, {verdict_label}"
             )
         review_msgs = await run_db(get_speech_review_messages, report_id)
         for rm in review_msgs:
@@ -2274,25 +2383,39 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception as e:
                 logger.error(f"Ошибка при показе меню выбора видео для toggling: {e}")
         else:
-            new_is_ok = 0 if report["is_ok"] == 1 else 1
-            new_format_comment = report["format_comment"] or ""
-            if video_items:
-                video_items[0]["is_ok"] = (new_is_ok == 1)
-                new_format_comment = rebuild_format_comment(video_items)
-
+            # Re-reads the CURRENT row and computes+writes the flip in ONE uninterrupted
+            # thread call, with no `await` between reading is_ok/format_comment and writing
+            # the toggled result. Previously the read happened in _fetch_report above and the
+            # decision (new_is_ok/new_format_comment) was computed here in the async function
+            # body, from data that could already be stale by the time _apply_fix_toggle
+            # actually wrote it - a fast double-tap on this same button could let both clicks
+            # read the same pre-toggle state and both write the same "flipped once" result,
+            # silently losing one of the two intended flips.
             def _apply_fix_toggle():
                 conn = get_db()
+                r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+                if not r:
+                    conn.close()
+                    return None, None
+                new_is_ok = 0 if r["is_ok"] == 1 else 1
+                new_format_comment = r["format_comment"] or ""
+                items = parse_video_comments(r["format_comment"])
+                if items:
+                    items[0]["is_ok"] = (new_is_ok == 1)
+                    new_format_comment = rebuild_format_comment(items)
                 conn.execute("UPDATE reports SET is_ok = ?, format_comment = ? WHERE id = ?", (new_is_ok, new_format_comment, report_id))
                 conn.commit()
-                r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-                w = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (r["telegram_id"],)).fetchone()
+                r2 = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+                w = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (r2["telegram_id"],)).fetchone()
                 conn.close()
-                return r, w
+                return r2, w
 
             report, worker = await run_db(_apply_fix_toggle)
+            if not report:
+                return
 
             async_sync_gsheets_background()
-            
+
             worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
             position = clean_position(worker["position"]) if worker else "?"
             text, kbd = await render_report_message_from_row(report, worker_name, position)
