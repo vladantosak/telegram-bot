@@ -193,12 +193,13 @@ def make_report_keyboard(report_id: int, report_type: str | None = None) -> Inli
     return InlineKeyboardMarkup([[InlineKeyboardButton("⚙️", callback_data=f"actions_expand_{report_id}")]])
 
 def make_report_actions_expanded_keyboard(report_id: int, report_type: str | None = None) -> InlineKeyboardMarkup:
-    """Expanded state, shown after an admin taps "⚙️": Оценка (fix_toggle_) / Тип
-    (toggle_type_) / Время (edit_time_, status only) / Действия (edit_action_, a manual
-    override for "Требуемые действия") - "📝 Изменить комментарий" is no longer on this quick
-    menu (Формат отчета no longer shows a freeform summary to edit - see render_report_
-    message_from_row), but edit_comment_/ed_overall_/ed_vid_ still exist unchanged in case
-    that's needed again."""
+    """Expanded state, shown after an admin taps "⚙️": Оценка (fix_toggle_, content quality
+    only) / Тип (toggle_type_) / Опоздание (toggle_late_, status only - a SEPARATE flag from
+    the content оценка, see render_report_message_from_row's effective_not_ok) / Время
+    (edit_time_, status only) / Действия (edit_action_, a manual override for "Требуемые
+    действия") - "📝 Изменить комментарий" is no longer on this quick menu (Формат отчета no
+    longer shows a freeform summary to edit - see render_report_message_from_row), but
+    edit_comment_/ed_overall_/ed_vid_ still exist unchanged in case that's needed again."""
     report_type = _resolve_report_type(report_id, report_type)
     rows = [
         [
@@ -211,6 +212,10 @@ def make_report_actions_expanded_keyboard(report_id: int, report_type: str | Non
         # Lets an admin correct a report misattributed to the wrong schedule slot (e.g. the
         # "nearest slot" pick landed on the wrong one) without having to delete and redo it.
         second_row.append(InlineKeyboardButton("🕒 Время", callback_data=f"edit_time_{report_id}"))
+        # Content quality (✏️ Оценка) and lateness are independent attributes - toggling one
+        # must never be the only way to affect the other (see effective_not_ok), so lateness
+        # gets its own dedicated button rather than being folded into "Оценка".
+        second_row.append(InlineKeyboardButton("⏰ Опоздание", callback_data=f"toggle_late_{report_id}"))
     second_row.append(InlineKeyboardButton("📋 Действия", callback_data=f"edit_action_{report_id}"))
     rows.append(second_row)
     rows.append([InlineKeyboardButton("◀️ Свернуть", callback_data=f"actions_collapse_{report_id}")])
@@ -2130,7 +2135,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         async_sync_gsheets_background()
-        
+
         worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
         position = clean_position(worker["position"]) if worker else "?"
         text, kbd = await render_report_message_from_row(report, worker_name, position)
@@ -2138,6 +2143,45 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
         except Exception as e:
             logger.error(f"Ошибка при изменении типа отчета: {e}")
+        return
+
+    # 2a-bis. Toggle the "опоздание" flag - independent of content-quality оценка (fix_toggle_).
+    # Root cause this button fixes: the group message's ✅/⚠️ verdict is effective_not_ok =
+    # (not is_ok) OR is_late, but fix_toggle_ only ever flips is_ok - so on a late report,
+    # toggling "Оценка" could never make the verdict show ✅, no matter how many times it was
+    # clicked (is_late stayed stuck at 1 forever). This button flips is_late directly.
+    if data.startswith("toggle_late_"):
+        report_id = int(data.split("_")[-1])
+
+        def _toggle_late():
+            conn = get_db()
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            if not r:
+                conn.close()
+                return None, None
+
+            new_is_late = 0 if r["is_late"] == 1 else 1
+            conn.execute("UPDATE reports SET is_late = ? WHERE id = ?", (new_is_late, report_id))
+            conn.commit()
+
+            r = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+            w = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (r["telegram_id"],)).fetchone()
+            conn.close()
+            return r, w
+
+        report, worker = await run_db(_toggle_late)
+        if not report:
+            return
+
+        async_sync_gsheets_background()
+
+        worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+        position = clean_position(worker["position"]) if worker else "?"
+        text, kbd = await render_report_message_from_row(report, worker_name, position)
+        try:
+            await query.edit_message_text(text=text, reply_markup=kbd, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Ошибка при изменении пометки опоздания: {e}")
         return
 
     # 2b. Edit slot time -> ask for the correct time from this worker's own schedule
