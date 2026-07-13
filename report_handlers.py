@@ -382,6 +382,93 @@ async def render_report_message_from_row(report: dict, worker_name: str, positio
 
     return notify_text, inline_kbd
 
+# The 3 admin text-input edit flows (комментарий / время сдачи / требуемые действия) each
+# store their own pending state as a handful of flat context.user_data keys.
+# context.user_data is a SINGLE dict per admin, shared across every chat and report card
+# they touch - it is NOT scoped to one report or one button press. "all_keys" lists every
+# key that flow ever sets (cleared in full when superseded); report/chat/message/prompt
+# single out the 4 keys every flow has in common, needed to restore the old card.
+_EDIT_FLOWS = {
+    "comment": {
+        "report": "editing_comment_report_id", "chat": "editing_comment_chat_id",
+        "message": "editing_comment_message_id", "prompt": "editing_comment_prompt_message_id",
+        "all_keys": ["editing_comment_report_id", "editing_comment_video_num", "editing_comment_chat_id",
+                     "editing_comment_message_id", "editing_comment_original_text", "editing_comment_prompt_message_id"],
+    },
+    "slot_time": {
+        "report": "editing_slot_time_report_id", "chat": "editing_slot_time_chat_id",
+        "message": "editing_slot_time_message_id", "prompt": "editing_slot_time_prompt_message_id",
+        "all_keys": ["editing_slot_time_report_id", "editing_slot_time_chat_id", "editing_slot_time_message_id",
+                     "editing_slot_time_prompt_message_id"],
+    },
+    "action": {
+        "report": "editing_action_report_id", "chat": "editing_action_chat_id",
+        "message": "editing_action_message_id", "prompt": "editing_action_prompt_message_id",
+        "all_keys": ["editing_action_report_id", "editing_action_chat_id", "editing_action_message_id",
+                     "editing_action_prompt_message_id"],
+    },
+}
+
+async def _cancel_any_pending_edit_flow(context: ContextTypes.DEFAULT_TYPE):
+    """Called at the START of every one of the 5 entry points that start a text-input edit
+    flow (edit_comment_/ed_overall_/ed_vid_ for комментарий, edit_time_, edit_action_),
+    BEFORE it sets its own context.user_data keys. At most ONE such flow can ever be
+    legitimately pending per admin at a time.
+
+    ROOT CAUSE this fixes: without this guard, an admin who starts editing report A's time
+    (or comment, or action) and then, before replying, taps a DIFFERENT edit button on
+    report B's card, ends up with a SECOND flow's keys also set in the same shared
+    context.user_data dict. handle_report checks the 3 flows in a fixed order and the FIRST
+    one that has a report_id set wins - so a reply meant for report B's flow could silently
+    get consumed by report A's still-pending (and higher-priority) flow instead: applied to
+    the WRONG report, or simply swallowed - while report B's card, and possibly report A's
+    too, stayed with disabled buttons forever, since nothing else ever re-enables them. This
+    is exactly what made "Изменить время сдачи" look like it silently did nothing: the typed
+    time went to whichever OTHER edit flow was still pending from an earlier, forgotten tap,
+    not to the time-edit flow the admin thought they were answering.
+
+    This restores the previously-pending flow's card to its normal keyboard and deletes its
+    now-orphaned prompt message, exactly as if the admin had pressed "❌ Отмена" on it
+    themselves, before the new flow is allowed to start."""
+    for flow in _EDIT_FLOWS.values():
+        pending_report_id = context.user_data.get(flow["report"])
+        if not pending_report_id:
+            continue
+
+        pending_chat_id = context.user_data.get(flow["chat"])
+        pending_msg_id = context.user_data.get(flow["message"])
+        pending_prompt_id = context.user_data.get(flow["prompt"])
+        for key in flow["all_keys"]:
+            context.user_data.pop(key, None)
+
+        if pending_prompt_id and pending_chat_id:
+            try:
+                await context.bot.delete_message(chat_id=pending_chat_id, message_id=pending_prompt_id)
+            except Exception:
+                pass
+
+        if pending_chat_id and pending_msg_id:
+            def _fetch(rid=pending_report_id):
+                conn = get_db()
+                r = conn.execute("SELECT * FROM reports WHERE id = ?", (rid,)).fetchone()
+                w = conn.execute("SELECT * FROM workers WHERE telegram_id = ?", (r["telegram_id"],)).fetchone() if r else None
+                conn.close()
+                return r, w
+
+            report, worker = await run_db(_fetch)
+            if report:
+                worker_name = f"{worker['last_name']} {worker['first_name']}" if worker else f"ID {report['telegram_id']}"
+                position = clean_position(worker["position"]) if worker else "?"
+                text, kbd = await render_report_message_from_row(report, worker_name, position)
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=pending_chat_id, message_id=pending_msg_id,
+                        text=text, reply_markup=kbd, parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка при восстановлении карточки отчёта {pending_report_id} при старте нового редактирования: {e}")
+        return  # at most one flow is ever legitimately pending
+
 def menu_for_user(user_id: int, chat_type: str = "private"):
     if is_admin(user_id) and chat_type == "private":
         # Note: MAIN_MENU is imported dynamically from bot main entry
@@ -2308,6 +2395,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if not report or report["report_type"] != "status":
             return
 
+        await _cancel_any_pending_edit_flow(context)
+
         schedule = SCHEDULES.get(worker["schedule"], SCHEDULE_A) if worker else SCHEDULE_A
         context.user_data["editing_slot_time_report_id"] = report_id
         context.user_data["editing_slot_time_chat_id"] = query.message.chat.id
@@ -2343,6 +2432,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         report = await run_db(_fetch_report_for_action)
         if not report:
             return
+
+        await _cancel_any_pending_edit_flow(context)
 
         context.user_data["editing_action_report_id"] = report_id
         context.user_data["editing_action_chat_id"] = query.message.chat.id
@@ -2530,6 +2621,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception as e:
                 logger.error(f"Ошибка при показе меню выбора видео для editing: {e}")
         else:
+            await _cancel_any_pending_edit_flow(context)
+
             context.user_data["editing_comment_report_id"] = report_id
             context.user_data["editing_comment_video_num"] = None
             context.user_data["editing_comment_chat_id"] = query.message.chat.id
@@ -2551,6 +2644,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # 7. Edit Overall Comment
     if data.startswith("ed_overall_"):
         report_id = int(data.split("_")[-1])
+        await _cancel_any_pending_edit_flow(context)
         context.user_data["editing_comment_report_id"] = report_id
         context.user_data["editing_comment_video_num"] = None
         context.user_data["editing_comment_chat_id"] = query.message.chat.id
@@ -2578,6 +2672,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         report_id = int(parts[2])
         video_num = int(parts[3])
 
+        await _cancel_any_pending_edit_flow(context)
         context.user_data["editing_comment_report_id"] = report_id
         context.user_data["editing_comment_video_num"] = video_num
         context.user_data["editing_comment_chat_id"] = query.message.chat.id
