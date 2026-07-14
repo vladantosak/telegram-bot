@@ -111,7 +111,7 @@ async def notify_admins_if_remark_threshold_crossed(context: ContextTypes.DEFAUL
         except Exception as e:
             logger.error(f"Не удалось отправить админу {admin_id} накопительное предупреждение о сотруднике {telegram_id}: {e}")
 
-from ai import (
+from ai_gemini import (
     transcribe_audio, clean_report, check_status, classify_report_type,
     assess_transcription_quality, AITechnicalError
 )
