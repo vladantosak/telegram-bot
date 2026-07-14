@@ -1,5 +1,10 @@
 FROM python:3.11-slim
 
+# ffmpeg нужен ai_gemini.py, чтобы вытаскивать звуковую дорожку из видео
+# перед отправкой в Gemini (экономит бесплатные лимиты в разы)
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # Рабочая директория
 WORKDIR /app
 
